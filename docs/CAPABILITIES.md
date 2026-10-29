@@ -66,7 +66,7 @@ Use `script/plugin_smoke_test.sh --compose-only` or `--k8s-only` to select one p
 
 ## Verification status
 
-The 29 October 2026 Edit Limits follow-up passed 123 tests and a packaged-app build. Disposable GUI checks covered running/stopped recreation, a repeated edit, stale-review refusal, retained disk/mount data, and guest CPU/memory enforcement. A whole-disk verification memory regression was reproduced and fixed with sparse extents, copy-on-write clones and a fixed read buffer; monitored whole-app RSS peaked at 279.6 MiB over three minutes. All five fixtures and their four recovery sessions were removed; baseline configurations and states matched afterward. Details and recovery limitations are in [the limits audit](../output/LIMITS_RECREATION_AUDIT.md).
+The 29 October 2026 Edit Limits follow-up passed 123 tests and a packaged-app build. Disposable GUI checks covered running/stopped recreation, a repeated edit, stale-review refusal, retained disk/mount data, and guest CPU/memory enforcement. A whole-disk verification memory regression was reproduced and fixed with sparse extents, copy-on-write clones and a fixed read buffer; monitored whole-app RSS peaked at 279.6 MiB over three minutes. All five fixtures and their four recovery sessions were removed; baseline configurations and states matched afterward. Recovery limitations are described under Safety and data handling in the [README](../README.md#safety-and-data-handling).
 
 The cleanup scan can be checked against the current local runtime without modifying it by setting `CONTAINERDESK_CLEANUP_LIVE_READ_CHECK=1` for `swift test --filter CleanupLiveReadTests`. This gated check is read-only; the regular cleanup store tests use injected clients and never delete live resources.
 

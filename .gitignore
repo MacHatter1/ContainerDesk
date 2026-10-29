@@ -15,9 +15,12 @@ xcuserdata/
 *.profdata
 /coverage/
 
-# Generated design and verification output; retain written audit reports
-/output/*
-!/output/*.md
+# Generated design, review and verification output
+/output/
+
+# AI coding-agent configuration and session state
+.codex/
+.claude/
 
 # Local credentials and environment overrides
 .env
