@@ -11,10 +11,6 @@ struct ResourceFormSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var image = ""
-    @State private var command = ""
-    @State private var environmentText = ""
-    @State private var portsText = ""
-    @State private var volumesText = ""
     @State private var cpuText = ""
     @State private var memoryText = ""
     @State private var platform = ""
@@ -41,7 +37,7 @@ struct ResourceFormSheet: View {
         NavigationStack {
             Form {
                 Section("Resource") {
-                    if section == .containers || section == .machines || section == .images {
+                    if section == .machines || section == .images {
                         TextField("Image reference", text: $image, prompt: Text("docker.io/library/alpine:latest"))
                     }
                     if section != .registries && section != .images {
@@ -55,38 +51,6 @@ struct ResourceFormSheet: View {
                             Text("HTTPS").tag("https")
                             Text("HTTP").tag("http")
                         }
-                    }
-                    if section == .containers {
-                        TextField("Command and arguments", text: $command, prompt: Text("/bin/sh -lc 'echo ready'"))
-                            .font(.system(.body, design: .monospaced))
-                        Label("The standard Run action starts in the background. Use Advanced Command for an attached interactive process.", systemImage: "info.circle")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-
-                if section == .containers {
-                    Section("Environment and ports") {
-                        TextEditor(text: $environmentText)
-                            .font(.system(.body, design: .monospaced))
-                            .frame(minHeight: 64, maxHeight: 100)
-                            .overlay(alignment: .topLeading) { if environmentText.isEmpty { Text("KEY=value, one per line").foregroundStyle(.tertiary).padding(.top, 7).padding(.leading, 5).allowsHitTesting(false) } }
-                        TextEditor(text: $portsText)
-                            .font(.system(.body, design: .monospaced))
-                            .frame(minHeight: 48, maxHeight: 80)
-                            .overlay(alignment: .topLeading) { if portsText.isEmpty { Text("HOST:CONTAINER, one per line").foregroundStyle(.tertiary).padding(.top, 7).padding(.leading, 5).allowsHitTesting(false) } }
-                        TextEditor(text: $volumesText)
-                            .font(.system(.body, design: .monospaced))
-                            .frame(minHeight: 48, maxHeight: 80)
-                            .overlay(alignment: .topLeading) { if volumesText.isEmpty { Text("SOURCE:DESTINATION[:ro], one per line").foregroundStyle(.tertiary).padding(.top, 7).padding(.leading, 5).allowsHitTesting(false) } }
-                    }
-                    Section("Resources") {
-                        TextField("CPUs", text: $cpuText)
-                        TextField("Memory", text: $memoryText, prompt: Text("256M minimum 200M"))
-                        if section == .containers, !memoryText.isEmpty, let mebibytes = Self.memoryMiB(memoryText), mebibytes < 200 {
-                            Label("The container CLI requires at least 200 MiB of memory.", systemImage: "exclamationmark.triangle.fill")
-                                .font(.caption).foregroundStyle(.orange)
-                        }
-                        TextField("Platform (optional)", text: $platform, prompt: Text("linux/arm64"))
                     }
                 }
 
@@ -134,11 +98,10 @@ struct ResourceFormSheet: View {
         .frame(minWidth: 480, minHeight: 420)
     }
 
-    private var nameLabel: String { section == .containers || section == .machines ? "Name (optional)" : "Name" }
+    private var nameLabel: String { section == .machines ? "Name (optional)" : "Name" }
     private var namePlaceholder: String { section == .volumes ? "app-data" : section == .networks ? "app-network" : "app" }
     private var sheetTitle: String {
         switch section {
-        case .containers: "Run Container"
         case .images: "Pull Image"
         case .volumes: "Create Volume"
         case .networks: "Create Network"
@@ -148,11 +111,10 @@ struct ResourceFormSheet: View {
         }
     }
     private var actionTitle: String {
-        switch section { case .containers: "Run"; case .images: "Pull"; case .registries: "Log In"; default: "Create" }
+        switch section { case .images: "Pull"; case .registries: "Log In"; default: "Create" }
     }
     private var canSubmit: Bool {
         switch section {
-        case .containers: !image.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (memoryText.isEmpty || (Self.memoryMiB(memoryText).map { $0 >= 200 } ?? false))
         case .machines: !image.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         case .images: !image.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         case .registries: !name.isEmpty && !username.isEmpty && !password.isEmpty
@@ -179,19 +141,6 @@ struct ResourceFormSheet: View {
     private func makeRequest() throws -> CommandRequest {
         var args: [String]
         switch section {
-        case .containers:
-            args = ["run"]
-            args.append("--detach")
-            if !name.isEmpty { args += ["--name", name] }
-            for line in environmentText.lines { args += ["--env", line] }
-            for line in portsText.lines { args += ["--publish", line] }
-            for line in volumesText.lines { args += ["--volume", line] }
-            if !cpuText.isEmpty { args += ["--cpus", cpuText] }
-            if !memoryText.isEmpty { args += ["--memory", memoryText] }
-            if !platform.isEmpty { args += ["--platform", platform] }
-            args.append(image)
-            if !command.isEmpty { args.append(contentsOf: try SafeArgumentTokenizer.tokenize(command)) }
-            return CommandRequest(arguments: args, redactions: environmentText.lines.compactMap { $0.split(separator: "=", maxSplits: 1).dropFirst().first.map(String.init) })
         case .images:
             args = ["image", "pull"]
             if !platform.isEmpty { args += ["--platform", platform] }
@@ -223,21 +172,6 @@ struct ResourceFormSheet: View {
         return CommandRequest(arguments: args)
     }
 
-    private static func memoryMiB(_ value: String) -> Double? {
-        let input = value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        guard !input.isEmpty else { return nil }
-        let suffix = input.last
-        let number = (suffix.map { "KMGTP".contains($0) } ?? false) ? String(input.dropLast()) : input
-        guard let amount = Double(number), amount >= 0 else { return nil }
-        switch suffix {
-        case "K": return amount / 1_024
-        case "M": return amount
-        case "G": return amount * 1_024
-        case "T": return amount * 1_048_576
-        case "P": return amount * 1_073_741_824
-        default: return amount / 1_048_576
-        }
-    }
 }
 
 struct ResourceActionSheet: View {

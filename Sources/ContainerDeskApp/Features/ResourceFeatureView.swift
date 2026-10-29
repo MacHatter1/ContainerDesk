@@ -14,6 +14,7 @@ struct ResourceFeatureView: View {
     @State private var focusedID: String?
     @State private var sortOrder = [KeyPathComparator(\ResourceSummary.title)]
     @State private var showingCreate = false
+    @State private var showingProfiles = false
     @State private var initialImage = ""
     @State private var showingAdvanced = false
     @State private var pendingAction: ResourcePendingAction?
@@ -73,7 +74,14 @@ struct ResourceFeatureView: View {
         .navigationTitle(section.title)
         .task { await store.refresh(section) }
         .sheet(isPresented: $showingCreate, onDismiss: { initialImage = "" }) {
-            ResourceFormSheet(section: section == .images && !initialImage.isEmpty ? .containers : section, store: store, initialImage: initialImage) { presentNotice($0) }
+            if section == .containers || (section == .images && !initialImage.isEmpty) {
+                ContainerRunSheet(store: store, initialImage: initialImage) { presentNotice($0) }
+            } else {
+                ResourceFormSheet(section: section, store: store, initialImage: initialImage) { presentNotice($0) }
+            }
+        }
+        .sheet(isPresented: $showingProfiles) {
+            EnvironmentProfilesSheet(store: store)
         }
         .sheet(isPresented: $showingAdvanced) {
             AdvancedCommandSheet(section: section, store: store) { presentNotice($0) }
@@ -261,6 +269,13 @@ struct ResourceFeatureView: View {
             }
             .padding(.horizontal, 8).padding(.vertical, 6)
             .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
+            if section == .containers {
+                Button { showingProfiles = true } label: {
+                    if compact { Image(systemName: "square.stack") }
+                    else { Label("Profiles", systemImage: "square.stack") }
+                }
+                .help("Manage reusable environment profiles")
+            }
             Menu {
                 ForEach(secondaryActions, id: \.title) { action in
                     Button(action.title, systemImage: action.symbol) {

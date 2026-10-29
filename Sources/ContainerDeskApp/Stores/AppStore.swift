@@ -6,6 +6,7 @@ import Observation
 @Observable
 public final class AppStore {
     let cleanupStore = CleanupStore()
+    let environmentProfiles: EnvironmentProfilesStore
     public private(set) var limitsOperationContainerID: String?
     public private(set) var operations: [OperationRecord] = []
     public private(set) var snapshots: [ContainerSection: ResourceSnapshot] = [:]
@@ -138,6 +139,7 @@ public final class AppStore {
     private let listSections: [ContainerSection] = [.containers, .images, .volumes, .networks, .registries, .machines]
 
     public init(client: (any ContainerClient)? = nil, defaults: UserDefaults = .standard) {
+        self.environmentProfiles = EnvironmentProfilesStore()
         self.defaults = defaults
         let savedPath = defaults.string(forKey: Self.cliPathKey)
         self.cliPath = savedPath
