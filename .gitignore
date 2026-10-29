@@ -1,0 +1,49 @@
+# SwiftPM and generated builds (keep Package.resolved tracked)
+.build/
+.swiftpm/
+/build/
+/dist/
+DerivedData/
+
+# Xcode user state and test/coverage results
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.xcresult/
+*.profraw
+*.profdata
+/coverage/
+
+# Generated design and verification output; retain written audit reports
+/output/*
+!/output/*.md
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+
+# Local model weights, virtual environments, and container disks
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.safetensors
+*.gguf
+*.ext4
+*.qcow2
+
+# macOS and editor temporary files
+.DS_Store
+._*
+.AppleDouble
+*.swp
+*.swo
+*~
