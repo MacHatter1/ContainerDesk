@@ -13,6 +13,7 @@ Browse, run, build, inspect and clean up Linux containers on your Mac with live 
 [![Swift 6.2](https://img.shields.io/badge/Swift-6.2-F05138?logo=swift&logoColor=white)](Package.swift)
 [![SwiftUI](https://img.shields.io/badge/UI-SwiftUI-0A84FF)](Sources/ContainerDeskApp)
 [![Apple container 1.5.0](https://img.shields.io/badge/Apple%20container-1.5.0-0A84FF)](docs/CAPABILITIES.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
 [Features](#features) · [Screenshots](#screenshots) · [Getting started](#getting-started) · [How it works](#how-it-works) · [Development](#development) · [Capability map](docs/CAPABILITIES.md)
 
@@ -219,6 +220,10 @@ CONTAINERDESK_PROFILES_LIVE_CHECK=1 CONTAINERDESK_PROFILES_IMAGE=docker.io/libra
 ```
 
 The optional `./script/smoke_test.sh` uses uniquely named temporary resources and the already-running builder to exercise container, file, volume, network, export, image build, and OCI archive workflows. It removes only the resources it created. Use `--keep-for-ui` to retain them for manual review; remove only the printed resource names afterward. `./script/plugin_smoke_test.sh` covers the Compose and Kubernetes plugins in the same disposable way.
+
+## License
+
+ContainerDesk is released under the [MIT License](LICENSE). It is provided as is, without warranty of any kind.
 
 ---
 
