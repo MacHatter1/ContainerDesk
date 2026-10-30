@@ -74,8 +74,8 @@ public enum ResourceJSONDecoder {
                 subtitle = displayName == nil ? nil : shortID(id, excluding: displayName)
                 let resources = config["resources"] as? [String: Any] ?? [:]
                 details = ResourceDetails(
-                    cpuCount: int(resources["cpus"]) ?? int(config["cpus"]),
-                    memoryBytes: int64(resources["memoryInBytes"]) ?? int64(config["memoryInBytes"]),
+                    cpuCount: int(object["cpus"]) ?? int(resources["cpus"]) ?? int(config["cpus"]),
+                    memoryBytes: int64(object["memory"]) ?? int64(resources["memoryInBytes"]) ?? int64(config["memoryInBytes"]),
                     isDefault: bool(object["isDefault"]) ?? bool(object["default"]) ?? bool(config["isDefault"])
                 )
             case .registries:
@@ -158,10 +158,8 @@ public enum ResourceJSONDecoder {
 
     private static func safeLabels(_ value: Any?) -> [String: String] {
         guard let labels = value as? [String: Any] else { return [:] }
-        let sensitive = ["password", "passwd", "token", "secret", "authorization", "credential", "api_key", "access_key", "private_key"]
         return labels.reduce(into: [:]) { result, pair in
-            let lower = pair.key.lowercased()
-            guard !sensitive.contains(where: lower.contains), let labelValue = pair.value as? String else { return }
+            guard !SensitiveMetadataKey.containsCredential(pair.key), let labelValue = pair.value as? String else { return }
             let sanitized = CommandRequest(arguments: []).sanitizeOutput(labelValue)
             if !sanitized.isEmpty { result[pair.key] = sanitized }
         }

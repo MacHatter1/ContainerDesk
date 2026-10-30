@@ -9,7 +9,14 @@ public struct CommandRequest: Sendable {
     /// Additional environment values. The inherited GUI-process environment is preserved.
     public var environment: [String: String]
     /// Exact secret strings removed from previews, events, and captured output.
-    public var redactions: [String]
+    public var redactions: [String] {
+        get {
+            explicitRedactions + CredentialArguments.substitutions(in: arguments.map(Optional.some))
+                .compactMap(\.secret).filter { !$0.isEmpty }
+        }
+        set { explicitRedactions = newValue.filter { !$0.isEmpty } }
+    }
+    private var explicitRedactions: [String]
     /// Upper bound for captured stdout/stderr independently. Stream events continue to be emitted.
     public var captureLimit: Int
     /// Do not emit stdout/stderr events; still return bounded output from `run` for immediate parsing.
@@ -30,7 +37,7 @@ public struct CommandRequest: Sendable {
         self.workingDirectory = workingDirectory
         self.stdin = stdin
         self.environment = environment
-        self.redactions = redactions.filter { !$0.isEmpty }
+        self.explicitRedactions = redactions.filter { !$0.isEmpty }
         self.captureLimit = max(0, captureLimit)
         self.suppressOutputEvents = suppressOutputEvents
         self.timeout = timeout
@@ -38,13 +45,11 @@ public struct CommandRequest: Sendable {
 
     public var preview: String {
         var safeArguments = arguments
-        let secretFlags = ["--password", "--token", "--secret", "--auth", "--authorization", "--access-key", "--secret-key"]
+        for substitution in CredentialArguments.substitutions(in: arguments.map(Optional.some)) {
+            safeArguments[substitution.index] = substitution.replacement
+        }
         for index in safeArguments.indices {
-            let lower = safeArguments[index].lowercased()
-            if secretFlags.contains(where: { lower == $0 || lower.hasPrefix($0 + "=") }) {
-                if let equals = safeArguments[index].firstIndex(of: "=") { safeArguments[index] = String(safeArguments[index][...equals]) + "••••" }
-                else if safeArguments.indices.contains(index + 1) { safeArguments[index + 1] = "••••" }
-            } else if let equals = safeArguments[index].firstIndex(of: "=") {
+            if let equals = safeArguments[index].firstIndex(of: "=") {
                 let key = safeArguments[index][..<equals].lowercased()
                 if ["password", "passwd", "token", "secret", "authorization", "access_key", "secret_key"].contains(where: { key.contains($0) }) {
                     safeArguments[index] = String(safeArguments[index][...equals]) + "••••"
@@ -58,7 +63,7 @@ public struct CommandRequest: Sendable {
     /// Only known read-only operations may be replayed after failure.
     public var isSafeToRetry: Bool {
         guard stdin == nil, environment.isEmpty, redactions.isEmpty else { return false }
-        let sensitiveMarkers = ["--password", "--token", "--secret", "--auth", "--authorization", "--env", "--env-file", "--access-key", "--secret-key"]
+        let sensitiveMarkers = CredentialArguments.flags.union(["--env", "--env-file"])
         guard !arguments.contains(where: { argument in
             let lower = argument.lowercased()
             return sensitiveMarkers.contains(where: { lower == $0 || lower.hasPrefix($0 + "=") }) || lower.contains("password=") || lower.contains("token=") || lower.contains("secret=")

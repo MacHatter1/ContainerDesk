@@ -2,18 +2,11 @@ import SwiftUI
 import UniformTypeIdentifiers
 import ContainerDeskCore
 
-private struct SavedComposeProject: Codable, Identifiable, Hashable {
-    var id: String { fileURL.absoluteString + "|" + name }
-    var fileURL: URL
-    var name: String
-}
-
 struct ComposeFeatureView: View {
     let store: AppStore
 
-    @AppStorage("containerdesk.composeProjects.v1") private var savedData = "[]"
     @State private var selectedID: String?
-    @State private var projects: [SavedComposeProject] = []
+    private var projects: [SavedComposeProject] { store.pluginLibrary.projects }
     @State private var projectName = ""
     @State private var showingImporter = false
     @State private var selectedFile: URL?
@@ -78,8 +71,7 @@ struct ComposeFeatureView: View {
             Button("Compose Down", role: .destructive) { launch { await runDown(dryRun: false) } }
             Button("Cancel", role: .cancel) { }
         } message: { Text("Compose down removes project containers and, by default, networks created by this project.") }
-        .onAppear { loadProjects() }
-        .onChange(of: projects) { _, _ in persistProjects() }
+        .onAppear { if selectedID == nil { selectedID = projects.first?.id } }
         .onChange(of: selectedID) { _, newID in
             if let project = projects.first(where: { $0.id == newID }) { projectName = project.name }
         }
@@ -167,29 +159,15 @@ struct ComposeFeatureView: View {
     }
 
     private func add(_ url: URL) {
-        let project = SavedComposeProject(fileURL: url.standardizedFileURL, name: projectName)
-        if let index = projects.firstIndex(where: { $0.fileURL == project.fileURL }) { projects[index] = project }
-        else { projects.insert(project, at: 0) }
-        selectedID = project.id
-        persistProjects()
-    }
-    private func loadProjects() {
-        guard let data = savedData.data(using: .utf8), let decoded = try? JSONDecoder().decode([SavedComposeProject].self, from: data) else { return }
-        projects = decoded
-        selectedID = projects.first?.id
-    }
-    private func persistProjects() {
-        guard let data = try? JSONEncoder().encode(projects), let encoded = String(data: data, encoding: .utf8) else { return }
-        savedData = encoded
+        selectedID = store.pluginLibrary.addProject(url, name: projectName).id
     }
     private func updateSelectedName() {
-        guard let id = selectedID, let index = projects.firstIndex(where: { $0.id == id }) else { return }
-        projects[index].name = projectName.trimmingCharacters(in: .whitespacesAndNewlines)
-        selectedID = projects[index].id
+        guard let id = selectedID else { return }
+        store.pluginLibrary.renameProject(id: id, name: projectName.trimmingCharacters(in: .whitespacesAndNewlines))
     }
     private func forget(_ project: SavedComposeProject) {
-        projects.removeAll { $0.id == project.id }
-        selectedID = projects.first?.id
+        store.pluginLibrary.forgetProject(id: project.id)
+        if selectedID == project.id { selectedID = projects.first?.id }
     }
     private func runUp(dryRun: Bool) async {
         guard let project = selectedProject else { return }
@@ -240,5 +218,5 @@ struct ComposeFeatureView: View {
         commandTask?.cancel()
         commandTask = nil
     }
-    private func append(_ text: String) { output += text; if output.count > 150_000 { output = String(output.suffix(150_000)) } }
+    private func append(_ text: String) { BoundedText.append(text, to: &output) }
 }

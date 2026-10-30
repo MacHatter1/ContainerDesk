@@ -167,7 +167,7 @@ public struct ContainerResourceReader: Sendable {
 
     private func cliInspect(id: String, fallbackReason: String?) async throws -> ResourceReadResult<SanitizedContainerInspection> {
         let result = try await runRead(["inspect", id])
-        let safeJSON = try SensitiveJSONRedactor.redact(result.standardOutput)
+        let safeJSON = try ResourceJSONRedactor.redact(result.standardOutput)
         return ResourceReadResult(value: SanitizedContainerInspection(containerID: id, json: safeJSON), backend: .cli, fallbackReason: fallbackReason)
     }
 
@@ -214,7 +214,7 @@ public struct ContainerResourceReader: Sendable {
         try Task.checkCancellation()
         let result = try await cli.run(CommandRequest(arguments: arguments, captureLimit: 2_000_000, suppressOutputEvents: true, timeout: .seconds(30)))
         try Task.checkCancellation()
-        guard result.succeeded else { throw ContainerResourceReaderError.commandFailed("The container CLI read failed with status \(result.exitCode).") }
+        guard result.succeeded else { throw ContainerResourceReaderError.commandFailed(result.failureDescription ?? "The container CLI read failed.") }
         guard !result.outputTruncated else { throw ContainerResourceReaderError.truncatedOutput }
         return result
     }
@@ -441,11 +441,10 @@ public struct NativeAPIGateDecision: Sendable, Equatable {
     public init(allowed: Bool, reason: String?) { self.allowed = allowed; self.reason = reason }
 }
 
-private enum SensitiveJSONRedactor {
-    private static let sensitiveFragments = ["password", "passwd", "token", "secret", "authorization", "credential", "privatekey", "accesskey", "apikey"]
+public enum ResourceJSONRedactor {
     private static let assignment = try! NSRegularExpression(pattern: #"(?i)((?:[A-Z0-9_.-]*(?:password|passwd|token|secret|authorization|api[_-]?key|access[_-]?key|private[_-]?key)[A-Z0-9_.-]*)\s*=\s*)[^,;\r\n}]+"#)
 
-    static func redact(_ source: String) throws -> String {
+    public static func redact(_ source: String) throws -> String {
         guard let data = source.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
             return "(Inspect output hidden because it could not be safely redacted.)"
         }
@@ -461,10 +460,10 @@ private enum SensitiveJSONRedactor {
     private static func redactObject(_ object: Any) -> Any {
         if let dictionary = object as? [String: Any] {
             return dictionary.reduce(into: [String: Any]()) { result, item in
-                let key = item.key.lowercased().filter(\.isLetter)
+                let key = SensitiveMetadataKey.normalized(item.key)
                 if key == "environment" || key == "env" {
                     result[item.key] = redactEnvironment(item.value)
-                } else if sensitiveFragments.contains(where: key.contains) {
+                } else if SensitiveMetadataKey.containsCredential(item.key) {
                     result[item.key] = "••••"
                 } else {
                     result[item.key] = redactObject(item.value)
@@ -488,29 +487,9 @@ private enum SensitiveJSONRedactor {
     }
 
     private static func redactArray(_ values: [Any]) -> [Any] {
-        var output: [Any] = []
-        var index = 0
-        let secretFlags: Set<String> = ["--password", "--passwd", "--token", "--secret", "--authorization", "--api-key", "--access-key", "--secret-key"]
-        while index < values.count {
-            guard let text = values[index] as? String else {
-                output.append(redactObject(values[index]))
-                index += 1
-                continue
-            }
-            let lower = text.lowercased()
-            if secretFlags.contains(lower) {
-                output.append(text)
-                if index + 1 < values.count {
-                    output.append("••••")
-                    index += 2
-                } else { index += 1 }
-            } else if secretFlags.contains(where: { lower.hasPrefix($0 + "=") }) {
-                output.append(String(text.prefix { $0 != "=" }) + "=••••")
-                index += 1
-            } else {
-                output.append(redactObject(text))
-                index += 1
-            }
+        var output = values.map(redactObject)
+        for substitution in CredentialArguments.substitutions(in: values.map { $0 as? String }) {
+            output[substitution.index] = substitution.replacement
         }
         return output
     }
@@ -679,7 +658,7 @@ public struct AppleContainerResourceAPIClient: AppleContainerResourceAPI {
         }
         let payload = try JSONEncoder().encode(snapshot)
         guard let json = String(data: payload, encoding: .utf8) else { throw ContainerResourceReaderError.invalidPayload }
-        return SanitizedContainerInspection(containerID: id, json: try SensitiveJSONRedactor.redact(json))
+        return SanitizedContainerInspection(containerID: id, json: try ResourceJSONRedactor.redact(json))
     }
 
     public func stats(id: String) async throws -> ContainerStatsSample {

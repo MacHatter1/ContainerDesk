@@ -4,6 +4,17 @@ import Testing
 @testable import ContainerDeskApp
 
 struct AppStoreOperationPolicyTests {
+    @MainActor @Test func timedOutZeroExitCannotPublishSuccessfulActivityOrInventory() async {
+        let store = AppStore(client: TimedOutPolicyClient())
+        await #expect(throws: (any Error).self) {
+            try await store.execute(CommandRequest(arguments: ["list", "--all", "--format", "json"]), title: "Timed out list")
+        }
+        #expect(store.operations.first?.state == .failed)
+        #expect(store.operations.first?.error == "Command timed out.")
+        await store.refresh(.containers, force: true)
+        if case .failed(let message)? = store.snapshots[.containers]?.state { #expect(message == "Command timed out.") }
+        else { Issue.record("Timed-out inventory was accepted") }
+    }
     @Test func onlyAllowlistedReadCommandsCanBeRetried() {
         for arguments in [["delete", "container-1"], ["prune"], ["image", "delete", "image:tag"], ["volume", "prune"], ["stop", "container-1"], ["copy", "a", "b"], ["exec", "container-1", "rm", "-rf", "/"]] {
             #expect(!CommandRequest(arguments: arguments).isSafeToRetry)
@@ -72,6 +83,7 @@ struct AppStoreOperationPolicyTests {
         #expect(!record.canRetry)
         #expect(!record.canCancel)
         store.cancelOperation(record.id)
+        operation.cancel()
         #expect(store.operations.first?.state == .running)
         await reviewedClient.finish()
         _ = try await operation.value
@@ -260,6 +272,14 @@ struct AppStoreOperationPolicyTests {
     }
 }
 
+private struct TimedOutPolicyClient: ContainerClient {
+    func run(_ request: CommandRequest) async throws -> CommandResult { Self.result }
+    func stream(_ request: CommandRequest) -> AsyncThrowingStream<CommandEvent, Error> {
+        AsyncThrowingStream { $0.yield(.completed(Self.result)); $0.finish() }
+    }
+    private static var result: CommandResult { .init(standardOutput: "[]", standardError: "", exitCode: 0, terminationReason: .exit, duration: .zero, timedOut: true) }
+}
+
 private actor StreamRoutingPolicyTestClient: ContainerClient {
     private var recorded: [[String]] = []
     private var startedWaiter: CheckedContinuation<Void, Never>?
@@ -337,6 +357,7 @@ private actor PolicyTestClient: ContainerClient {
         startedWaiter?.resume()
         startedWaiter = nil
         if blocked { await withCheckedContinuation { finishWaiter = $0 } }
+        try Task.checkCancellation()
         return CommandResult(standardOutput: "", standardError: "", exitCode: 0, terminationReason: .exit, duration: .zero)
     }
 

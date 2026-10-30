@@ -11,6 +11,7 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            MonitoringSettingsView(monitoring: store.monitoring)
             Section {
                 Picker("Appearance", selection: $appearanceRawValue) {
                     ForEach(AppAppearance.allCases) { appearance in
@@ -66,6 +67,8 @@ struct SettingsView: View {
             Section {
                 LabeledContent("Container reads", value: containerReadDescription)
                 LabeledContent("Native list reads", value: "Containers, networks and volumes when available")
+                Text("Container CPU/RAM history and lifecycle events are sampled across all sections while a window is visible, including when another app has focus. Logs stream while the Logs screen is open.")
+                    .font(.caption).foregroundStyle(.secondary)
                 LabeledContent("CLI list reads", value: "Images, registries and machines · about every 3 seconds")
                 Text("Native reads are used for supported resources, with CLI fallback if a read fails. Selecting the CLI path disables native reads. Changes, builds, plugins and terminals continue through the CLI.")
                     .font(.caption).foregroundStyle(.secondary)

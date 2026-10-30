@@ -10,11 +10,15 @@ private struct RememberedCluster: Identifiable {
 struct KubernetesFeatureView: View {
     let store: AppStore
 
-    @AppStorage("containerdesk.k8sTrackedNames.v1") private var rememberedData = "[]"
-    @State private var rememberedNames: [String] = []
-    @State private var output = ""
-    @State private var error: String?
-    @State private var busy = false
+    private var rememberedNames: [String] { store.pluginLibrary.clusterNames }
+    private var operation: KubernetesOperationStore { store.kubernetesOperations }
+    private var busy: Bool { operation.isRunning }
+    private var output: String { operation.output }
+    private var error: String? { inputError ?? operation.error }
+    @State private var inputError: String?
+    @State private var owner = UUID()
+    @State private var actionTask: Task<Void, Never>?
+    @State private var actionID: UUID?
     @State private var showCreate = false
     @State private var showDelete = false
     @State private var showLoadImage = false
@@ -33,8 +37,6 @@ struct KubernetesFeatureView: View {
     @State private var kubeconfig = "~/.kube/config"
     @State private var removeOnStop = false
     @State private var showCNIImporter = false
-    @State private var operationTask: Task<Void, Never>?
-    @State private var operationID: UUID?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -56,14 +58,14 @@ struct KubernetesFeatureView: View {
                 HStack {
                     Spacer()
                     Button("Create Cluster…", systemImage: "plus") { showCreate = true }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(.borderedProminent).disabled(busy)
                     Menu("Cluster Actions") {
                         Button("Load Local Image…", systemImage: "square.and.arrow.down") { showLoadImage = true }
                         Button("Write Kubeconfig…", systemImage: "doc.badge.gearshape") { showWriteConfig = true }
                         Divider()
                         Button("Delete Cluster…", systemImage: "trash", role: .destructive) { showDelete = true }
                     }
-                }
+                }.disabled(busy)
                 Text(output.isEmpty ? "Refresh to list clusters. The 1.5.0 list command returns human-readable text and has no JSON formatter." : output)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(output.isEmpty ? .secondary : .primary)
@@ -91,16 +93,16 @@ struct KubernetesFeatureView: View {
                         .frame(minHeight: 120)
                     }
                     HStack {
-                        Button("Load Image…") { showLoadImage = true }.disabled(rememberedNames.isEmpty)
-                        Button("Write Kubeconfig…") { showWriteConfig = true }.disabled(rememberedNames.isEmpty)
+                        Button("Load Image…") { showLoadImage = true }.disabled(busy || rememberedNames.isEmpty)
+                        Button("Write Kubeconfig…") { showWriteConfig = true }.disabled(busy || rememberedNames.isEmpty)
                         Spacer()
-                        Button("Delete…", role: .destructive) { showDelete = true }.disabled(rememberedNames.isEmpty)
+                        Button("Delete…", role: .destructive) { showDelete = true }.disabled(busy || rememberedNames.isEmpty)
                     }
                   }
                 }
                 .padding(.horizontal, 16)
             }
-            HStack { Label(busy ? "Working…" : "App quit leaves clusters running", systemImage: busy ? "hourglass" : "power") ; Spacer(); if busy { Button("Cancel", role: .destructive) { cancelOperation() } }; if !output.isEmpty { Button("Clear Output") { output = ""; error = nil } } }
+            HStack { Label(busy ? "Working…" : "App quit leaves clusters running", systemImage: busy ? "hourglass" : "power") ; Spacer(); if busy, operation.owner == owner { Button("Cancel", role: .destructive) { cancelOperation() } }; if !output.isEmpty { Button("Clear Output") { operation.clearOutput(); inputError = nil }.disabled(busy) } }
                 .font(.caption).foregroundStyle(.secondary).padding(10).background(.bar)
                 .animation(ContainerDeskMotion.animation(reduceMotion: reduceMotion), value: busy)
         }
@@ -109,17 +111,18 @@ struct KubernetesFeatureView: View {
         .sheet(isPresented: $showLoadImage) { loadImageSheet }
         .sheet(isPresented: $showWriteConfig) { writeConfigSheet }
         .fileImporter(isPresented: $showCNIImporter, allowedContentTypes: [.yaml, .plainText], allowsMultipleSelection: false) { result in
-            switch result { case .success(let urls): if let url = urls.first { cni = url.path }; case .failure(let issue): error = issue.localizedDescription }
+            switch result { case .success(let urls): if let url = urls.first { cni = url.path }; case .failure(let issue): inputError = issue.localizedDescription }
         }
         .confirmationDialog("Create a local cluster?", isPresented: $showCreateConfirmation, titleVisibility: .visible) {
             Button("Create \(clusterName)") { launch { await createCluster() } }
             Button("Cancel", role: .cancel) { }
         } message: { Text("The plugin merges credentials into ~/.kube/config when it creates a cluster. This action creates one control-plane node and changes local Kubernetes configuration.") }
         .confirmationDialog("Delete Kubernetes cluster?", isPresented: $showDelete, titleVisibility: .visible) {
-            Button("Delete \(clusterName)", role: .destructive) { Task { await deleteCluster() } }
+            Button("Delete \(clusterName)", role: .destructive) { launch { await deleteCluster() } }
             Button("Cancel", role: .cancel) { }
         } message: { Text("This stops and removes the cluster container and removes its context from ~/.kube/config.") }
-        .onAppear { loadRemembered(); Task { await refreshList() } }
+        .task { await refreshList() }
+        .onDisappear { actionTask?.cancel(); actionTask = nil; actionID = nil; operation.cancel(owner: owner) }
         .onChange(of: selectedNames) { _, newValue in if let name = newValue.first { clusterName = name } }
     }
 
@@ -143,7 +146,7 @@ struct KubernetesFeatureView: View {
             .formStyle(.grouped).navigationTitle("Create Kubernetes Cluster")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showCreate = false } }
-                ToolbarItem(placement: .confirmationAction) { Button("Create") { showCreate = false; showCreateConfirmation = true }.buttonStyle(.borderedProminent).disabled(clusterName.isEmpty) }
+                ToolbarItem(placement: .confirmationAction) { Button("Create") { showCreate = false; showCreateConfirmation = true }.buttonStyle(.borderedProminent).disabled(busy || clusterName.isEmpty) }
             }
         }.frame(minWidth: 480, minHeight: 360)
     }
@@ -160,7 +163,7 @@ struct KubernetesFeatureView: View {
             }.formStyle(.grouped).navigationTitle("Load Local Image")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showLoadImage = false } }
-                ToolbarItem(placement: .confirmationAction) { Button("Load Image") { launch { await loadImage() } }.buttonStyle(.borderedProminent).disabled(image.isEmpty || clusterName.isEmpty) }
+                ToolbarItem(placement: .confirmationAction) { Button("Load Image") { launch { await loadImage() } }.buttonStyle(.borderedProminent).disabled(busy || image.isEmpty || clusterName.isEmpty) }
             }
         }.frame(minWidth: 460, minHeight: 280)
     }
@@ -176,7 +179,7 @@ struct KubernetesFeatureView: View {
             }.formStyle(.grouped).navigationTitle("Write Kubeconfig")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showWriteConfig = false } }
-                ToolbarItem(placement: .confirmationAction) { Button("Write…") { confirmWriteConfig = true }.buttonStyle(.borderedProminent).disabled(clusterName.isEmpty || kubeconfig.isEmpty) }
+                ToolbarItem(placement: .confirmationAction) { Button("Write…") { confirmWriteConfig = true }.buttonStyle(.borderedProminent).disabled(busy || clusterName.isEmpty || kubeconfig.isEmpty) }
             }
             .confirmationDialog("Write kubeconfig for \(clusterName)?", isPresented: $confirmWriteConfig, titleVisibility: .visible) {
                 Button("Write Configuration") { launch { await writeConfig() } }
@@ -188,28 +191,23 @@ struct KubernetesFeatureView: View {
     }
 
     private func refreshList() async {
-        busy = true; error = nil
-        do {
-            let result = try await store.client.run(CommandRequest(arguments: ["k8s", "list"], captureLimit: 100_000, suppressOutputEvents: true))
-            guard result.succeeded else { throw FeatureCommandError(result: result) }
-            output = result.standardOutput
-        } catch { self.error = error.localizedDescription }
-        busy = false
+        _ = await execute(["k8s", "list"], title: "List Kubernetes Clusters")
     }
     private func createCluster() async {
-        var args = ["k8s", "create", "--name", clusterName, "--node-image", nodeImage]
+        let name = clusterName
+        var args = ["k8s", "create", "--name", name, "--node-image", nodeImage]
         if !cpus.isEmpty { args += ["--cpus", cpus] }; if !memory.isEmpty { args += ["--memory", memory] }
         if !registryScheme.isEmpty { args += ["--scheme", registryScheme] }
         if !maxDownloads.isEmpty { args += ["--max-concurrent-downloads", maxDownloads] }
         if !cni.isEmpty { args += ["--cni", cni] }; if removeOnStop { args.append("--rm") }
         guard await execute(args, title: "Create Kubernetes Cluster") else { return }
-        if !rememberedNames.contains(clusterName) { rememberedNames.append(clusterName); persistRemembered() }; showCreate = false; await refreshList()
+        store.pluginLibrary.rememberCluster(name); showCreate = false; await refreshList()
     }
     private func deleteCluster() async {
         let name = clusterName
         guard !name.isEmpty else { return }
         guard await execute(["k8s", "delete", "--name", name], title: "Delete Kubernetes Cluster") else { return }
-        rememberedNames.removeAll { $0 == name }; persistRemembered(); selectedNames.remove(name); await refreshList()
+        store.pluginLibrary.forgetCluster(name); selectedNames.remove(name); await refreshList()
     }
     private func loadImage() async {
         var args = ["k8s", "load-image", "--name", clusterName, image]
@@ -220,37 +218,20 @@ struct KubernetesFeatureView: View {
         if await execute(["k8s", "write-config", "--name", clusterName, "--kubeconfig", (kubeconfig as NSString).expandingTildeInPath], title: "Write Kubernetes Config") { showWriteConfig = false }
     }
     @discardableResult private func execute(_ arguments: [String], title: String) async -> Bool {
-        busy = true; error = nil
-        var succeeded = false
-        do {
-            let stream = store.stream(CommandRequest(arguments: arguments, captureLimit: 500_000), title: title)
-            operationID = store.operations.first?.id
-            for try await event in stream {
-                try Task.checkCancellation()
-                switch event {
-                case .standardOutput(let chunk): append(chunk)
-                case .standardError(let chunk): append(chunk)
-                case .completed(let result):
-                    if !result.succeeded { throw FeatureCommandError(result: result) }
-                    succeeded = true
-                }
-            }
-        } catch is CancellationError { }
-        catch { self.error = error.localizedDescription }
-        operationID = nil
-        busy = false
-        return succeeded
+        inputError = nil
+        return await operation.run(CommandRequest(arguments: arguments, captureLimit: 500_000), title: title, store: store, owner: owner)
     }
-    private func loadRemembered() {
-        if let data = rememberedData.data(using: .utf8), let names = try? JSONDecoder().decode([String].self, from: data) { rememberedNames = names }
+    private func launch(_ action: @escaping () async -> Void) {
+        guard !busy, actionTask == nil else { return }
+        let id = UUID()
+        actionID = id
+        actionTask = Task {
+            guard !Task.isCancelled else { return }
+            await action()
+            if actionID == id { actionTask = nil; actionID = nil }
+        }
     }
-    private func persistRemembered() {
-        guard let data = try? JSONEncoder().encode(rememberedNames), let string = String(data: data, encoding: .utf8) else { return }
-        rememberedData = string
-    }
-    private func append(_ text: String) { output += text; if output.count > 150_000 { output = String(output.suffix(150_000)) } }
-    private func launch(_ action: @escaping () async -> Void) { operationTask = Task { await action() } }
-    private func cancelOperation() { if let operationID { store.cancelOperation(operationID) }; operationTask?.cancel(); operationTask = nil }
+    private func cancelOperation() { operation.cancel(owner: owner) }
     private func chooseKubeconfig() {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "config"

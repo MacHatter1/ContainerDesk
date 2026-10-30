@@ -3,6 +3,25 @@ import Testing
 @testable import ContainerDeskCore
 
 struct ResourceJSONDecoderTests {
+    @Test(arguments: [ContainerSection.containers, .volumes, .networks])
+    func summariesApplyTheSameCredentialKeyPolicyAsInspect(_ section: ContainerSection) throws {
+        let labels = ["apiKey": "hidden-camel", "com.example.api-key": "hidden-hyphen", "privateKey": "hidden-private", "access_key": "hidden-access", "com.docker.compose.project": "storefront", "com.apple.container.plugin": "compose"]
+        let data = try JSONSerialization.data(withJSONObject: [["id": "fixture", "configuration": ["name": "fixture", "labels": labels]]])
+        let item = try #require(ResourceJSONDecoder.summaries(from: data, section: section).first)
+        #expect(item.details.labels == ["com.docker.compose.project": "storefront", "com.apple.container.plugin": "compose"])
+        let inspect = try ResourceJSONRedactor.redact(String(decoding: data, as: UTF8.self))
+        #expect(!inspect.contains("hidden-"))
+        #expect(inspect.contains("storefront"))
+    }
+
+    @Test func decodesPinnedMachineListResourceFields() throws {
+        let json = #"[{"id":"dev","status":"running","default":true,"cpus":4,"memory":4294967296}]"#
+        let machine = try #require(ResourceJSONDecoder.summaries(from: Data(json.utf8), section: .machines).first)
+        #expect(machine.details.cpuCount == 4)
+        #expect(machine.details.memoryBytes == 4_294_967_296)
+        #expect(machine.details.isDefault == true)
+    }
+
     @Test func decodesOnlyCuratedContainerMetadata() throws {
         let json = #"[{"id":"fixture-container-1","configuration":{"image":{"reference":"example.invalid/demo:dev"},"initProcess":{"environment":["TOKEN=fixture-only"]},"publishedPorts":[{"containerPort":3000,"hostPort":8080,"hostAddress":"127.0.0.1","proto":"tcp","count":1}],"resources":{"cpus":2,"memoryInBytes":536870912},"labels":{"project":"fixture","password":"do-not-retain"}},"status":{"state":"running"}}]"#
         let items = try ResourceJSONDecoder.summaries(from: Data(json.utf8), section: .containers)

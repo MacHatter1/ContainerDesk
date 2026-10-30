@@ -19,10 +19,11 @@ struct BuildFeatureView: View {
     @State private var noCache = false
     @State private var contextImporter = false
     @State private var dockerfileImporter = false
-    @State private var running = false
-    @State private var progress = ""
-    @State private var error: String?
-    @State private var operationTask: Task<Void, Never>?
+    @State private var operation = BuildOperationStore()
+    @State private var formError: String?
+    private var running: Bool { operation.isRunning }
+    private var progress: String { operation.output }
+    private var error: String? { formError ?? operation.error }
     @State private var showBuilderDelete = false
     @State private var showAdvanced = false
     @State private var showBuildArgs = false
@@ -42,13 +43,14 @@ struct BuildFeatureView: View {
             .frame(minHeight: 260, maxHeight: .infinity)
             Divider()
             outputPanel.padding(16).frame(minHeight: 170, idealHeight: 235)
-            HStack { Label(running ? "BuildKit is building" : "BuildKit image builder", systemImage: running ? "hammer.fill" : "shippingbox"); Spacer(); Button("Advanced Build Options…", systemImage: "slider.horizontal.3") { showAdvanced = true }.disabled(running) }
+            HStack { Label(running ? "Running BuildKit operation" : "BuildKit image builder", systemImage: running ? "hammer.fill" : "shippingbox"); Spacer(); Button("Advanced Build Options…", systemImage: "slider.horizontal.3") { showAdvanced = true }.disabled(running) }
                 .font(.caption).foregroundStyle(.secondary).padding(10).background(.bar)
         }
         .navigationTitle("Builds")
         .task { await refreshBuilderStatus() }
-        .fileImporter(isPresented: $contextImporter, allowedContentTypes: [.folder], allowsMultipleSelection: false) { result in switch result { case .success(let urls): if let url = urls.first { contextURL = url }; case .failure(let error): self.error = error.localizedDescription } }
-        .fileImporter(isPresented: $dockerfileImporter, allowedContentTypes: [.plainText, .text], allowsMultipleSelection: false) { result in switch result { case .success(let urls): dockerfileURL = urls.first; case .failure(let error): self.error = error.localizedDescription } }
+        .onDisappear { operation.cancel() }
+        .fileImporter(isPresented: $contextImporter, allowedContentTypes: [.folder], allowsMultipleSelection: false) { result in switch result { case .success(let urls): if let url = urls.first { contextURL = url }; case .failure(let error): formError = error.localizedDescription } }
+        .fileImporter(isPresented: $dockerfileImporter, allowedContentTypes: [.plainText, .text], allowsMultipleSelection: false) { result in switch result { case .success(let urls): dockerfileURL = urls.first; case .failure(let error): formError = error.localizedDescription } }
         .sheet(isPresented: $showAdvanced) { AdvancedCommandSheet(section: .builds, store: store) { _ in } }
         .confirmationDialog("Delete the image builder?", isPresented: $showBuilderDelete, titleVisibility: .visible) {
             Button("Delete Builder", role: .destructive) { Task { await builderAction(["builder", "delete"], title: "Delete Image Builder") } }
@@ -59,9 +61,9 @@ struct BuildFeatureView: View {
     private var header: some View {
         WorkspaceHeader(title: "Build Images", subtitle: "BuildKit · Dockerfile or Containerfile · progress remains in this view", symbol: "hammer.fill", tint: .orange) {
             Button {
-                if running { operationTask?.cancel() } else { startBuild() }
+                if running { operation.cancel() } else { startBuild() }
             } label: {
-                Label(running ? "Cancel Build" : "Build Image", systemImage: running ? "xmark.circle" : "hammer.fill")
+                Label(running ? "Cancel Operation" : "Build Image", systemImage: running ? "xmark.circle" : "hammer.fill")
             }
             .buttonStyle(.borderedProminent)
             .disabled(!running && (contextURL == nil || tags.lines.isEmpty))
@@ -160,6 +162,7 @@ struct BuildFeatureView: View {
 
     private func startBuild() {
         guard let contextURL, !tags.lines.isEmpty else { return }
+        formError = nil
         var args = ["build"]
         if let dockerfileURL { args += ["--file", dockerfileURL.path] }
         for tag in tags.lines { args += ["--tag", tag] }
@@ -176,39 +179,16 @@ struct BuildFeatureView: View {
         args.append(contextURL.path)
         let sensitive = buildArgs.lines.compactMap { $0.split(separator: "=", maxSplits: 1).dropFirst().first.map(String.init) }
         let request = CommandRequest(arguments: args, workingDirectory: contextURL, redactions: sensitive + secrets.lines, captureLimit: 1_000_000)
-        running = true; error = nil; progress = ""
-        let events = store.stream(request, title: "Build Image")
-        operationTask = Task {
-            do {
-                for try await event in events {
-                    try Task.checkCancellation()
-                    switch event {
-                    case .standardOutput(let chunk): append(chunk)
-                    case .standardError(let chunk): append(chunk)
-                    case .completed(let result): if !result.succeeded { error = result.standardError.isEmpty ? "Build failed with exit code \(result.exitCode)." : result.standardError }
-                    }
-                }
-            } catch is CancellationError { }
-            catch { self.error = error.localizedDescription }
-            running = false
-            if error == nil { await store.refresh(.images, force: true) }
+        operation.start(request, title: "Build Image", store: store) { succeeded in
+            if succeeded { await store.refresh(.images, force: true) }
         }
     }
 
     private func builderAction(_ args: [String], title: String) async {
-        running = true; error = nil; progress = ""
-        do {
-            let result = try await store.execute(CommandRequest(arguments: args, suppressOutputEvents: true), title: title)
-            guard result.succeeded else { throw FeatureCommandError(result: result) }
-            if args.contains("status") {
-                updateBuilderStatus(from: result.standardOutput)
-                progress = "Builder status refreshed."
-            } else {
-                progress = result.standardOutput + (result.standardError.isEmpty ? "" : "\n" + result.standardError)
-            }
-        } catch { self.error = error.localizedDescription }
-        if !args.contains("status") { await refreshBuilderStatus() }
-        running = false
+        formError = nil
+        operation.start(CommandRequest(arguments: args), title: title, store: store) { _ in
+            await refreshBuilderStatus()
+        }
     }
     private func refreshBuilderStatus() async {
         builderStatusLoaded = false
@@ -240,10 +220,7 @@ struct BuildFeatureView: View {
         return builderStatusLoaded ? "Not created" : "Checking…"
     }
     private var builderIsRunning: Bool { (builderStatus?.state ?? "").localizedCaseInsensitiveContains("running") }
-    private func append(_ text: String) {
-        progress += text
-        if progress.count > 150_000 { progress = String(progress.suffix(150_000)) }
-    }
+
 }
 
 private struct BuildKitStatus: Decodable {

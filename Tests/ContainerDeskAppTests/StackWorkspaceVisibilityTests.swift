@@ -44,7 +44,7 @@ struct StackWorkspaceVisibilityTests {
             if await predicate() { return }
             try await Task.sleep(for: .milliseconds(20))
         }
-        #expect(Bool(false), "The Stacks destination did not refresh all shared resource snapshots.")
+        #expect(await predicate(), "The Stacks destination did not refresh all shared resource snapshots.")
     }
 }
 

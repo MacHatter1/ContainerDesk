@@ -1,4 +1,5 @@
 import CFNetwork
+import Darwin
 import Foundation
 
 /// A current-user listener eligible for a loopback-only service probe.
@@ -8,12 +9,15 @@ public struct MLXLocalListener: Sendable, Hashable, Identifiable {
     public let processName: String
     public let address: String
     public let port: UInt16
+    /// Derived locally from the owning process's argv, never from an HTTP claim.
+    public let isMLXLMServer: Bool
 
-    public init(processID: Int32, processName: String, address: String, port: UInt16) {
+    public init(processID: Int32, processName: String, address: String, port: UInt16, isMLXLMServer: Bool = false) {
         self.processID = processID
         self.processName = safeExternalText(processName, limit: 128)
         self.address = safeExternalText(address, limit: 64)
         self.port = port
+        self.isMLXLMServer = isMLXLMServer
     }
 }
 
@@ -64,11 +68,13 @@ public struct MLXExternalProbeResult: Sendable, Equatable {
     public let status: MLXExternalServerStatus
     public let backend: String?
     public let models: [MLXExternalModelRecord]
+    public let requiresProcessIdentity: Bool
 
-    public init(status: MLXExternalServerStatus, backend: String? = nil, models: [MLXExternalModelRecord] = []) {
+    public init(status: MLXExternalServerStatus, backend: String? = nil, models: [MLXExternalModelRecord] = [], requiresProcessIdentity: Bool = false) {
         self.status = status
         self.backend = backend
         self.models = Array(models.prefix(64))
+        self.requiresProcessIdentity = requiresProcessIdentity
     }
 }
 
@@ -93,6 +99,10 @@ public protocol MLXExternalServerProbing: Sendable {
 
 /// Finds current-user MLX/Jev-compatible services without taking ownership of them.
 public struct MLXExternalServerDiscoverer: Sendable {
+    private struct VerifiedProbe: Sendable {
+        let record: MLXExternalServerRecord
+        let requiresProcessIdentity: Bool
+    }
     private let listenerEnumerator: any MLXListenerEnumerating
     private let serverProber: any MLXExternalServerProbing
     private let maximumListeners: Int
@@ -139,8 +149,8 @@ public struct MLXExternalServerDiscoverer: Sendable {
         let candidates = Array(orderedListeners.filter { seenListeners.insert($0.id).inserted }.prefix(maximumListeners))
         guard !candidates.isEmpty else { return MLXExternalServerDiscoveryResult(servers: []) }
 
-        var records: [MLXExternalServerRecord] = []
-        await withTaskGroup(of: MLXExternalServerRecord?.self) { group in
+        var records: [VerifiedProbe] = []
+        await withTaskGroup(of: VerifiedProbe?.self) { group in
             var nextIndex = 0
             let initialCount = min(maximumConcurrentProbes, candidates.count)
             for _ in 0..<initialCount {
@@ -166,7 +176,8 @@ public struct MLXExternalServerDiscoverer: Sendable {
         }
         guard !Task.isCancelled else { return MLXExternalServerDiscoveryResult(servers: []) }
         let currentKeys = Set(currentListeners.filter(Self.isCandidate).map(\.id))
-        let verifiedRecords = records.filter { currentKeys.contains($0.id) }
+        let stockKeys = Set(currentListeners.filter(\.isMLXLMServer).map(\.id))
+        let verifiedRecords = records.filter { currentKeys.contains($0.record.id) && (!$0.requiresProcessIdentity || stockKeys.contains($0.record.id)) }.map(\.record)
         return MLXExternalServerDiscoveryResult(servers: verifiedRecords.sorted {
             if $0.endpoint.port == $1.endpoint.port { return $0.processID < $1.processID }
             return ($0.endpoint.port ?? 0) < ($1.endpoint.port ?? 0)
@@ -187,12 +198,12 @@ public struct MLXExternalServerDiscoverer: Sendable {
         return name.contains("mlx") || name.contains("jev")
     }
 
-    private static func probeRecord(_ listener: MLXLocalListener, using prober: any MLXExternalServerProbing) async -> MLXExternalServerRecord? {
+    private static func probeRecord(_ listener: MLXLocalListener, using prober: any MLXExternalServerProbing) async -> VerifiedProbe? {
         guard !Task.isCancelled else { return nil }
         let endpoint = URL(string: "http://127.0.0.1:\(listener.port)")!
         guard let probe = await prober.probe(listener: listener),
               probe.backend?.localizedLowercase.contains("mlx") == true else { return nil }
-        return MLXExternalServerRecord(
+        let record = MLXExternalServerRecord(
             processID: listener.processID,
             processName: listener.processName,
             endpoint: endpoint,
@@ -201,6 +212,7 @@ public struct MLXExternalServerDiscoverer: Sendable {
             models: probe.models,
             detail: probe.status == .reachable ? "Responding on loopback; not managed by this app instance." : "The local service reported that it is not healthy."
         )
+        return VerifiedProbe(record: record, requiresProcessIdentity: probe.requiresProcessIdentity)
     }
 }
 
@@ -225,7 +237,13 @@ public struct LsofMLXListenerEnumerator: MLXListenerEnumerating, Sendable {
             timeout: .seconds(3)
         )
         let result = try await ProcessExecutableClient(executableURL: executableURL).run(request)
-        return try Self.parseResult(result)
+        let listeners = try Self.parseResult(result)
+        var stockProcesses: [Int32: Bool] = [:]
+        return listeners.map { listener in
+            let stock = stockProcesses[listener.processID] ?? MLXServerProcessIdentity.isServer(arguments: MLXServerProcessIdentity.arguments(processID: listener.processID))
+            stockProcesses[listener.processID] = stock
+            return MLXLocalListener(processID: listener.processID, processName: listener.processName, address: listener.address, port: listener.port, isMLXLMServer: stock)
+        }
     }
 
     static func parseResult(_ result: CommandResult) throws -> [MLXLocalListener] {
@@ -271,10 +289,12 @@ public struct LsofMLXListenerEnumerator: MLXListenerEnumerating, Sendable {
 public struct LoopbackMLXServerProber: MLXExternalServerProbing, Sendable {
     public let requestTimeout: TimeInterval
     public let maximumResponseBytes: Int
+    private let sessionConfiguration: @Sendable () -> URLSessionConfiguration
 
-    public init(requestTimeout: TimeInterval = 1.5, maximumResponseBytes: Int = 64 * 1024) {
+    public init(requestTimeout: TimeInterval = 1.5, maximumResponseBytes: Int = 64 * 1024, sessionConfiguration: @escaping @Sendable () -> URLSessionConfiguration = { .ephemeral }) {
         self.requestTimeout = min(3, max(0.2, requestTimeout))
         self.maximumResponseBytes = min(128 * 1024, max(1_024, maximumResponseBytes))
+        self.sessionConfiguration = sessionConfiguration
     }
 
     public func probe(listener: MLXLocalListener) async -> MLXExternalProbeResult? {
@@ -284,18 +304,24 @@ public struct LoopbackMLXServerProber: MLXExternalServerProbing, Sendable {
         let modelBackend = Self.string("backend", in: modelObject)
             ?? (modelObject?["data"] as? [[String: Any]])?.compactMap { $0["backend"] as? String }.first
         let healthObject: [String: Any]?
-        if modelBackend == nil { healthObject = await fetchJSON(port: listener.port, path: "/healthz") }
+        if modelBackend == nil { healthObject = await fetchJSON(port: listener.port, path: listener.isMLXLMServer ? "/health" : "/healthz") }
         else { healthObject = nil }
         guard !Task.isCancelled else { return nil }
         guard modelObject != nil || healthObject != nil else { return nil }
 
-        return Self.decode(modelsObject: modelObject, healthObject: healthObject)
+        return Self.decode(modelsObject: modelObject, healthObject: healthObject, isMLXLMServer: listener.isMLXLMServer)
     }
 
-    static func decode(modelsObject: [String: Any]?, healthObject: [String: Any]?) -> MLXExternalProbeResult? {
+    static func decode(modelsObject: [String: Any]?, healthObject: [String: Any]?, isMLXLMServer: Bool = false) -> MLXExternalProbeResult? {
         guard modelsObject != nil || healthObject != nil else { return nil }
         let modelBackend = (modelsObject?["data"] as? [[String: Any]])?.compactMap { $0["backend"] as? String }.first
-        let backend = Self.string("backend", in: healthObject) ?? Self.string("backend", in: modelsObject) ?? modelBackend
+        var backend = Self.string("backend", in: healthObject) ?? Self.string("backend", in: modelsObject) ?? modelBackend
+        var requiresProcessIdentity = false
+        if backend == nil, isMLXLMServer, modelsObject?["object"] as? String == "list",
+           modelsObject?["data"] is [[String: Any]], Self.string("status", in: healthObject) == "ok" {
+            backend = "mlx-lm"
+            requiresProcessIdentity = true
+        }
         var models = Self.models(from: modelsObject, fallbackBackend: backend)
         if models.isEmpty, let name = Self.string("model", in: healthObject) ?? Self.string("model", in: modelsObject) {
             models = [MLXExternalModelRecord(name: name, backend: backend)]
@@ -304,14 +330,14 @@ public struct LoopbackMLXServerProber: MLXExternalServerProbing, Sendable {
         let isHealthy: Bool
         if let healthStatus { isHealthy = ["ok", "healthy", "ready", "running"].contains(healthStatus) }
         else { isHealthy = modelsObject != nil }
-        return MLXExternalProbeResult(status: isHealthy ? .reachable : .unavailable, backend: backend, models: models)
+        return MLXExternalProbeResult(status: isHealthy ? .reachable : .unavailable, backend: backend, models: models, requiresProcessIdentity: requiresProcessIdentity)
     }
 
     private func fetchJSON(port: UInt16, path: String) async -> [String: Any]? {
-        guard path == "/v1/models" || path == "/healthz",
+        guard ["/v1/models", "/healthz", "/health"].contains(path),
               let url = URL(string: "http://127.0.0.1:\(port)\(path)") else { return nil }
         let delegate = ExternalNoRedirectDelegate()
-        let config = URLSessionConfiguration.ephemeral
+        let config = sessionConfiguration()
         config.connectionProxyDictionary = [
             kCFNetworkProxiesHTTPEnable as String: 0,
             kCFNetworkProxiesHTTPSEnable as String: 0,

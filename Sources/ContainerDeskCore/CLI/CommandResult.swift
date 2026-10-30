@@ -9,7 +9,11 @@ public struct CommandResult: Sendable, Equatable {
     public let outputTruncated: Bool
     public let timedOut: Bool
 
-    public var succeeded: Bool { terminationReason == .exit && exitCode == 0 }
+    public var succeeded: Bool { !timedOut && terminationReason == .exit && exitCode == 0 }
+    public var failureDescription: String? {
+        guard !succeeded else { return nil }
+        return timedOut ? "Command timed out." : "Command failed with exit code \(exitCode)."
+    }
 
     public init(standardOutput: String, standardError: String, exitCode: Int32, terminationReason: Process.TerminationReason, duration: Duration, outputTruncated: Bool = false, timedOut: Bool = false) {
         self.standardOutput = standardOutput

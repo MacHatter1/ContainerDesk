@@ -5,13 +5,15 @@ import SwiftUI
 
 /// Embeds a disposable SwiftTerm PTY for interactive CLI actions. Terminal contents are never persisted.
 struct ContainerTerminalView: NSViewRepresentable {
+    let runtimeOperations: RuntimeOperationPolicy
     var arguments: [String]
     var executablePath: String?
     var environment: [String: String]
     var currentDirectory: String?
     var onExit: ((Int32?) -> Void)?
 
-    init(arguments: [String], executablePath: String? = nil, environment: [String: String] = [:], currentDirectory: String? = nil, onExit: ((Int32?) -> Void)? = nil) {
+    init(arguments: [String], runtimeOperations: RuntimeOperationPolicy, executablePath: String? = nil, environment: [String: String] = [:], currentDirectory: String? = nil, onExit: ((Int32?) -> Void)? = nil) {
+        self.runtimeOperations = runtimeOperations
         self.arguments = arguments
         self.executablePath = executablePath
         self.environment = environment
@@ -25,6 +27,12 @@ struct ContainerTerminalView: NSViewRepresentable {
         let view = LocalProcessTerminalView(frame: .zero)
         view.processDelegate = context.coordinator
         applyTerminalAppearance(view, colorScheme: context.environment.colorScheme)
+        // Admission and synchronous PTY creation run on the main actor. Release
+        // immediately: idle guest sessions must not prevent a later recreation.
+        let lease: UUID?
+        do { lease = try runtimeOperations.beginCommand(CommandRequest(arguments: arguments)) }
+        catch { view.feed(text: "\(error.localizedDescription)\r\n"); return view }
+        defer { runtimeOperations.endCommand(lease) }
         guard let executable = ExecutableResolver(overridePath: executablePath).resolve() else {
             view.feed(text: "Container CLI was not found. Choose its path in Settings.\r\n")
             return view

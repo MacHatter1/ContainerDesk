@@ -105,17 +105,32 @@ public struct MLXToolchainDetector: MLXCapabilityProbing, Sendable {
             if let header, let firstLine = String(data: header, encoding: .utf8)?.split(whereSeparator: \.isNewline).first,
                firstLine.hasPrefix("#!") {
                 let interpreter = String(firstLine.dropFirst(2)).trimmingCharacters(in: .whitespaces)
-                if interpreter.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: interpreter) {
-                    return URL(fileURLWithPath: interpreter).standardizedFileURL
-                }
                 let components = interpreter.split(whereSeparator: \.isWhitespace)
-                if components.first.map({ URL(fileURLWithPath: String($0)).lastPathComponent }) == "env", let name = components.dropFirst().first,
-                   let located = resolveCommand(String(name), in: environment) { return located }
+                if let path = components.first, path.hasPrefix("/"), isPythonName(URL(fileURLWithPath: String(path)).lastPathComponent),
+                   FileManager.default.isExecutableFile(atPath: String(path)) {
+                    return URL(fileURLWithPath: String(path)).standardizedFileURL
+                }
+                if components.first.map({ URL(fileURLWithPath: String($0)).lastPathComponent }) == "env" {
+                    let arguments = components.dropFirst().filter { $0 != "-S" && $0 != "--split-string" }
+                    if let name = arguments.first, isPythonName(String(name)),
+                       let located = resolveCommand(String(name), in: environment) { return located }
+                }
             }
         }
-        let siblingPython = executable.deletingLastPathComponent().appendingPathComponent("python", isDirectory: false)
-        if FileManager.default.isExecutableFile(atPath: siblingPython.path) { return siblingPython.standardizedFileURL }
+        // pip/distlib may use a /bin/sh trampoline when the environment path contains
+        // spaces. The shell is a launcher, never the interpreter for our Python helper.
+        for name in ["python", "python3"] {
+            let siblingPython = executable.resolvingSymlinksInPath().deletingLastPathComponent().appendingPathComponent(name, isDirectory: false)
+            if FileManager.default.isExecutableFile(atPath: siblingPython.path) { return siblingPython.standardizedFileURL }
+        }
         return resolveCommand("python3", in: environment)
+    }
+
+    private static func isPythonName(_ name: String) -> Bool {
+        for prefix in ["python", "pypy"] where name.hasPrefix(prefix) {
+            return name.dropFirst(prefix.count).allSatisfy { $0.isNumber || $0 == "." }
+        }
+        return false
     }
 
     private static func resolveCommand(_ name: String, in environment: [String: String]) -> URL? {

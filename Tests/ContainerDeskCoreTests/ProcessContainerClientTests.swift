@@ -199,6 +199,14 @@ struct ProcessContainerClientTests {
         if let tail = redactor.finish() { #expect(tail.isEmpty) }
     }
 
+    @Test func aTimeoutCannotSucceedWhenTheChildHandlesTERMWithExitZero() async throws {
+        let client = ProcessExecutableClient(executableURL: URL(fileURLWithPath: "/bin/sh"))
+        let result = try await client.run(CommandRequest(arguments: ["-c", "trap 'exit 0' TERM; while :; do sleep 1; done"], timeout: .milliseconds(100)))
+        #expect(result.timedOut)
+        #expect(result.exitCode == 0)
+        #expect(!result.succeeded)
+    }
+
     @Test func timeoutIsReportedSeparatelyFromOrdinaryExit() async throws {
         let client = try makeClient(script: "sleep 5")
         let result = try await client.run(CommandRequest(arguments: [], timeout: .milliseconds(50)))

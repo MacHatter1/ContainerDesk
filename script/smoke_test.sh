@@ -18,11 +18,11 @@ HOST_FILE="$(/usr/bin/mktemp /private/tmp/containerdesk-copy.XXXXXX)"
 BUILD_CONTEXT="$MANIFEST_DIR/build-context"
 IMAGE="containerdesk-smoke-$SUFFIX:build"
 IMAGE_TAG="containerdesk-smoke-$SUFFIX:tagged"
-CREATED_NETWORK=0
-CREATED_VOLUME=0
-CREATED_CONTAINER=0
-CREATED_IMAGE=0
-CREATED_IMAGE_TAG=0
+NETWORK_MAY_EXIST=0
+VOLUME_MAY_EXIST=0
+CONTAINER_MAY_EXIST=0
+IMAGE_MAY_EXIST=0
+IMAGE_TAG_MAY_EXIST=0
 
 cleanup_step() {
   local description="$1"
@@ -36,26 +36,82 @@ cleanup_step() {
   fi
 }
 
+# A creating command can fail after its side effect, so cleanup tracks intent.
+# A failed delete is harmless only when a fresh, well-formed inventory proves absence.
+cleanup_resource() {
+  local kind="$1" target="$2" delete_status
+  shift 2
+  if "$@" >/dev/null 2>&1; then return 0; else delete_status=$?; fi
+  local inventory="$MANIFEST_DIR/cleanup-inventory.json"
+  local list_args=()
+  case "$kind" in
+    container) list_args=(list --all --format json) ;;
+    image) list_args=(image list --format json --verbose) ;;
+    volume) list_args=(volume list --format json) ;;
+    network) list_args=(network list --format json) ;;
+    *) return 1 ;;
+  esac
+  if "$CLI" "${list_args[@]}" > "$inventory" 2>/dev/null && /usr/bin/python3 - "$inventory" "$kind" "$target" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "rb") as stream:
+        payload = stream.read(2_000_001)
+    if len(payload) > 2_000_000:
+        raise ValueError("incomplete inventory")
+    rows = json.loads(payload)
+    if not isinstance(rows, list):
+        raise ValueError("invalid inventory")
+    names = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("invalid row")
+        config = row.get("configuration", {})
+        if not isinstance(config, dict):
+            raise ValueError("invalid configuration")
+        name = (config.get("id") or row.get("id")) if sys.argv[2] == "container" else config.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("missing identity")
+        names.append(name)
+        if sys.argv[2] == "image":
+            # Apple CLI 1.5 keeps the canonical reference in configuration.name
+            # and resolves its active default registry in displayReference.
+            # Compare both spellings; missing display metadata cannot prove
+            # that a failed deletion of an unqualified tag was harmless.
+            display = row.get("displayReference")
+            if not isinstance(display, str) or not display:
+                raise ValueError("missing image display reference")
+            names.append(display)
+    sys.exit(0 if sys.argv[3] not in names else 1)
+except (ValueError, OSError):
+    sys.exit(1)
+PY
+  then
+    return 0
+  fi
+  echo "Smoke cleanup failed: delete $kind $target (exit $delete_status; absence could not be verified)." >&2
+  return "$delete_status"
+}
+
 cleanup() {
   local exit_code=$?
   local cleanup_failed=0
   trap - EXIT INT TERM
   if [[ "$KEEP_FOR_UI" -eq 0 ]]; then
-    if [[ "$CREATED_CONTAINER" -eq 1 ]]; then
-      cleanup_step "stop container $NAME" "$CLI" stop --time 1 "$NAME" || cleanup_failed=1
-      cleanup_step "delete container $NAME" "$CLI" delete --force "$NAME" || cleanup_failed=1
+    if [[ "$CONTAINER_MAY_EXIST" -eq 1 ]]; then
+      "$CLI" stop --time 1 -- "$NAME" >/dev/null 2>&1 || true
+      cleanup_resource container "$NAME" "$CLI" delete --force -- "$NAME" || cleanup_failed=1
     fi
-    if [[ "$CREATED_IMAGE_TAG" -eq 1 ]]; then
-      cleanup_step "delete image $IMAGE_TAG" "$CLI" image delete --force "$IMAGE_TAG" || cleanup_failed=1
+    if [[ "$IMAGE_TAG_MAY_EXIST" -eq 1 ]]; then
+      cleanup_resource image "$IMAGE_TAG" "$CLI" image delete --force -- "$IMAGE_TAG" || cleanup_failed=1
     fi
-    if [[ "$CREATED_IMAGE" -eq 1 ]]; then
-      cleanup_step "delete image $IMAGE" "$CLI" image delete --force "$IMAGE" || cleanup_failed=1
+    if [[ "$IMAGE_MAY_EXIST" -eq 1 ]]; then
+      cleanup_resource image "$IMAGE" "$CLI" image delete --force -- "$IMAGE" || cleanup_failed=1
     fi
-    if [[ "$CREATED_VOLUME" -eq 1 ]]; then
-      cleanup_step "delete volume $VOLUME" "$CLI" volume delete "$VOLUME" || cleanup_failed=1
+    if [[ "$VOLUME_MAY_EXIST" -eq 1 ]]; then
+      cleanup_resource volume "$VOLUME" "$CLI" volume delete -- "$VOLUME" || cleanup_failed=1
     fi
-    if [[ "$CREATED_NETWORK" -eq 1 ]]; then
-      cleanup_step "delete network $NETWORK" "$CLI" network delete "$NETWORK" || cleanup_failed=1
+    if [[ "$NETWORK_MAY_EXIST" -eq 1 ]]; then
+      cleanup_resource network "$NETWORK" "$CLI" network delete -- "$NETWORK" || cleanup_failed=1
     fi
     cleanup_step "remove host file $HOST_FILE" /bin/rm -f "$HOST_FILE" || cleanup_failed=1
     cleanup_step "remove temporary directory $MANIFEST_DIR" /bin/rm -rf "$MANIFEST_DIR" || cleanup_failed=1
@@ -99,13 +155,13 @@ if not isinstance(entries, list) or not any(
 ):
     raise SystemExit("Smoke build requires the existing buildkit builder to be running; no builder was started or changed.")
 PY
+NETWORK_MAY_EXIST=1
 "$CLI" network create "$NETWORK" >/dev/null
-CREATED_NETWORK=1
+VOLUME_MAY_EXIST=1
 "$CLI" volume create "$VOLUME" >/dev/null
-CREATED_VOLUME=1
 printf 'ContainerDesk smoke %s\n' "$SUFFIX" > "$HOST_FILE"
+CONTAINER_MAY_EXIST=1
 "$CLI" run --detach --name "$NAME" --cpus 1 --memory 256M --network "$NETWORK" --volume "$VOLUME:/tmp/containerdesk" alpine:3.20 sh -c 'while true; do echo containerdesk-smoke; sleep 1; done' >/dev/null
-CREATED_CONTAINER=1
 
 "$CLI" inspect "$NAME" >/dev/null
 "$CLI" logs -n 5 "$NAME" >/dev/null
@@ -121,10 +177,10 @@ cat > "$BUILD_CONTEXT/Containerfile" <<'EOF'
 FROM scratch
 COPY marker.txt /marker.txt
 EOF
+IMAGE_MAY_EXIST=1
 "$CLI" build --tag "$IMAGE" "$BUILD_CONTEXT"
-CREATED_IMAGE=1
+IMAGE_TAG_MAY_EXIST=1
 "$CLI" image tag "$IMAGE" "$IMAGE_TAG"
-CREATED_IMAGE_TAG=1
 "$CLI" image inspect "$IMAGE_TAG" >/dev/null
 "$CLI" image save --output "$MANIFEST_DIR/image.tar" "$IMAGE_TAG"
 "$CLI" image load --input "$MANIFEST_DIR/image.tar" --force
