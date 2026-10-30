@@ -167,6 +167,25 @@ struct ContainerResourceReaderTests {
         #expect(!cli.requests.map(\.arguments).contains(where: { $0.first == "stats" && $0.contains("stale") }))
     }
 
+    @Test func nativeStatsMergeSamplesAndFailuresAcrossBatches() async throws {
+        let cli = StubContainerClient()
+        let samples = ["b", "e", "f"].map {
+            ContainerStatsSample(id: $0, cpuUsageUsec: 20, memoryUsageBytes: 512, sampledAtUptimeNanoseconds: 900)
+        }
+        let api = StubAppleContainerAPI(
+            stats: Dictionary(uniqueKeysWithValues: samples.map { ($0.id, $0) }),
+            statsFailures: ["a", "c", "d"]
+        )
+        let reader = ContainerResourceReader(cli: cli, nativeAPI: api)
+
+        let result = try await reader.stats(ids: ["f", "a", "e", "d", "c", "b"])
+
+        #expect(result.backend == .nativeAPI, "Fallback reason: \(result.fallbackReason ?? "none")")
+        #expect(result.value == samples)
+        #expect(Set(result.failures.keys) == ["a", "c", "d"])
+        #expect(!cli.requests.map(\.arguments).contains(["stats", "--no-stream", "--format", "json"]))
+    }
+
     @Test func cliInspectRedactsEnvironmentArgsAndCredentialFields() async throws {
         let cli = StubContainerClient(inspectJSON: #"{"configuration":{"initProcess":{"environment":["API_TOKEN=env-private","MODE=test"],"arguments":["--password","arg-private","--token=flag-private"]},"registryPassword":"field-private"}}"#)
         let reader = ContainerResourceReader(cli: cli, nativeAPI: nil)
