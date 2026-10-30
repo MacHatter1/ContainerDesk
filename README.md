@@ -225,6 +225,29 @@ CONTAINERDESK_PROFILES_LIVE_CHECK=1 CONTAINERDESK_PROFILES_IMAGE=docker.io/libra
 
 The optional `./script/smoke_test.sh` uses uniquely named temporary resources and the already-running builder to exercise container, file, volume, network, export, image build, and OCI archive workflows. It removes only the resources it created. Use `--keep-for-ui` to retain them for manual review; remove only the printed resource names afterward. `./script/plugin_smoke_test.sh` covers the Compose and Kubernetes plugins in the same disposable way.
 
+For an optimized local app bundle, set the build configuration to `release`:
+
+```sh
+CONTAINERDESK_BUILD_CONFIGURATION=release ./script/build_and_run.sh --build-only
+```
+
+## Releases
+
+After changes are ready on `main`, push a semantic version tag to start the release workflow:
+
+```sh
+git tag -a v1.0.0 -m "ContainerDesk v1.0.0"
+git push origin v1.0.0
+```
+
+The workflow runs `swift test`, builds the optimized macOS app, and publishes a GitHub Release with generated notes, a macOS Apple silicon ZIP, and its SHA-256 checksum. Tags such as `v1.0.0-rc.1` are published as prereleases. The release ZIP is not Developer ID signed or notarized; see [macOS Gatekeeper](#macos-gatekeeper) before distributing it.
+
+After downloading both release assets into the same folder, verify the ZIP with:
+
+```sh
+shasum -a 256 -c ContainerDesk-v1.0.0-macos-arm64.zip.sha256
+```
+
 ## License
 
 ContainerDesk is released under the [MIT License](LICENSE). It is provided as is, without warranty of any kind.

@@ -5,6 +5,7 @@ MODE="${1:-run}"
 APP_NAME="ContainerDesk"
 BUNDLE_ID="com.thomasswift.ContainerDesk"
 MIN_SYSTEM_VERSION="26.0"
+BUILD_CONFIGURATION="${CONTAINERDESK_BUILD_CONFIGURATION:-debug}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 DIST_DIR="$ROOT_DIR/dist"
@@ -13,6 +14,11 @@ APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
 APP_BINARY="$APP_MACOS/$APP_NAME"
 APP_ICON="$ROOT_DIR/Sources/ContainerDeskApp/Resources/ContainerDesk.icns"
+
+if [[ "$BUILD_CONFIGURATION" != "debug" && "$BUILD_CONFIGURATION" != "release" ]]; then
+  echo "CONTAINERDESK_BUILD_CONFIGURATION must be 'debug' or 'release'." >&2
+  exit 2
+fi
 
 if [[ ! -f "$APP_ICON" ]]; then
   echo "Missing app icon: $APP_ICON" >&2
@@ -37,8 +43,8 @@ if [[ "$MODE" != "--build-only" && "$MODE" != "build-only" ]]; then
     fi
   fi
 fi
-swift build
-BUILD_BIN_PATH="$(swift build --show-bin-path)"
+swift build --configuration "$BUILD_CONFIGURATION"
+BUILD_BIN_PATH="$(swift build --configuration "$BUILD_CONFIGURATION" --show-bin-path)"
 BUILD_BINARY="$BUILD_BIN_PATH/$APP_NAME"
 
 rm -rf "$APP_BUNDLE"
