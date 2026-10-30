@@ -240,12 +240,14 @@ git tag -a v1.0.0 -m "ContainerDesk v1.0.0"
 git push origin v1.0.0
 ```
 
-The workflow runs `swift test`, builds the optimized macOS app, and publishes a GitHub Release with generated notes, a macOS Apple silicon ZIP, and its SHA-256 checksum. Tags such as `v1.0.0-rc.1` are published as prereleases. The release ZIP is not Developer ID signed or notarized; see [macOS Gatekeeper](#macos-gatekeeper) before distributing it.
+The workflow runs `swift test`, builds the optimized macOS app, and publishes a GitHub Release with generated notes, a drag-to-Applications DMG, a ZIP, and a SHA-256 checksum for each. Tags such as `v1.0.0-rc.1` are published as prereleases. The downloads are not Developer ID signed or notarized; see [macOS Gatekeeper](#macos-gatekeeper) before distributing them.
 
-After downloading both release assets into the same folder, verify the ZIP with:
+After downloading a release file and its matching `.sha256` file into the same folder, verify either download with:
 
 ```sh
-shasum -a 256 -c ContainerDesk-v1.0.0-macos-arm64.zip.sha256
+shasum -a 256 -c \
+  ContainerDesk-v1.0.0-macos-arm64.dmg.sha256 \
+  ContainerDesk-v1.0.0-macos-arm64.zip.sha256
 ```
 
 ## License

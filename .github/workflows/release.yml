@@ -51,9 +51,16 @@ jobs:
           mkdir -p dist/release
           archive="ContainerDesk-${GITHUB_REF_NAME}-macos-arm64.zip"
           ditto -c -k --sequesterRsrc --keepParent dist/ContainerDesk.app "dist/release/$archive"
+          disk_image="ContainerDesk-${GITHUB_REF_NAME}-macos-arm64.dmg"
+          image_root="$(mktemp -d)"
+          trap 'rm -rf "$image_root"' EXIT
+          ditto dist/ContainerDesk.app "$image_root/ContainerDesk.app"
+          ln -s /Applications "$image_root/Applications"
+          hdiutil create -volname "ContainerDesk ${GITHUB_REF_NAME}" -srcfolder "$image_root" -ov -format UDZO "dist/release/$disk_image"
           (
             cd dist/release
             shasum -a 256 "$archive" > "$archive.sha256"
+            shasum -a 256 "$disk_image" > "$disk_image.sha256"
           )
 
       - name: Upload release assets
@@ -89,4 +96,4 @@ jobs:
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             release_args+=(--prerelease)
           fi
-          gh release create "$GITHUB_REF_NAME" release-assets/*.zip release-assets/*.sha256 "${release_args[@]}"
+          gh release create "$GITHUB_REF_NAME" release-assets/*.dmg release-assets/*.zip release-assets/*.sha256 "${release_args[@]}"
