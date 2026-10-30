@@ -79,14 +79,20 @@ jobs:
             swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.resolved', 'Package.swift') }}-
 
       - name: Run release tests
-        run: swift test --configuration release --force-resolved-versions --xunit-output test-results.xml
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test --configuration release --force-resolved-versions --xunit-output test-results.xml 2>&1 | tee test-results.log
+          test -s test-results-swift-testing.xml || { echo "Swift Testing report is missing or empty." >&2; exit 1; }
 
       - name: Upload test results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: test-results
-          path: test-results.xml
+          path: |
+            test-results*.xml
+            test-results.log
           if-no-files-found: warn
 
       - name: Build release app bundle

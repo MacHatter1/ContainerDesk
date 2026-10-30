@@ -2,6 +2,8 @@
 
 The `CI / Lint workflows and scripts` job checks workflows with actionlint and shell scripts with ShellCheck using pinned, checksum-verified binaries. The `CI / Test and build` job runs for pull requests and pushes to `main` on GitHub's macOS 26 runner. It uses Xcode 26.6, runs the Swift tests in release configuration with locked package versions, uploads xUnit results, builds the release app bundle and validates it. SwiftPM caches are keyed by the OS, architecture, toolchain and package manifests; they are an acceleration, not a replacement for testing. The tag-triggered release workflow repeats these checks before packaging and publishing. Bundle validation does not establish Developer ID signing or notarization.
 
+Test artifacts include the console log and XML reports. SwiftPM adds `-swift-testing` to the report filename when both testing libraries are enabled; the upload includes that report, and a successful test command must produce it. The build records its actual SwiftPM resource bundle inventory so validation also works after extracting a release archive.
+
 Required status checks are configured in the repository’s branch protection, not by workflow files. `main` requires **Test and build** and **Lint workflows and scripts** from GitHub Actions, including for administrators. The live integration workflow is not required. Pull requests exercise both required checks; pushes to `main` also run CI after merging.
 
 ## Dedicated live runner
