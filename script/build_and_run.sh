@@ -67,9 +67,12 @@ PLIST
 APP_RESOURCES="$APP_CONTENTS/Resources"
 mkdir -p "$APP_RESOURCES"
 cp "$APP_ICON" "$APP_RESOURCES/ContainerDesk.icns"
+RESOURCE_INVENTORY="$APP_RESOURCES/SwiftPMResourceBundles.txt"
+: > "$RESOURCE_INVENTORY"
 shopt -s nullglob
 for RESOURCE_BUNDLE in "$BUILD_BIN_PATH"/*.bundle; do
   cp -R "$RESOURCE_BUNDLE" "$APP_RESOURCES/"
+  printf '%s\n' "${RESOURCE_BUNDLE##*/}" >> "$RESOURCE_INVENTORY"
 done
 
 "$ROOT_DIR/script/validate_app_bundle.sh" "$APP_BUNDLE"

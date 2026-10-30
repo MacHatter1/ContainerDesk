@@ -33,24 +33,37 @@ ARCHS="$(/usr/bin/lipo -archs "$BINARY" 2>/dev/null)" || fail "executable is not
 [[ " $ARCHS " == *" arm64 "* ]] || fail "executable must include arm64 (found: $ARCHS)"
 [[ -s "$RESOURCES/ContainerDesk.icns" ]] || fail "icon Contents/Resources/ContainerDesk.icns is missing or empty"
 
-# Resource bundles emitted by the pinned SwiftPM dependency graph. Update this
-# list when Package.resolved changes the resources required by the executable.
-for bundle in \
-  ContainerDesk_ContainerDeskApp \
-  SwiftProtobuf_SwiftProtobuf \
-  swift-crypto_CCryptoBoringSSL \
-  swift-crypto_CCryptoBoringSSLShims \
-  swift-crypto_Crypto \
-  swift-crypto_CryptoBoringWrapper \
-  swift-crypto_CryptoExtras \
-  swift-nio-ssl_NIOSSL \
-  swift-nio_NIOPosix \
-  swift-nio__NIOFileSystem; do
-  bundle_contents="$RESOURCES/$bundle.bundle/Contents"
-  [[ -f "$bundle_contents/Info.plist" && -d "$bundle_contents/Resources" ]] || fail "required SwiftPM resource bundle $bundle.bundle is missing or incomplete"
-  if [[ "$bundle" != ContainerDesk_ContainerDeskApp ]]; then
-    [[ -s "$bundle_contents/Resources/PrivacyInfo.xcprivacy" ]] || fail "$bundle.bundle is missing PrivacyInfo.xcprivacy"
+# The build records the actual SwiftPM output so packaged copies can be
+# checked without the build directory. Swift Build uses Contents/Resources;
+# native SwiftPM copies resources to the bundle root.
+INVENTORY="$RESOURCES/SwiftPMResourceBundles.txt"
+[[ -s "$INVENTORY" ]] || fail "SwiftPM resource bundle inventory is missing or empty"
+declared_bundles=" "
+app_bundle_found=false
+while IFS= read -r bundle || [[ -n "$bundle" ]]; do
+  [[ "$bundle" =~ ^[A-Za-z0-9_.-]+\.bundle$ && "$bundle" != .* ]] || fail "invalid SwiftPM resource bundle name in inventory: '$bundle'"
+  [[ "$declared_bundles" != *" $bundle "* ]] || fail "duplicate SwiftPM resource bundle in inventory: $bundle"
+  declared_bundles+="$bundle "
+  bundle_path="$RESOURCES/$bundle"
+  [[ -d "$bundle_path" ]] || fail "required SwiftPM resource bundle $bundle is missing"
+  if [[ -d "$bundle_path/Contents" ]]; then
+    bundle_resources="$bundle_path/Contents/Resources"
+    bundle_plist="$bundle_path/Contents/Info.plist"
+    [[ -f "$bundle_plist" ]] || fail "$bundle is missing Contents/Info.plist"
+  else
+    bundle_resources="$bundle_path"
+    bundle_plist="$bundle_path/Info.plist"
   fi
-done
-[[ -s "$RESOURCES/ContainerDesk_ContainerDeskApp.bundle/Contents/Resources/ContainerDesk.icns" ]] || fail "app's SwiftPM resource bundle is missing ContainerDesk.icns"
+  if [[ -f "$bundle_plist" ]]; then
+    /usr/bin/plutil -lint "$bundle_plist" >/dev/null 2>&1 || fail "$bundle has an invalid Info.plist"
+  fi
+  if [[ "$bundle" == ContainerDesk_ContainerDeskApp.bundle ]]; then
+    app_bundle_found=true
+    [[ -s "$bundle_resources/ContainerDesk.icns" ]] || fail "$bundle is missing ContainerDesk.icns"
+    [[ -s "$bundle_resources/README.txt" ]] || fail "$bundle is missing README.txt"
+  else
+    [[ -s "$bundle_resources/PrivacyInfo.xcprivacy" ]] || fail "$bundle is missing PrivacyInfo.xcprivacy"
+  fi
+done < "$INVENTORY"
+[[ "$app_bundle_found" == true ]] || fail "SwiftPM resource bundle inventory does not list ContainerDesk_ContainerDeskApp.bundle"
 echo "Validated app bundle: $APP_BUNDLE"
