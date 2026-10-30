@@ -75,6 +75,16 @@ Browse, run, build, inspect and clean up Linux containers on your Mac with live 
 - Use **Edit Limits…** on a container to review new CPU and memory limits and recreate it with downtime. The flow backs up the stopped writable disk and boot files, keeps the full launch settings and existing mounts, and restores the prior running/stopped state. A container that has never started can change limits without booting. It attempts restoration if recreation fails. This flow requires the default CLI and API server at exactly 1.5.0 and rejects configurations it cannot preserve safely before stopping them. See [Safety and data handling](#safety-and-data-handling) for how recreation and recovery work.
 - Pull, push, tag, save and load OCI images.
 
+### Stacks
+
+- Create and name a stack, including an empty stack to populate later.
+- Add existing containers, run new containers into a stack, move members between saved stacks, or remove members.
+- Rename or delete a saved stack. Removing members or deleting a stack preserves the containers and their data.
+- Discover groups from project labels and shared names, then save a discovered group as an editable stack.
+- View aggregate metrics, related resources, and tagged merged logs; start, stop, or restart saved and label-verified stacks.
+
+Saved membership is local to ContainerDesk and separated by the configured CLI runtime. It takes priority over discovery; explicitly removed members remain ungrouped. Membership changes do not alter container networking, storage, or runtime labels. Stack definitions persist in `~/Library/Application Support/ContainerDesk/stacks.json`.
+
 ### Environment profiles
 
 - Use **Containers → Profiles** to save, edit, duplicate, import and export reusable environment profiles. Profiles retain the image, optional command and container name, ports, mounts, networks, CPU/memory limits, platform, environment-file paths and required variable names. **Review & Run…** opens the full launch form before starting anything. You can also save the current Run form as a profile or load an existing profile there.
@@ -232,6 +242,23 @@ For an optimized local app bundle, set the build configuration to `release`:
 ```sh
 CONTAINERDESK_BUILD_CONFIGURATION=release ./script/build_and_run.sh --build-only
 ```
+
+Measure sidebar navigation in the debug app with:
+
+```sh
+./script/build_and_run.sh --navigation-benchmark
+```
+
+The benchmark drives the sidebar's selection binding through Images, Containers,
+Activity, Cleanup, and System. It warms the destinations, measures three further
+cycles without accessibility inspection or screenshots, and fails if any warm
+switch takes 500 ms or longer. Results are saved to the ignored
+`output/navigation-benchmark.json`; set `CONTAINERDESK_NAVIGATION_REPORT` to use
+another absolute output path. The metric ends when the main run loop settles
+after the destination updates; it does not measure physical display presentation
+or completion of asynchronous resource reads. The benchmark performs read-only
+navigation and leaves the app open. Use `--navigation-metrics` to log timings
+while switching pages manually.
 
 ## Releases
 

@@ -6,7 +6,10 @@ struct ResourceFeatureView: View {
     let section: ContainerSection
     let store: AppStore
     let sceneID: String
-    @Environment(\.openCleanup) private var openCleanup
+    let activation: ResourceFeatureActivation
+
+    private var isActive: Bool { activation.isActive }
+    private var openCleanup: CleanupNavigationAction { activation.cleanupNavigation }
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var query = ""
@@ -42,6 +45,11 @@ struct ResourceFeatureView: View {
     private var sortedItems: [ResourceSummary] { items.sorted(using: sortOrder) }
 
     var body: some View {
+        content
+            .environment(\.openCleanup, activation.cleanupNavigation)
+    }
+
+    private var content: some View {
         VStack(spacing: 0) {
             resourceActionsBar
             if let notice {
@@ -58,21 +66,19 @@ struct ResourceFeatureView: View {
                 .transition(.opacity)
                 .animation(ContainerDeskMotion.animation(reduceMotion: reduceMotion), value: notice.id)
             }
-            GeometryReader { geometry in
-                let workspaceWidth = max(0, geometry.size.width)
-                VSplitView {
-                    resourceTable
-                        .frame(width: workspaceWidth)
-                        .frame(minHeight: 180, idealHeight: 400, maxHeight: .infinity)
-                    detailPaneContainer(width: workspaceWidth)
-                }
-                .frame(width: workspaceWidth, height: geometry.size.height)
+            VSplitView {
+                resourceTable
+                    .frame(minHeight: 180, idealHeight: 400, maxHeight: .infinity)
+                detailPaneContainer
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             footer
         }
         .navigationTitle(section.title)
-        .task { await store.refresh(section) }
+        .task {
+            guard isActive else { return }
+            await store.refresh(section)
+        }
         .sheet(isPresented: $showingCreate, onDismiss: { initialImage = "" }) {
             if section == .containers || (section == .images && !initialImage.isEmpty) {
                 ContainerRunSheet(store: store, initialImage: initialImage) { presentNotice($0) }
@@ -100,19 +106,32 @@ struct ResourceFeatureView: View {
             if focusedID == nil { focusedID = new.first }
             if old.isEmpty != new.isEmpty { detailTab = .overview }
         }
-        .onAppear { updateStatsTarget() }
-        .onChange(of: detailTab) { _, _ in updateStatsTarget() }
+        .onAppear { if isActive { updateStatsTarget() } }
+        .onReceive(activation.$isActive.dropFirst().removeDuplicates()) { active in
+            if active { updateStatsTarget() }
+            else {
+                clearStatsTargetIfNeeded()
+                if showingCreate { showingCreate = false }
+                if showingProfiles { showingProfiles = false }
+                if showingAdvanced { showingAdvanced = false }
+                if !initialImage.isEmpty { initialImage = "" }
+                if pendingAction != nil { pendingAction = nil }
+                if limitsTarget != nil { limitsTarget = nil }
+            }
+        }
+        .onChange(of: detailTab) { _, _ in if isActive { updateStatsTarget() } }
         .onChange(of: selected?.id) { _, _ in
+            guard isActive else { return }
             detailTab = .overview
             store.setStatsTarget(nil, forWindow: sceneID)
         }
-        .onDisappear { store.setStatsTarget(nil, forWindow: sceneID) }
+        .onDisappear { clearStatsTargetIfNeeded() }
     }
 
-    private func detailPaneContainer(width: CGFloat) -> some View {
+    private var detailPaneContainer: some View {
         VStack(spacing: 0) {
             if let selected {
-                ResourceDetailPane(resource: selected, section: section, tab: $detailTab, transientText: $transientText, store: store, limitsOperationInProgress: store.limitsOperationContainerID == selected.id) { presentNotice($0) } action: { kind in
+                ResourceDetailPane(resource: selected, section: section, tab: $detailTab, transientText: $transientText, store: store, limitsOperationInProgress: store.limitsOperationContainerID == selected.id, activation: activation) { presentNotice($0) } action: { kind in
                     pendingAction = .init(kind: kind, id: selected.id)
                 } onRun: { image in
                     initialImage = image
@@ -139,7 +158,7 @@ struct ResourceFeatureView: View {
                 .background(Color.accentColor.opacity(0.025))
             }
         }
-        .frame(width: width)
+        .frame(maxWidth: .infinity)
         .frame(minHeight: selected == nil ? 78 : 240, idealHeight: selected == nil ? 96 : 320, maxHeight: selected == nil ? 96 : .infinity, alignment: .top)
     }
 
@@ -318,6 +337,7 @@ struct ResourceFeatureView: View {
 
     private var sectionTint: Color {
         switch section {
+        case .stacks: .indigo
         case .containers: .green
         case .images: .blue
         case .volumes: .purple
@@ -456,6 +476,10 @@ struct ResourceFeatureView: View {
     private func isRunning(_ resource: ResourceSummary) -> Bool { (resource.state ?? "").localizedCaseInsensitiveContains("running") }
     private func updateStatsTarget() {
         store.setStatsTarget(section == .containers && detailTab == .stats ? selected?.id : nil, forWindow: sceneID)
+    }
+    private func clearStatsTargetIfNeeded() {
+        guard section == .containers, detailTab == .stats, let id = selected?.id else { return }
+        store.clearStatsTarget(id, forWindow: sceneID)
     }
     private func cpuGaugeHelp(_ resource: ResourceSummary) -> String {
         if let count = cpuAllocationCount(for: resource) {
@@ -643,6 +667,7 @@ private extension ResourceSummary {
 extension ContainerSection {
     var symbol: String {
         switch self {
+        case .stacks: "square.stack.3d.up.fill"
         case .containers: "shippingbox"
         case .images: "square.stack.3d.up"
         case .builds: "hammer"

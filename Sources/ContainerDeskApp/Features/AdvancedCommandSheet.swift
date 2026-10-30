@@ -330,6 +330,7 @@ private enum AdvancedCommandCatalog {
     typealias Positional = AdvancedCommandSpec.Positional
     static func specs(for section: ContainerSection) -> [AdvancedCommandSpec] {
         switch section {
+        case .stacks: []
         case .containers: containers
         case .images: images
         case .builds: builds
