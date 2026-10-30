@@ -134,6 +134,10 @@ The script builds `dist/ContainerDesk.app`, stages its SwiftPM resource bundles,
 
 The app discovers the Homebrew CLI from standard install paths and inherited `PATH`. If it cannot find the executable, open **ContainerDesk → Settings** and select it.
 
+### macOS Gatekeeper
+
+The app bundle produced by the build script is not signed with a Developer ID or notarized by Apple. If you download a build, macOS may warn or block the first launch. If you trust the source and have verified the download, try opening the app once, then use **System Settings → Privacy & Security → Open Anyway** if macOS offers that option. Managed Macs may restrict this override. See [Apple’s instructions for opening an unidentified or unnotarized app](https://support.apple.com/en-gb/102445).
+
 ## How it works
 
 ContainerDesk is a SwiftPM package with two modules:
