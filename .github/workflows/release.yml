@@ -16,6 +16,8 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
 
     steps:
       - name: Check out repository
@@ -32,12 +34,42 @@ jobs:
           fi
 
       - name: Show toolchain versions
+        id: toolchain
+        shell: bash
         run: |
+          set -euo pipefail
           sw_vers
+          xcodebuild -version
           swift --version
+          fingerprint="$( { uname -m; xcodebuild -version; swift --version; } | shasum -a 256 | cut -d ' ' -f 1)"
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
 
-      - name: Run tests
-        run: swift test
+      - name: Cache SwiftPM dependencies and build outputs
+        uses: actions/cache@v5
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.resolved', 'Package.swift') }}-${{ github.sha }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.resolved', 'Package.swift') }}-
+
+      - name: Run release tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test --configuration release --force-resolved-versions --xunit-output test-results.xml 2>&1 | tee test-results.log
+          test -s test-results-swift-testing.xml || { echo "Swift Testing report is missing or empty." >&2; exit 1; }
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-test-results
+          path: |
+            test-results*.xml
+            test-results.log
+          if-no-files-found: warn
 
       - name: Build release app bundle
         run: ./script/build_and_run.sh --build-only

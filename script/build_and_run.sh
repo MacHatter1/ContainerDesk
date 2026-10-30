@@ -43,8 +43,8 @@ if [[ "$MODE" != "--build-only" && "$MODE" != "build-only" ]]; then
     fi
   fi
 fi
-swift build --configuration "$BUILD_CONFIGURATION"
-BUILD_BIN_PATH="$(swift build --configuration "$BUILD_CONFIGURATION" --show-bin-path)"
+swift build --force-resolved-versions --configuration "$BUILD_CONFIGURATION"
+BUILD_BIN_PATH="$(swift build --force-resolved-versions --configuration "$BUILD_CONFIGURATION" --show-bin-path)"
 BUILD_BINARY="$BUILD_BIN_PATH/$APP_NAME"
 
 rm -rf "$APP_BUNDLE"
@@ -67,10 +67,15 @@ PLIST
 APP_RESOURCES="$APP_CONTENTS/Resources"
 mkdir -p "$APP_RESOURCES"
 cp "$APP_ICON" "$APP_RESOURCES/ContainerDesk.icns"
+RESOURCE_INVENTORY="$APP_RESOURCES/SwiftPMResourceBundles.txt"
+: > "$RESOURCE_INVENTORY"
 shopt -s nullglob
 for RESOURCE_BUNDLE in "$BUILD_BIN_PATH"/*.bundle; do
   cp -R "$RESOURCE_BUNDLE" "$APP_RESOURCES/"
+  printf '%s\n' "${RESOURCE_BUNDLE##*/}" >> "$RESOURCE_INVENTORY"
 done
+
+"$ROOT_DIR/script/validate_app_bundle.sh" "$APP_BUNDLE"
 
 case "$MODE" in
   --build-only|build-only) ;;

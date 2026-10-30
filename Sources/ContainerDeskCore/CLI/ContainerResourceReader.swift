@@ -188,19 +188,20 @@ public struct ContainerResourceReader: Sendable {
         for offset in stride(from: 0, to: ids.count, by: 4) {
             try Task.checkCancellation()
             let batch = Array(ids[offset..<min(offset + 4, ids.count)])
-            await withTaskGroup(of: (String, Result<ContainerStatsSample, Error>).self) { group in
+            await withTaskGroup(of: NativeStatsResult.self) { group in
                 for id in batch {
                     group.addTask {
-                        do { return (id, .success(try await api.stats(id: id))) }
-                        catch { return (id, .failure(error)) }
+                        do { return .sample(try await api.stats(id: id)) }
+                        catch is CancellationError { return .cancelled }
+                        catch { return .failed(id) }
                     }
                 }
-                for await (id, result) in group {
+                for await result in group {
                     switch result {
-                    case .success(let sample): samples.append(sample)
-                    case .failure(let error):
-                        if error is CancellationError { continue }
+                    case .sample(let sample): samples.append(sample)
+                    case .failed(let id):
                         failures[id] = "Statistics are unavailable for this container."
+                    case .cancelled: break
                     }
                 }
             }
@@ -229,6 +230,13 @@ public struct ContainerResourceReader: Sendable {
         default: nil
         }
     }
+}
+
+// Optimized Swift 6.3 and 6.4 can lose task-group results with a tuple containing Result.
+private enum NativeStatsResult: Sendable {
+    case sample(ContainerStatsSample)
+    case failed(String)
+    case cancelled
 }
 
 /// Cached version eligibility and a short native-failure cooldown prevent repeated XPC/help probes.

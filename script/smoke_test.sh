@@ -24,20 +24,66 @@ CREATED_CONTAINER=0
 CREATED_IMAGE=0
 CREATED_IMAGE_TAG=0
 
+cleanup_step() {
+  local description="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    return 0
+  else
+    local cleanup_status=$?
+    echo "Smoke cleanup failed: $description (exit $cleanup_status)." >&2
+    return "$cleanup_status"
+  fi
+}
+
 cleanup() {
   local exit_code=$?
+  local cleanup_failed=0
+  trap - EXIT INT TERM
   if [[ "$KEEP_FOR_UI" -eq 0 ]]; then
-    if [[ "$CREATED_CONTAINER" -eq 1 ]]; then "$CLI" stop --time 1 "$NAME" >/dev/null 2>&1 || true; "$CLI" delete --force "$NAME" >/dev/null 2>&1 || true; fi
-    if [[ "$CREATED_IMAGE_TAG" -eq 1 ]]; then "$CLI" image delete --force "$IMAGE_TAG" >/dev/null 2>&1 || true; fi
-    if [[ "$CREATED_IMAGE" -eq 1 ]]; then "$CLI" image delete --force "$IMAGE" >/dev/null 2>&1 || true; fi
-    if [[ "$CREATED_VOLUME" -eq 1 ]]; then "$CLI" volume delete "$VOLUME" >/dev/null 2>&1 || true; fi
-    if [[ "$CREATED_NETWORK" -eq 1 ]]; then "$CLI" network delete "$NETWORK" >/dev/null 2>&1 || true; fi
-    /bin/rm -f "$HOST_FILE"
-    /bin/rm -rf "$MANIFEST_DIR"
+    if [[ "$CREATED_CONTAINER" -eq 1 ]]; then
+      cleanup_step "stop container $NAME" "$CLI" stop --time 1 "$NAME" || cleanup_failed=1
+      cleanup_step "delete container $NAME" "$CLI" delete --force "$NAME" || cleanup_failed=1
+    fi
+    if [[ "$CREATED_IMAGE_TAG" -eq 1 ]]; then
+      cleanup_step "delete image $IMAGE_TAG" "$CLI" image delete --force "$IMAGE_TAG" || cleanup_failed=1
+    fi
+    if [[ "$CREATED_IMAGE" -eq 1 ]]; then
+      cleanup_step "delete image $IMAGE" "$CLI" image delete --force "$IMAGE" || cleanup_failed=1
+    fi
+    if [[ "$CREATED_VOLUME" -eq 1 ]]; then
+      cleanup_step "delete volume $VOLUME" "$CLI" volume delete "$VOLUME" || cleanup_failed=1
+    fi
+    if [[ "$CREATED_NETWORK" -eq 1 ]]; then
+      cleanup_step "delete network $NETWORK" "$CLI" network delete "$NETWORK" || cleanup_failed=1
+    fi
+    cleanup_step "remove host file $HOST_FILE" /bin/rm -f "$HOST_FILE" || cleanup_failed=1
+    cleanup_step "remove temporary directory $MANIFEST_DIR" /bin/rm -rf "$MANIFEST_DIR" || cleanup_failed=1
+    if [[ "$cleanup_failed" -eq 1 ]]; then
+      echo "Smoke cleanup incomplete; inspect only the resources logged for this run." >&2
+      if [[ "$exit_code" -eq 0 ]]; then exit_code=1; fi
+    elif [[ "$exit_code" -eq 0 ]]; then
+      echo "Smoke checks and cleanup passed."
+    fi
   fi
   exit "$exit_code"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+cat > "$MANIFEST" <<EOF
+container=$NAME
+network=$NETWORK
+volume=$VOLUME
+image=$IMAGE
+image_tag=$IMAGE_TAG
+host_copy=$HOST_FILE
+image_archive=$MANIFEST_DIR/image.tar
+EOF
+echo "Smoke resources for this run:"
+cat "$MANIFEST"
+echo "Manifest: $MANIFEST"
 
 "$CLI" system status >/dev/null
 # Never let a smoke build implicitly create or reconfigure a builder. Use only
@@ -83,20 +129,9 @@ CREATED_IMAGE_TAG=1
 "$CLI" image save --output "$MANIFEST_DIR/image.tar" "$IMAGE_TAG"
 "$CLI" image load --input "$MANIFEST_DIR/image.tar" --force
 
-cat > "$MANIFEST" <<EOF
-container=$NAME
-network=$NETWORK
-volume=$VOLUME
-image=alpine:3.20
-host_copy=$HOST_FILE
-image_tag=$IMAGE_TAG
-image_archive=$MANIFEST_DIR/image.tar
-EOF
-
 if [[ "$KEEP_FOR_UI" -eq 1 ]]; then
   echo "Smoke resources retained for UI review. Container: $NAME"
-  echo "Manifest: $MANIFEST"
   echo "Clean up only these named resources after review: $NAME, $VOLUME, $NETWORK, $IMAGE, $IMAGE_TAG"
 else
-  echo "Smoke checks passed; cleaning only $NAME, $VOLUME, $NETWORK, $IMAGE and $IMAGE_TAG."
+  echo "Smoke checks completed; cleaning only $NAME, $VOLUME, $NETWORK, $IMAGE and $IMAGE_TAG."
 fi
