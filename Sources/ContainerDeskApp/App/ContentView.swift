@@ -8,12 +8,15 @@ struct ContentView: View {
     @SceneStorage("containerDesk.selectedSection") private var selectedRawValue = ContainerSection.containers.rawValue
     @SceneStorage("containerDesk.sceneID") private var sceneID = UUID().uuidString
     @State private var cleanupCategory: CleanupCategory?
+    @State private var navigationPerformance = NavigationPerformanceTracker()
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     private var cleanupNavigation: CleanupNavigationAction {
         CleanupNavigationAction { category in
+            let current = ContainerSection(rawValue: selectedRawValue) ?? .containers
+            navigationPerformance.begin(from: current, to: .cleanup)
             cleanupCategory = category
             selectedRawValue = ContainerSection.cleanup.rawValue
         }
@@ -23,8 +26,11 @@ struct ContentView: View {
         Binding(
             get: { ContainerSection(rawValue: selectedRawValue) },
             set: {
-                if $0 == .cleanup { cleanupCategory = nil }
-                selectedRawValue = ($0 ?? .containers).rawValue
+                let current = ContainerSection(rawValue: selectedRawValue) ?? .containers
+                let destination = $0 ?? .containers
+                navigationPerformance.begin(from: current, to: destination)
+                if destination == .cleanup { cleanupCategory = nil }
+                selectedRawValue = destination.rawValue
             }
         )
     }
@@ -53,6 +59,7 @@ struct ContentView: View {
 
                 List(selection: selection) {
                     Section("Resources") {
+                        sectionRow(.stacks, icon: "square.stack.3d.up.fill")
                         sectionRow(.containers, icon: "shippingbox")
                         sectionRow(.images, icon: "square.stack.3d.up")
                         sectionRow(.volumes, icon: "externaldrive")
@@ -103,7 +110,7 @@ struct ContentView: View {
             }
             .navigationSplitViewColumnWidth(min: 215, ideal: 230, max: 280)
         } detail: {
-            FeatureRootView(section: ContainerSection(rawValue: selectedRawValue) ?? .containers, store: store, mlxStore: mlxStore, externalMLXStore: externalMLXStore, sceneID: sceneID, cleanupCategory: cleanupCategory)
+            FeatureRootView(section: ContainerSection(rawValue: selectedRawValue) ?? .containers, store: store, mlxStore: mlxStore, externalMLXStore: externalMLXStore, sceneID: sceneID, navigationPerformance: navigationPerformance, cleanupCategory: cleanupCategory)
         }
         .environment(\.openCleanup, cleanupNavigation)
         .focusedSceneValue(\.cleanupNavigation, cleanupNavigation)
@@ -135,6 +142,9 @@ struct ContentView: View {
             store.setVisibleSection(ContainerSection(rawValue: selectedRawValue), for: sceneID)
             store.setWindowActive(sceneID, active: true)
         }
+        .task {
+            await navigationPerformance.runBenchmark { selection.wrappedValue = $0 }
+        }
         .onDisappear {
             store.setWindowActive(sceneID, active: false)
             mlxStore.discardChatState(forScene: sceneID)
@@ -153,7 +163,7 @@ struct ContentView: View {
 
     private func sidebarTint(_ section: ContainerSection) -> Color {
         switch section {
-        case .containers, .images, .registries: .accentColor
+        case .stacks, .containers, .images, .registries: .accentColor
         case .volumes, .machines: .purple
         case .networks, .compose: .teal
         case .builds, .kubernetes: .orange

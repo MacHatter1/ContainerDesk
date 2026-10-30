@@ -233,6 +233,23 @@ For an optimized local app bundle, set the build configuration to `release`:
 CONTAINERDESK_BUILD_CONFIGURATION=release ./script/build_and_run.sh --build-only
 ```
 
+Measure sidebar navigation in the debug app with:
+
+```sh
+./script/build_and_run.sh --navigation-benchmark
+```
+
+The benchmark drives the sidebar's selection binding through Images, Containers,
+Activity, Cleanup, and System. It warms the destinations, measures three further
+cycles without accessibility inspection or screenshots, and fails if any warm
+switch takes 500 ms or longer. Results are saved to the ignored
+`output/navigation-benchmark.json`; set `CONTAINERDESK_NAVIGATION_REPORT` to use
+another absolute output path. The metric ends when the main run loop settles
+after the destination updates; it does not measure physical display presentation
+or completion of asynchronous resource reads. The benchmark performs read-only
+navigation and leaves the app open. Use `--navigation-metrics` to log timings
+while switching pages manually.
+
 ## Releases
 
 After changes are ready on `main`, push a semantic version tag to start the release workflow:

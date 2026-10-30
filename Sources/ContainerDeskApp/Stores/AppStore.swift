@@ -66,6 +66,7 @@ public final class AppStore {
             cleanupStore.invalidate()
             for section in listSections { refreshGenerations[section, default: 0] += 1 }
             refreshingSections.removeAll()
+            lastResourceRefreshAt.removeAll()
             for section in ContainerSection.allCases {
                 cliCapabilities[section] = .unknown
                 snapshots[section] = ResourceSnapshot()
@@ -118,6 +119,7 @@ public final class AppStore {
     @ObservationIgnored private var resourcePollingTasks: [ContainerSection: Task<Void, Never>] = [:]
     @ObservationIgnored private var resourcePollingTokens: [ContainerSection: UUID] = [:]
     @ObservationIgnored private var refreshingSections = Set<ContainerSection>()
+    @ObservationIgnored private var lastResourceRefreshAt: [ContainerSection: Date] = [:]
     @ObservationIgnored private var refreshGenerations: [ContainerSection: Int] = [:]
     @ObservationIgnored private var clientEpoch = 0
     @ObservationIgnored private var healthPollingGeneration = 0
@@ -134,6 +136,8 @@ public final class AppStore {
     @ObservationIgnored private var retryRequests: [UUID: CommandRequest] = [:]
     @ObservationIgnored private var lastCapabilitiesRefresh: Date?
     private let defaults: UserDefaults
+    /// Visible resources poll every three seconds; this limits list reads to roughly every twelve seconds.
+    private let resourceRefreshFreshnessInterval: TimeInterval = 12
     private static let cliPathKey = "containerDesk.cliPath"
     private static let legacyStatsWindowID = "__containerDesk_legacy_stats_target__"
     private let listSections: [ContainerSection] = [.containers, .images, .volumes, .networks, .registries, .machines]
@@ -363,7 +367,16 @@ public final class AppStore {
     public func refresh(_ section: ContainerSection, force: Bool = false) async {
         guard !Task.isCancelled else { return }
         guard listArguments(for: section) != nil else { return }
-        if refreshingSections.contains(section) && !force { return }
+        // A fresh snapshot is already suitable for navigation and the next visible poll.
+        // Forced/manual callers still bypass this age check.
+        if !force,
+           let lastRefresh = lastResourceRefreshAt[section],
+           snapshots[section]?.state == .loaded,
+           Date.now.timeIntervalSince(lastRefresh) < resourceRefreshFreshnessInterval {
+            return
+        }
+        // A read already in progress satisfies concurrent navigation/poll/manual callers.
+        if refreshingSections.contains(section) { return }
         refreshingSections.insert(section)
         let generation = (refreshGenerations[section] ?? 0) + 1
         refreshGenerations[section] = generation
@@ -372,18 +385,33 @@ public final class AppStore {
         defer {
             if refreshGenerations[section] == generation { refreshingSections.remove(section) }
         }
-        var snapshot = snapshots[section] ?? ResourceSnapshot()
-        if snapshot.fetchedAt == nil { snapshot.state = .loading }
-        snapshots[section] = snapshot
+        let initialSnapshot = snapshots[section] ?? ResourceSnapshot()
+        if initialSnapshot.fetchedAt == nil, initialSnapshot.state != .loading {
+            var loadingSnapshot = initialSnapshot
+            loadingSnapshot.state = .loading
+            snapshots[section] = loadingSnapshot
+        }
         do {
             let result = try await reader.list(section)
             guard !Task.isCancelled, clientEpoch == epoch, refreshGenerations[section] == generation else { return }
-            snapshots[section] = ResourceSnapshot(items: result.value, fetchedAt: .now, state: .loaded)
-            resourceReadBackends[section] = result.backend
-            resourceReadFallbackReasons[section] = result.fallbackReason
+            let refreshedAt = Date.now
+            lastResourceRefreshAt[section] = refreshedAt
+            let currentSnapshot = snapshots[section] ?? ResourceSnapshot()
+            // Keep the observation graph quiet when a successful poll returns identical data.
+            // The private refresh clock still advances, so later polls remain cadence based.
+            if currentSnapshot.items != result.value || currentSnapshot.state != .loaded {
+                snapshots[section] = ResourceSnapshot(items: result.value, fetchedAt: refreshedAt, state: .loaded)
+            }
+            if resourceReadBackends[section] != result.backend {
+                resourceReadBackends[section] = result.backend
+            }
+            if resourceReadFallbackReasons[section] != result.fallbackReason {
+                resourceReadFallbackReasons[section] = result.fallbackReason
+            }
             if section == .containers { updateContainerMetricsPolling() }
         } catch {
             if !Task.isCancelled, clientEpoch == epoch, refreshGenerations[section] == generation {
+                lastResourceRefreshAt[section] = nil
                 resourceReadFallbackReasons[section] = nil
                 setFailure(for: section, message: error.localizedDescription)
             }
@@ -410,7 +438,13 @@ public final class AppStore {
 
     private func updateVisibleResourcePolling() {
         guard pollingTask != nil else { return }
-        let visibleSections = Set(activeWindowIDs.compactMap { visibleSectionsByWindow[$0] }.filter { listSections.contains($0) })
+        let selectedSections = activeWindowIDs.compactMap { visibleSectionsByWindow[$0] }
+        // A Stacks window consumes the same snapshots as the resource browsers. Keep those
+        // existing polling tasks alive; Set deduplicates them when another window shows a source.
+        let visibleSections = Set(selectedSections.flatMap { section -> [ContainerSection] in
+            if section == .stacks { return [.containers, .images, .volumes, .networks] }
+            return listSections.contains(section) ? [section] : []
+        })
         for (section, task) in Array(resourcePollingTasks) where !visibleSections.contains(section) {
             task.cancel()
             resourcePollingTasks[section] = nil
@@ -684,7 +718,10 @@ public final class AppStore {
     }
 
     private var isContainerSectionVisible: Bool {
-        activeWindowIDs.contains { visibleSectionsByWindow[$0] == .containers }
+        activeWindowIDs.contains {
+            let section = visibleSectionsByWindow[$0]
+            return section == .containers || section == .stacks
+        }
     }
 
     private func updateContainerMetricsPolling() {
@@ -805,7 +842,7 @@ public final class AppStore {
         case .networks: ["network", "list", "--format", "json"]
         case .registries: ["registry", "list", "--format", "json"]
         case .machines: ["machine", "list", "--format", "json"]
-        case .builds, .compose, .kubernetes, .system, .cleanup, .activity, .mlxModels: nil
+        case .stacks, .builds, .compose, .kubernetes, .system, .cleanup, .activity, .mlxModels: nil
         }
     }
 

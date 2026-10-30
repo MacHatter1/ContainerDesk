@@ -2,6 +2,7 @@ import Foundation
 
 public enum ContainerSection: String, CaseIterable, Identifiable, Sendable {
     case containers
+    case stacks
     case images
     case builds
     case volumes
@@ -20,6 +21,7 @@ public enum ContainerSection: String, CaseIterable, Identifiable, Sendable {
     public var title: String {
         switch self {
         case .containers: "Containers"
+        case .stacks: "Stacks"
         case .images: "Images"
         case .builds: "Builds"
         case .volumes: "Volumes"

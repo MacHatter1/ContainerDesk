@@ -86,13 +86,24 @@ case "$MODE" in
     /usr/bin/log stream --info --style compact --predicate "process == \"$APP_NAME\""
     ;;
   --telemetry|telemetry)
-    /usr/bin/open -n "$APP_BUNDLE"
+    /usr/bin/open -n "$APP_BUNDLE" --args --navigation-metrics
     /usr/bin/log stream --info --style compact --predicate "subsystem == \"$BUNDLE_ID\""
+    ;;
+  --navigation-metrics|navigation-metrics)
+    /usr/bin/open -n "$APP_BUNDLE" --args --navigation-metrics
+    /usr/bin/log stream --info --style compact --predicate "subsystem == \"$BUNDLE_ID\" && category == \"NavigationPerformance\""
+    ;;
+  --navigation-benchmark|navigation-benchmark)
+    NAVIGATION_REPORT="${CONTAINERDESK_NAVIGATION_REPORT:-$ROOT_DIR/output/navigation-benchmark.json}"
+    mkdir -p "$(dirname "$NAVIGATION_REPORT")"
+    rm -f "$NAVIGATION_REPORT"
+    /usr/bin/open -n "$APP_BUNDLE" --args --navigation-benchmark "--navigation-benchmark-output=$NAVIGATION_REPORT"
+    python3 "$ROOT_DIR/script/check_navigation_benchmark.py" "$NAVIGATION_REPORT"
     ;;
   --verify|verify)
     /usr/bin/open -n "$APP_BUNDLE"
     sleep 1
     pgrep -x "$APP_NAME" >/dev/null
     ;;
-  *) echo "usage: $0 [run|--build-only|--debug|--logs|--telemetry|--verify]" >&2; exit 2 ;;
+  *) echo "usage: $0 [run|--build-only|--debug|--logs|--telemetry|--navigation-metrics|--navigation-benchmark|--verify]" >&2; exit 2 ;;
 esac

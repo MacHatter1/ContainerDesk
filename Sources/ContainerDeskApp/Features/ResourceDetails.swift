@@ -30,6 +30,9 @@ struct ResourceDetailPane: View {
     @Binding var transientText: String
     let store: AppStore
     let limitsOperationInProgress: Bool
+    @ObservedObject var activation: ResourceFeatureActivation
+
+    private var isActive: Bool { activation.isActive }
     let onNotice: (FeatureNotice) -> Void
     let action: (ResourceActionKind) -> Void
     let onRun: (String) -> Void
@@ -72,8 +75,14 @@ struct ResourceDetailPane: View {
         .onChange(of: tab) { oldValue, _ in
             if oldValue == .logs { cancelFollowLogs() }
         }
+        .onChange(of: isActive) { _, active in
+            if !active { cancelFollowLogs() }
+        }
         .onDisappear { cancelFollowLogs() }
-        .task(id: "\(resource.id)-\(tab.rawValue)-\(followLogs)") { if tab == .logs || tab == .inspect || tab == .files { await load() } }
+        .task(id: "\(resource.id)-\(tab.rawValue)-\(followLogs)-\(isActive)") {
+            guard isActive else { return }
+            if tab == .logs || tab == .inspect || tab == .files { await load() }
+        }
     }
 
     private var detailHeader: some View {
