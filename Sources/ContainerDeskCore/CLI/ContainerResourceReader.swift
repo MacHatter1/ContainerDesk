@@ -373,13 +373,13 @@ private final class GateProbeWaiter: @unchecked Sendable {
     private var outcome: NativeAPIGateDecision?
 
     func install(_ continuation: CheckedContinuation<NativeAPIGateDecision, Never>) -> Bool {
-        let outcome = lock.withLock { () -> NativeAPIGateDecision? in
-            if let outcome { return outcome }
+        let completedOutcome = lock.withLock { () -> NativeAPIGateDecision? in
+            if let storedOutcome = self.outcome { return storedOutcome }
             self.continuation = continuation
             return nil
         }
-        if let outcome {
-            continuation.resume(returning: outcome)
+        if let completedOutcome {
+            continuation.resume(returning: completedOutcome)
             return false
         }
         return true
