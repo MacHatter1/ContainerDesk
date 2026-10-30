@@ -57,6 +57,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Test smoke cleanup with a mocked CLI
+        run: python3 -m unittest discover -s script -p 'test_*.py' -v
+
       - name: Show toolchain versions
         id: toolchain
         shell: bash
