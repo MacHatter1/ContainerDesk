@@ -22,6 +22,9 @@ struct StackWorkspaceFeatureView: View {
     @State private var activeLogStreamIDs: Set<UUID> = []
     @State private var followingLogs = false
     @State private var detailWidth: CGFloat = 0
+    @State private var editorRequest: StackEditorRequest?
+    @State private var runStack: ManagedStack?
+    @State private var deletingStack: ManagedStack?
 
     private enum DetailTab: String, CaseIterable, Identifiable {
         case overview = "Overview"
@@ -32,6 +35,7 @@ struct StackWorkspaceFeatureView: View {
     private struct PendingStackAction {
         let action: StackWorkspaceAction
         let workspaceID: String
+        let containerIDs: Set<String>
     }
 
     private var workspaces: [StackWorkspace] {
@@ -40,7 +44,9 @@ struct StackWorkspaceFeatureView: View {
             images: store.snapshots[.images]?.items ?? [],
             volumes: store.snapshots[.volumes]?.items ?? [],
             networks: store.snapshots[.networks]?.items ?? [],
-            metrics: store.containerMetrics
+            metrics: store.containerMetrics,
+            managedStacks: store.managedStacks.stacks,
+            ungroupedContainerIDs: store.managedStacks.collection.ungroupedContainerIDs
         )
     }
 
@@ -64,22 +70,35 @@ struct StackWorkspaceFeatureView: View {
     var body: some View {
         VStack(spacing: 0) {
             WorkspaceHeader(title: "Stacks", subtitle: "Operate related containers together", symbol: "square.stack.3d.up.fill", tint: .indigo) {
+                Button("New Stack", systemImage: "plus") { editorRequest = StackEditorRequest() }
+                    .disabled(isRunningAction || store.managedStacks.loadError != nil)
                 Button("Refresh", systemImage: "arrow.clockwise") {
                     Task { await refreshWorkspaceResources(force: true) }
                 }
                 .disabled(isRunningAction)
             }
 
+            if let error = store.managedStacks.loadError {
+                HStack {
+                    InlineNotice(message: error, kind: .error)
+                    Button("Reload Library") { store.managedStacks.reload() }
+                }
+                .padding(12)
+            }
+            if let actionError {
+                InlineNotice(message: actionError, kind: .error) { self.actionError = nil }
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+            }
+
             if workspaces.isEmpty {
                 ContentUnavailableView {
                     Label("No Stacks Yet", systemImage: "square.stack.3d.up")
                 } description: {
-                    Text("Containers with a shared Compose project label will appear here. Other containers remain available in Containers.")
+                    Text("Create a stack, then add existing containers or run new ones into it. Shared project labels are also discovered automatically.")
                 } actions: {
-                    Button("Refresh Containers", systemImage: "arrow.clockwise") {
-                        Task { await refreshWorkspaceResources(force: true) }
-                    }
+                    Button("Create Stack", systemImage: "plus") { editorRequest = StackEditorRequest() }
                     .buttonStyle(.borderedProminent)
+                    .disabled(store.managedStacks.loadError != nil)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -115,6 +134,35 @@ struct StackWorkspaceFeatureView: View {
         .onChange(of: detailTab) { _, tab in
             if tab != .logs { stopFollowingLogs() }
         }
+        .onChange(of: selectedWorkspace?.containers.map(\.id)) { _, _ in stopFollowingLogs() }
+        .onChange(of: store.managedStacks.runtimeScope) { _, _ in
+            editorRequest = nil
+            runStack = nil
+            deletingStack = nil
+            pendingAction = nil
+            stopFollowingLogs()
+        }
+        .sheet(item: $editorRequest) { request in
+            StackEditorSheet(store: store, request: request) { saved in
+                searchText = ""
+                selectedWorkspaceID = saved.workspaceID
+            }
+        }
+        .sheet(item: $runStack) { stack in
+            ContainerRunSheet(store: store, stackID: stack.id) { _ in }
+        }
+        .alert("Delete Stack?", isPresented: Binding(get: { deletingStack != nil }, set: { if !$0 { deletingStack = nil } })) {
+            Button("Delete Stack", role: .destructive) {
+                if let deletingStack {
+                    do { try store.managedStacks.delete(deletingStack) }
+                    catch { actionError = error.localizedDescription }
+                }
+                deletingStack = nil
+            }
+            Button("Cancel", role: .cancel) { deletingStack = nil }
+        } message: {
+            Text("Remove the saved stack and ungroup its containers. The containers keep running and their data is preserved.")
+        }
         .confirmationDialog(
             confirmationTitle,
             isPresented: Binding(get: { pendingAction != nil }, set: { if !$0 { pendingAction = nil } }),
@@ -124,7 +172,7 @@ struct StackWorkspaceFeatureView: View {
                 Button(confirmationButtonTitle(pendingAction.action), role: .destructive) {
                     let action = pendingAction
                     self.pendingAction = nil
-                    Task { await perform(action.action, workspaceID: action.workspaceID) }
+                    Task { await perform(action.action, workspaceID: action.workspaceID, expectedContainerIDs: action.containerIDs) }
                 }
             }
             Button("Cancel", role: .cancel) { pendingAction = nil }
@@ -223,31 +271,29 @@ struct StackWorkspaceFeatureView: View {
         }
     }
 
-    @ViewBuilder private func actionButtons(_ workspace: StackWorkspace) -> some View {
-        HStack(spacing: 7) {
-            Button("Start", systemImage: "play.fill") { request(.start, workspace) }
-                .disabled(!workspace.allowsLifecycleActions || isRunningAction || workspace.stoppedCount == 0)
-            Button("Restart", systemImage: "arrow.clockwise") { request(.restart, workspace) }
-                .disabled(!workspace.allowsLifecycleActions || isRunningAction || workspace.runningCount == 0)
-            Button("Stop", systemImage: "stop.fill", role: .destructive) { request(.stop, workspace) }
-                .disabled(!workspace.allowsLifecycleActions || isRunningAction || workspace.runningCount == 0)
-            Menu {
-                Button("Review Cleanup…", systemImage: "sparkles") { openCleanup() }
-            } label: {
-                Image(systemName: "ellipsis.circle")
+    private func actionButtons(_ workspace: StackWorkspace) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Button("Start", systemImage: "play.fill") { request(.start, workspace) }
+                    .disabled(!canOperate(workspace) || isRunningAction || workspace.stoppedCount == 0)
+                Button("Restart", systemImage: "arrow.clockwise") { request(.restart, workspace) }
+                    .disabled(!canOperate(workspace) || isRunningAction || workspace.runningCount == 0)
+                Button("Stop", systemImage: "stop.fill", role: .destructive) { request(.stop, workspace) }
+                    .disabled(!canOperate(workspace) || isRunningAction || workspace.runningCount == 0)
+                Menu {
+                    Button("Review Cleanup…", systemImage: "sparkles") { openCleanup() }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .help("Review stack cleanup")
             }
-            .help("More stack actions")
+            StackManagementActions(stack: managedStack(for: workspace), disabled: isRunningAction || store.managedStacks.loadError != nil) {
+                let original = managedStack(for: workspace)
+                editorRequest = StackEditorRequest(original: original, name: original?.name ?? workspace.title, containerIDs: original?.containerIDs ?? Set(workspace.containers.map(\.id)))
+            } run: { runStack = $0 } delete: { deletingStack = $0 }
         }
         .buttonStyle(.bordered)
         .fixedSize(horizontal: true, vertical: false)
-        .overlay(alignment: .bottomLeading) {
-            if !workspace.allowsLifecycleActions {
-                Text("Read-only grouping")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .offset(y: 17)
-            }
-        }
     }
 
     private func overview(_ workspace: StackWorkspace) -> some View {
@@ -255,9 +301,9 @@ struct StackWorkspaceFeatureView: View {
             VStack(alignment: .leading, spacing: 14) {
                 if !workspace.allowsLifecycleActions {
                     InlineNotice(
-                        message: "This grouping is based on container names. Stack-wide actions are disabled until the runtime confirms a shared project label.",
+                        message: "Review these containers and save an editable stack to manage membership and enable stack-wide actions.",
                         kind: .info,
-                        title: "Inferred grouping"
+                        title: workspace.grouping.isStandalone ? "Ungrouped container" : "Inferred grouping"
                     )
                 }
 
@@ -270,9 +316,24 @@ struct StackWorkspaceFeatureView: View {
 
                 AccentPanel(title: "Containers", symbol: "shippingbox", tint: .green) {
                     VStack(spacing: 0) {
+                        if workspace.containers.isEmpty {
+                            Text("No containers currently available. Use Manage Containers to add existing ones, or Run Container to launch a new member.")
+                                .foregroundStyle(.secondary).padding(.vertical, 14)
+                        }
                         ForEach(Array(workspace.containers.enumerated()), id: \.element.id) { index, container in
-                            containerRow(container)
+                            containerRow(container, workspace: workspace)
                             if index < workspace.containers.count - 1 { Divider().padding(.leading, 26) }
+                        }
+                    }
+                }
+                if !workspace.missingContainerIDs.isEmpty, let stack = managedStack(for: workspace) {
+                    AccentPanel(title: "Unavailable containers", symbol: "shippingbox", tint: .secondary) {
+                        ForEach(workspace.missingContainerIDs, id: \.self) { id in
+                            HStack {
+                                Text(id).font(.callout.monospaced()).lineLimit(1)
+                                Spacer()
+                                StackMemberMenu(containerID: id, containerTitle: id, stack: stack, library: store.managedStacks) { actionError = $0 }
+                            }
                         }
                     }
                 }
@@ -321,7 +382,7 @@ struct StackWorkspaceFeatureView: View {
         .help(cpuUsageExplanation)
     }
 
-    private func containerRow(_ container: ResourceSummary) -> some View {
+    private func containerRow(_ container: ResourceSummary, workspace: StackWorkspace) -> some View {
         let metric = store.containerMetrics[container.id]
         return HStack(spacing: 10) {
             StateBadge(state: container.state ?? "Unknown")
@@ -337,9 +398,13 @@ struct StackWorkspaceFeatureView: View {
                 Text(memberMetricSummary(metric)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     .help(cpuUsageExplanation)
             }
+            if let stack = managedStack(for: workspace) {
+                StackMemberMenu(containerID: container.id, containerTitle: container.title, stack: stack, library: store.managedStacks) { actionError = $0 }
+                    .disabled(isRunningAction)
+            }
         }
         .padding(.vertical, 7)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
         .accessibilityHint(cpuUsageExplanation)
     }
 
@@ -433,16 +498,17 @@ struct StackWorkspaceFeatureView: View {
     private var confirmationMessage: String {
         guard let workspace = pendingWorkspace, let pendingAction else { return "" }
         switch pendingAction.action {
-        case .stop: return "All \(workspace.runningCount) running containers in this verified stack will stop gracefully."
-        case .restart: return "All \(workspace.runningCount) running containers in this verified stack will stop, then those containers will start again."
-        case .start: return "Stopped containers in this verified stack will start."
+        case .stop: return "All \(workspace.runningCount) running containers in this stack will stop gracefully."
+        case .restart: return "All \(workspace.runningCount) running containers in this stack will stop, then those containers will start again."
+        case .start: return "Stopped containers in this stack will start."
         }
     }
 
     private func request(_ action: StackWorkspaceAction, _ workspace: StackWorkspace) {
-        guard workspace.allowsLifecycleActions else { return }
-        if action == .start { Task { await perform(action, workspaceID: workspace.id) } }
-        else { pendingAction = PendingStackAction(action: action, workspaceID: workspace.id) }
+        guard canOperate(workspace) else { return }
+        let members = Set(workspace.containers.map(\.id))
+        if action == .start { Task { await perform(action, workspaceID: workspace.id, expectedContainerIDs: members) } }
+        else { pendingAction = PendingStackAction(action: action, workspaceID: workspace.id, containerIDs: members) }
     }
 
     private func confirmationButtonTitle(_ action: StackWorkspaceAction) -> String {
@@ -458,20 +524,30 @@ struct StackWorkspaceFeatureView: View {
         return workspaces.first { $0.id == pendingAction.workspaceID }
     }
 
-    @MainActor private func perform(_ action: StackWorkspaceAction, workspaceID: String) async {
-        guard let workspace = workspaces.first(where: { $0.id == workspaceID }), workspace.allowsLifecycleActions else { return }
+    @MainActor private func perform(_ action: StackWorkspaceAction, workspaceID: String, expectedContainerIDs: Set<String>) async {
+        guard let workspace = workspaces.first(where: { $0.id == workspaceID }), canOperate(workspace) else { return }
+        guard Set(workspace.containers.map(\.id)) == expectedContainerIDs else {
+            actionError = "Stack membership changed. Review the containers and try again."
+            return
+        }
+        let runtime = store.managedStacks.runtimeScope
+        let client = store.client
         isRunningAction = true
         actionError = nil
         defer { isRunningAction = false }
         do {
             let plan = StackWorkspaceCatalog.plan(action, for: workspace)
             for command in plan {
+                guard store.managedStacks.runtimeScope == runtime else { throw ManagedStackError.runtimeChanged }
+                guard let current = workspaces.first(where: { $0.id == workspaceID }),
+                      Set(current.containers.map(\.id)) == expectedContainerIDs else { throw ManagedStackError.staleStack }
                 let phaseName = command.phase == .stop ? "Stop" : "Start"
                 _ = try await store.execute(
                     CommandRequest(arguments: command.arguments),
-                    title: "\(phaseName) Stack · \(workspace.title)"
+                    title: "\(phaseName) Stack · \(workspace.title)", using: client
                 )
             }
+            guard store.managedStacks.runtimeScope == runtime else { throw ManagedStackError.runtimeChanged }
             await store.refresh(.containers, force: true)
             await store.refresh(.images, force: true)
             await store.refresh(.volumes, force: true)
@@ -578,6 +654,7 @@ struct StackWorkspaceFeatureView: View {
     }
 
     private func workspaceState(_ workspace: StackWorkspace) -> String {
+        if workspace.containers.isEmpty { return workspace.missingContainerIDs.isEmpty ? "Empty" : "Unavailable" }
         if workspace.runningCount == workspace.containers.count { return "Running" }
         if workspace.runningCount == 0 && workspace.stoppedCount == workspace.containers.count { return "Stopped" }
         if workspace.runningCount > 0 { return "Partial" }
@@ -586,10 +663,20 @@ struct StackWorkspaceFeatureView: View {
 
     private func groupingDescription(_ grouping: StackWorkspaceGrouping) -> String {
         switch grouping {
+        case .managed: "Saved stack · editable membership"
         case .explicitLabel(let key, _): "Verified · \(key)"
         case .sharedNamePrefix: "Inferred from container names"
         case .standalone: "Single container · ungrouped"
         }
+    }
+
+    private func managedStack(for workspace: StackWorkspace) -> ManagedStack? {
+        guard case .managed(let id) = workspace.grouping else { return nil }
+        return store.managedStacks.stacks.first { $0.id == id }
+    }
+
+    private func canOperate(_ workspace: StackWorkspace) -> Bool {
+        workspace.allowsLifecycleActions && (managedStack(for: workspace) == nil || store.managedStacks.loadError == nil)
     }
 
     private func memorySummary(_ workspace: StackWorkspace) -> String {

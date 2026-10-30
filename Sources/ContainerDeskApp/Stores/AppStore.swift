@@ -7,6 +7,7 @@ import Observation
 public final class AppStore {
     let cleanupStore = CleanupStore()
     let environmentProfiles: EnvironmentProfilesStore
+    let managedStacks: ManagedStacksStore
     public private(set) var limitsOperationContainerID: String?
     public private(set) var operations: [OperationRecord] = []
     public private(set) var snapshots: [ContainerSection: ResourceSnapshot] = [:]
@@ -63,6 +64,7 @@ public final class AppStore {
             client = ProcessContainerClient(resolver: ExecutableResolver(overridePath: cliPath))
             resourceReader = ContainerResourceReader(cli: client, nativeAllowed: cliPath == nil)
             clientEpoch += 1
+            managedStacks.setRuntime(cliPath: cliPath)
             cleanupStore.invalidate()
             for section in listSections { refreshGenerations[section, default: 0] += 1 }
             refreshingSections.removeAll()
@@ -142,10 +144,11 @@ public final class AppStore {
     private static let legacyStatsWindowID = "__containerDesk_legacy_stats_target__"
     private let listSections: [ContainerSection] = [.containers, .images, .volumes, .networks, .registries, .machines]
 
-    public init(client: (any ContainerClient)? = nil, defaults: UserDefaults = .standard) {
+    public init(client: (any ContainerClient)? = nil, defaults: UserDefaults = .standard, stackRepository: ManagedStackRepository = .init()) {
         self.environmentProfiles = EnvironmentProfilesStore()
         self.defaults = defaults
         let savedPath = defaults.string(forKey: Self.cliPathKey)
+        self.managedStacks = ManagedStacksStore(repository: stackRepository, cliPath: savedPath)
         self.cliPath = savedPath
         let initialClient = client ?? ProcessContainerClient(resolver: ExecutableResolver(overridePath: savedPath))
         self.client = initialClient

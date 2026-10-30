@@ -11,6 +11,7 @@ struct ContainerRunSheet: View {
     let store: AppStore
     let mode: ContainerRunSheetMode
     let onNotice: (FeatureNotice) -> Void
+    let stackID: UUID?
 
     @Environment(\.dismiss) private var dismiss
     @State private var configuration: ContainerLaunchConfiguration
@@ -24,12 +25,14 @@ struct ContainerRunSheet: View {
     @State private var choosingEnvironmentFiles = false
     @State private var pendingProfile: EnvironmentProfile?
     @State private var confirmingLoad = false
+    @State private var launchedWithoutMembership = false
 
     init(store: AppStore, initialImage: String = "", profile: EnvironmentProfile? = nil,
-         mode: ContainerRunSheetMode = .run, onNotice: @escaping (FeatureNotice) -> Void) {
+         mode: ContainerRunSheetMode = .run, stackID: UUID? = nil, onNotice: @escaping (FeatureNotice) -> Void) {
         self.store = store
         self.mode = mode
         self.onNotice = onNotice
+        self.stackID = stackID
         var configuration = profile?.configuration ?? ContainerLaunchConfiguration(image: initialImage)
         if mode == .duplicateProfile { configuration.name = "" }
         _configuration = State(initialValue: configuration)
@@ -66,7 +69,7 @@ struct ContainerRunSheet: View {
                         else { saveProfile(close: true) }
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(busy || configuration.image.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (mode != .run && profileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                    .disabled(busy || launchedWithoutMembership || configuration.image.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (mode != .run && profileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
                 }
             }
         }
@@ -128,6 +131,11 @@ struct ContainerRunSheet: View {
 
     private var launchSection: some View {
         Section("Container") {
+            if let stackID, let stack = store.managedStacks.stacks.first(where: { $0.id == stackID }) {
+                LabeledContent("Stack", value: stack.name)
+                Text("This container will join the stack after a successful launch. A container name is generated when omitted.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             TextField("Image reference", text: $configuration.image, prompt: Text("docker.io/library/postgres:17"))
             TextField("Container name (optional)", text: $configuration.name, prompt: Text("api-dev"))
             TextField("Command and arguments", text: $configuration.command, prompt: Text("/bin/sh -lc 'echo ready'"))
@@ -229,13 +237,14 @@ struct ContainerRunSheet: View {
         errorText = nil
         defer { busy = false }
         do {
-            let request = try ContainerLaunchRequestBuilder.makeRequest(configuration: reviewedConfiguration(), environment: environmentEntries)
-            let result = try await store.execute(request, title: "Run Container")
+            let result = try await store.runContainer(configuration: reviewedConfiguration(), environment: environmentEntries, stackID: stackID)
             guard result.succeeded else { throw FeatureCommandError(result: result) }
             onNotice(FeatureNotice(title: "Container launched", message: "The background launch command completed."))
             dismiss()
-            await store.refresh(.containers, force: true)
-        } catch { errorText = error.localizedDescription }
+        } catch {
+            if case ManagedStackError.launchedButNotAssigned = error { launchedWithoutMembership = true }
+            errorText = error.localizedDescription
+        }
     }
 }
 

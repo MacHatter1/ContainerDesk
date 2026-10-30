@@ -1,9 +1,15 @@
 import Foundation
 
 public enum StackWorkspaceGrouping: Sendable, Equatable {
+    case managed(stackID: UUID)
     case explicitLabel(key: String, value: String)
     case sharedNamePrefix(String)
     case standalone(containerID: String)
+
+    public var isStandalone: Bool {
+        if case .standalone = self { return true }
+        return false
+    }
 }
 
 public enum StackWorkspaceAction: Sendable, Equatable {
@@ -39,6 +45,7 @@ public struct StackWorkspace: Identifiable, Sendable, Equatable {
     public let runningCount: Int
     public let stoppedCount: Int
     public let otherCount: Int
+    public var missingContainerIDs: [String] = []
     /// Sum of member CPU percentages. Nil when no running member has a current sample.
     public let cpuPercent: Double?
     /// Sum of live member memory. Nil when no running member has a current sample.
@@ -48,6 +55,7 @@ public struct StackWorkspace: Identifiable, Sendable, Equatable {
     public let memoryLimitBytes: Int64?
 
     public var allowsLifecycleActions: Bool {
+        if case .managed = grouping { return true }
         if case .explicitLabel = grouping { return true }
         return false
     }
@@ -84,9 +92,8 @@ public struct StackWorkspace: Identifiable, Sendable, Equatable {
 }
 
 /// Builds stable stack workspaces from already-sanitized resource summaries.
-/// Label groups are authoritative and can be acted on; inferred name-prefix
-/// groups and individual containers remain read-only because their membership
-/// is a convenience heuristic rather than runtime-declared ownership.
+/// Explicit user membership takes priority over runtime labels and inferred
+/// names. Unconfirmed inferred groups and individual containers are read-only.
 public enum StackWorkspaceCatalog {
     private static let projectLabelKeys = [
         "com.docker.compose.project",
@@ -101,13 +108,26 @@ public enum StackWorkspaceCatalog {
         images: [ResourceSummary] = [],
         volumes: [ResourceSummary] = [],
         networks: [ResourceSummary] = [],
-        metrics: [String: ContainerMetric] = [:]
+        metrics: [String: ContainerMetric] = [:],
+        managedStacks: [ManagedStack] = [],
+        ungroupedContainerIDs: Set<String> = []
     ) -> [StackWorkspace] {
         let sortedContainers = containers.sorted(by: resourceOrder)
+        let managedIDs = managedStacks.reduce(into: Set<String>()) { $0.formUnion($1.containerIDs) }
+        let discoveredContainers = sortedContainers.filter { !managedIDs.contains($0.id) }
+        var managedWorkspaces = managedStacks.map { stack in
+            let members = sortedContainers.filter { stack.containerIDs.contains($0.id) }
+            var workspace = makeWorkspace(
+                id: stack.workspaceID, title: stack.name, grouping: .managed(stackID: stack.id),
+                containers: members, images: images, volumes: volumes, networks: networks, metrics: metrics, label: nil
+            )
+            workspace.missingContainerIDs = stack.containerIDs.subtracting(members.map(\.id)).sorted()
+            return workspace
+        }
         var explicitGroups: [LabelGroup: [ResourceSummary]] = [:]
         var unlabelled: [ResourceSummary] = []
 
-        for container in sortedContainers {
+        for container in discoveredContainers where !ungroupedContainerIDs.contains(container.id) {
             if let label = projectLabel(in: container.details.labels) {
                 explicitGroups[LabelGroup(key: label.key, value: label.value), default: []].append(container)
             } else {
@@ -146,7 +166,7 @@ public enum StackWorkspaceCatalog {
         })
 
         let groupedIDs = Set(explicitGroups.values.flatMap { $0.map(\.id) } + inferredGroups.flatMap { $0.members.map(\.id) })
-        for container in unlabelled where !groupedIDs.contains(container.id) {
+        for container in discoveredContainers where !groupedIDs.contains(container.id) {
             workspaces.append(makeWorkspace(
                 id: "container:\(container.id)",
                 title: container.title,
@@ -160,14 +180,15 @@ public enum StackWorkspaceCatalog {
             ))
         }
 
-        return workspaces.sorted {
+        managedWorkspaces.append(contentsOf: workspaces)
+        return managedWorkspaces.sorted {
             let titleOrder = $0.title.localizedStandardCompare($1.title)
             return titleOrder == .orderedSame ? $0.id < $1.id : titleOrder == .orderedAscending
         }
     }
 
     /// Returns no commands for inferred or standalone membership. Explicitly
-    /// labeled stacks are processed in stable member order and stop/start use
+    /// saved or labeled stacks are processed in stable member order and stop/start use
     /// the CLI's positional terminator so option-shaped IDs remain literal.
     public static func plan(_ action: StackWorkspaceAction, for workspace: StackWorkspace) -> [StackWorkspaceCommand] {
         guard workspace.allowsLifecycleActions else { return [] }
@@ -201,14 +222,18 @@ public enum StackWorkspaceCatalog {
         let cpuSamples = running.compactMap { metrics[$0.id]?.cpuPercent }.filter(\.isFinite)
         let memorySamples = running.compactMap { metrics[$0.id]?.memoryUsageBytes }
         let referencedImages = Set(members.compactMap { $0.details.imageReference })
+        let relatedLabels: [LabelGroup]
+        if let label { relatedLabels = [label] }
+        else if case .managed = grouping { relatedLabels = Array(Set(members.compactMap { projectLabel(in: $0.details.labels) })) }
+        else { relatedLabels = [] }
         return StackWorkspace(
             id: id,
             title: title,
             grouping: grouping,
             containers: members,
             images: images.filter { referencedImages.contains($0.details.imageReference ?? $0.id) }.sorted(by: resourceOrder),
-            volumes: label.map { group in volumes.filter { hasMatchingLabel($0.details.labels, group: group) }.sorted(by: resourceOrder) } ?? [],
-            networks: label.map { group in networks.filter { hasMatchingLabel($0.details.labels, group: group) }.sorted(by: resourceOrder) } ?? [],
+            volumes: volumes.filter { resource in relatedLabels.contains { hasMatchingLabel(resource.details.labels, group: $0) } }.sorted(by: resourceOrder),
+            networks: networks.filter { resource in relatedLabels.contains { hasMatchingLabel(resource.details.labels, group: $0) } }.sorted(by: resourceOrder),
             runningCount: running.count,
             stoppedCount: stopped.count,
             otherCount: members.count - running.count - stopped.count,
