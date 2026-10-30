@@ -15,7 +15,7 @@ struct StackWorkspaceFeatureView: View {
     @State private var pendingAction: PendingStackAction?
     @State private var isRunningAction = false
     @State private var actionError: String?
-    @State private var logText = ""
+    @State private var logBuffer = ContainerLogBuffer(maxEntries: 2_000, maxBytes: 120_000)
     @State private var logSearch = ""
     @State private var logTasks: [Task<Void, Never>] = []
     @State private var logOperationIDs: [UUID] = []
@@ -39,15 +39,7 @@ struct StackWorkspaceFeatureView: View {
     }
 
     private var workspaces: [StackWorkspace] {
-        StackWorkspaceCatalog.build(
-            containers: store.snapshots[.containers]?.items ?? [],
-            images: store.snapshots[.images]?.items ?? [],
-            volumes: store.snapshots[.volumes]?.items ?? [],
-            networks: store.snapshots[.networks]?.items ?? [],
-            metrics: store.containerMetrics,
-            managedStacks: store.managedStacks.stacks,
-            ungroupedContainerIDs: store.managedStacks.collection.ungroupedContainerIDs
-        )
+        store.stackWorkspaces
     }
 
     private var filteredWorkspaces: [StackWorkspace] {
@@ -128,7 +120,7 @@ struct StackWorkspaceFeatureView: View {
         }
         .onChange(of: selectedWorkspaceID) { _, _ in
             stopFollowingLogs()
-            logText = ""
+            logBuffer = ContainerLogBuffer(maxEntries: 2_000, maxBytes: 120_000)
             actionError = nil
         }
         .onChange(of: detailTab) { _, tab in
@@ -462,6 +454,7 @@ struct StackWorkspaceFeatureView: View {
     }
 
     private var visibleLogText: String {
+        let logText = logBuffer.entries.map { "[\($0.containerID)] \($0.message)\n" }.joined()
         guard !logSearch.isEmpty else { return logText }
         return logText.split(separator: "\n", omittingEmptySubsequences: false)
             .filter { $0.localizedCaseInsensitiveContains(logSearch) }
@@ -569,7 +562,7 @@ struct StackWorkspaceFeatureView: View {
         cancelLogStreams()
         guard !workspace.containers.isEmpty else { followingLogs = false; return }
         followingLogs = true
-        logText = ""
+        logBuffer = ContainerLogBuffer(maxEntries: 2_000, maxBytes: 120_000)
         logOperationIDs = []
         for container in workspace.containers {
             let stream = store.streamWithID(
@@ -582,50 +575,31 @@ struct StackWorkspaceFeatureView: View {
             let operationID = stream.operationID
             let events = stream.events
             let task = Task { @MainActor in
-                var pendingLine = ""
                 do {
                     for try await event in events {
                         try Task.checkCancellation()
                         switch event {
-                        case .standardOutput(let chunk), .standardError(let chunk):
-                            appendTaggedLogs(chunk, label: label, pendingLine: &pendingLine)
+                        case .standardOutput(let chunk):
+                            logBuffer.append(chunk, containerID: label)
+                        case .standardError(let chunk):
+                            logBuffer.append(chunk, containerID: label, stderr: true)
                         case .completed(let result):
                             if !result.succeeded {
-                                appendLogs("[\(label)] Command exited with status \(result.exitCode).\n")
+                                logBuffer.append("Command exited with status \(result.exitCode).\n", containerID: label, stderr: true)
                             }
                         }
                     }
                 } catch is CancellationError {
                     store.cancelOperation(operationID)
                 } catch {
-                    appendLogs("[\(label)] \(error.localizedDescription)\n")
+                    if activeLogStreamIDs.contains(operationID) {
+                        logBuffer.append(error.localizedDescription + "\n", containerID: label, stderr: true)
+                    }
                 }
-                if !pendingLine.isEmpty { appendLogs("[\(label)] \(pendingLine)\n") }
+                if activeLogStreamIDs.contains(operationID) { logBuffer.finish(containerID: label) }
                 finishLogStream(operationID)
             }
             logTasks.append(task)
-        }
-    }
-
-    @MainActor private func appendTaggedLogs(_ chunk: String, label: String, pendingLine: inout String) {
-        pendingLine += chunk
-        let lines = pendingLine.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        guard lines.count > 1 else { return }
-        for line in lines.dropLast() { appendLogs("[\(label)] \(line)\n") }
-        pendingLine = lines.last ?? ""
-    }
-
-    @MainActor private func appendLogs(_ chunk: String) {
-        logText += chunk
-        let maximumLines = 2_000
-        let lines = logText.split(separator: "\n", omittingEmptySubsequences: false)
-        if lines.count > maximumLines {
-            logText = lines.suffix(maximumLines).joined(separator: "\n")
-        }
-        let maximumCharacters = 120_000
-        if logText.count > maximumCharacters {
-            logText = String(logText.suffix(maximumCharacters))
-            if let firstNewline = logText.firstIndex(of: "\n") { logText = String(logText[logText.index(after: firstNewline)...]) }
         }
     }
 
@@ -635,6 +609,7 @@ struct StackWorkspaceFeatureView: View {
     }
 
     @MainActor private func cancelLogStreams() {
+        logBuffer.finishAll()
         for task in logTasks { task.cancel() }
         logTasks.removeAll()
         for id in logOperationIDs { store.cancelOperation(id) }

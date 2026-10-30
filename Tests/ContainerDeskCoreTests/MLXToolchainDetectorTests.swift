@@ -91,12 +91,54 @@ struct MLXToolchainDetectorTests {
     @Test func resolvesInterpreterFromScriptShebangWithoutExecutingIt() throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        let python = root.appendingPathComponent("mlx-python")
+        let python = root.appendingPathComponent("python3.14")
         let executable = root.appendingPathComponent("mlx_lm")
         try writeExecutable(python, script: "#!/bin/sh\nexit 0\n")
         try writeExecutable(executable, script: "#!\(python.path)\nexit 0\n")
 
         #expect(MLXToolchainDetector.pythonInterpreter(for: executable, environment: ["PATH": ""])?.path == python.path)
+    }
+
+    @Test func shellTrampolineUsesTheSiblingPythonInAPathContainingSpaces() throws {
+        let root = temporaryDirectory().appendingPathComponent("Python Environment/bin")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent().deletingLastPathComponent()) }
+        let python = root.appendingPathComponent("python")
+        let executable = root.appendingPathComponent("mlx_lm")
+        try writeExecutable(python, script: "#!/bin/sh\nexit 0\n")
+        try writeExecutable(executable, script: "#!/bin/sh\n'''exec' \"\(python.path)\" \"$0\" \"$@\"\n' '''\n")
+        #expect(MLXToolchainDetector.pythonInterpreter(for: executable, environment: ["PATH": ""])?.path == python.path)
+    }
+
+    @Test func symlinkedShellTrampolineUsesTargetVenvWithoutResolvingPythonOutOfIt() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bin = root.appendingPathComponent("Python Environment/bin")
+        let exposed = root.appendingPathComponent("exposed")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: exposed, withIntermediateDirectories: true)
+        let python = bin.appendingPathComponent("python")
+        try FileManager.default.createSymbolicLink(at: python, withDestinationURL: URL(fileURLWithPath: "/bin/sh"))
+        let target = bin.appendingPathComponent("mlx_lm")
+        try writeExecutable(target, script: "#!/bin/sh\n'''exec' \"\(python.path)\" \"$0\" \"$@\"\n' '''\n")
+        let link = exposed.appendingPathComponent("mlx_lm")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        #expect(MLXToolchainDetector.pythonInterpreter(for: link, environment: ["PATH": "/usr/bin:/bin"])?.path == python.path)
+    }
+
+    @Test func envShebangResolvesPythonAndNeverReturnsAShellOrAnArbitraryInterpreter() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("mlx_lm")
+        let python = root.appendingPathComponent("python3")
+        try writeExecutable(python, script: "#!/bin/sh\nexit 0\n")
+        try writeExecutable(executable, script: "#!/usr/bin/env -S python3 -u\n")
+        #expect(MLXToolchainDetector.pythonInterpreter(for: executable, environment: ["PATH": root.path])?.path == python.path)
+        try FileManager.default.removeItem(at: python)
+        for interpreter in ["/bin/sh", "/bin/bash", "/usr/bin/ruby"] {
+            try writeExecutable(executable, script: "#!\(interpreter)\n")
+            #expect(MLXToolchainDetector.pythonInterpreter(for: executable, environment: ["PATH": ""]) == nil)
+        }
     }
 
     private func writeExecutable(_ url: URL, script: String) throws {

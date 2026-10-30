@@ -73,6 +73,7 @@ struct ContentView: View {
                         sectionRow(.machines, icon: "desktopcomputer")
                     }
                     Section("Runtime") {
+                        sectionRow(.logs, icon: "text.alignleft")
                         sectionRow(.system, icon: "gearshape.2")
                         sectionRow(.cleanup, icon: "sparkles")
                         sectionRow(.activity, icon: "clock.arrow.circlepath")
@@ -133,7 +134,8 @@ struct ContentView: View {
         }
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: mlxStore.shutdownMessage != nil)
         .onChange(of: scenePhase) { _, phase in
-            store.setWindowActive(sceneID, active: phase == .active)
+            // Keep history and exit alerts useful while another app has keyboard focus.
+            store.setWindowActive(sceneID, active: phase != .background)
         }
         .onChange(of: selectedRawValue) { _, rawValue in
             store.setVisibleSection(ContainerSection(rawValue: rawValue), for: sceneID)
@@ -170,6 +172,7 @@ struct ContentView: View {
         case .cleanup: .mint
         case .mlxModels: .indigo
         case .system, .activity: .secondary
+        case .logs: .teal
         }
     }
 }

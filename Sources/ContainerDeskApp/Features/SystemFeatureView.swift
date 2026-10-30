@@ -63,7 +63,7 @@ struct SystemFeatureView: View {
         .confirmationDialog("Stop Apple container services?", isPresented: $showStopConfirmation, titleVisibility: .visible) {
             Button("Stop Services", role: .destructive) { Task { await run(["system", "stop"], title: "Stop Container Services") } }
             Button("Cancel", role: .cancel) { }
-        } message: { Text("The service will stop, but running containers remain on disk and continue after the service is started again.") }
+        } message: { Text(SystemServiceActions.stopConfirmation) }
     }
 
     private var serviceCard: some View {
@@ -85,7 +85,7 @@ struct SystemFeatureView: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(busy || runtimeIsRunning)
                     Button("Stop Services", systemImage: "stop.fill") { showStopConfirmation = true }
-                        .disabled(busy || !runtimeIsRunning)
+                        .disabled(busy || !runtimeIsRunning || store.limitsOperationContainerID != nil)
                 }
                 .controlSize(.regular)
             }

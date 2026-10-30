@@ -77,15 +77,27 @@ run_k8s() {
 
 cleanup() {
   local exit_code=$?
+  local cleanup_failed=0
   trap - EXIT INT TERM
   if [[ "$COMPOSE_MAY_EXIST" -eq 1 ]]; then
-    "$CLI" compose down --file "$COMPOSE_FILE" --project-name "$COMPOSE_PROJECT" > /dev/null 2>&1 || true
-    record "Compose cleanup: requested down for only $COMPOSE_PROJECT"
+    if "$CLI" compose down --file "$COMPOSE_FILE" --project-name "$COMPOSE_PROJECT" > /dev/null 2>&1; then
+      record "Compose cleanup: passed"
+    else
+      record "Compose cleanup: failed (exit $?)"
+      echo "Cleanup incomplete: inspect Compose project $COMPOSE_PROJECT and its retained networks." >&2
+      cleanup_failed=1
+    fi
   fi
   if [[ "$K8S_MAY_EXIST" -eq 1 ]]; then
-    KUBECONFIG="$KUBECONFIG_FILE" "$CLI" k8s delete --name "$K8S_NAME" > /dev/null 2>&1 || true
-    record "Kubernetes cleanup: requested delete for only $K8S_NAME"
+    if KUBECONFIG="$KUBECONFIG_FILE" "$CLI" k8s delete --name "$K8S_NAME" > /dev/null 2>&1; then
+      record "Kubernetes cleanup: passed"
+    else
+      record "Kubernetes cleanup: failed (exit $?)"
+      echo "Cleanup incomplete: inspect Kubernetes cluster $K8S_NAME." >&2
+      cleanup_failed=1
+    fi
   fi
+  if [[ "$cleanup_failed" -eq 1 && "$exit_code" -eq 0 ]]; then exit_code=1; fi
   local after_hash
   after_hash="$(file_hash "$DEFAULT_KUBECONFIG")"
   if [[ "$after_hash" != "$DEFAULT_KUBECONFIG_HASH" ]]; then
@@ -97,8 +109,8 @@ cleanup() {
   fi
   echo "Plugin smoke checks:"
   /usr/bin/grep -E '^(Run prefix:|Container service preflight:|Compose .*: (passed|failed)|Kubernetes .*: (passed|failed)|Kubernetes list:|Default kubeconfig hash:)' "$LOG_FILE" || true
-  if [[ "$COMPOSE_PASSED" -eq 1 ]]; then echo "Compose smoke passed (unique project $COMPOSE_PROJECT)."; fi
-  if [[ "$K8S_PASSED" -eq 1 ]]; then echo "Kubernetes smoke passed (unique cluster $K8S_NAME; isolated KUBECONFIG)."; fi
+  if [[ "$COMPOSE_PASSED" -eq 1 && "$exit_code" -eq 0 ]]; then echo "Compose smoke passed (unique project $COMPOSE_PROJECT)."; fi
+  if [[ "$K8S_PASSED" -eq 1 && "$exit_code" -eq 0 ]]; then echo "Kubernetes smoke passed (unique cluster $K8S_NAME; isolated KUBECONFIG)."; fi
   if [[ "$COMPOSE_PASSED" -eq 0 && "$K8S_PASSED" -eq 0 && "$exit_code" -eq 0 ]]; then echo "No plugin smoke workflow was selected."; fi
   if [[ "$exit_code" -ne 0 ]]; then
     echo "Plugin smoke failed; only the named resources above were targeted." >&2

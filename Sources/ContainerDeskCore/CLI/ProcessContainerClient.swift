@@ -7,28 +7,18 @@ public struct ProcessContainerClient: ContainerClient {
     public init(resolver: ExecutableResolver = ExecutableResolver()) { self.resolver = resolver }
 
     public func run(_ request: CommandRequest) async throws -> CommandResult {
-        var result: CommandResult?
-        for try await event in stream(request) {
-            if case .completed(let value) = event { result = value }
-        }
-        guard let result else { throw ContainerClientError.launchFailed("The container command ended without a result.") }
-        return result
+        try Task.checkCancellation()
+        return try await launch(request).completedResult()
     }
 
     public func stream(_ request: CommandRequest) -> AsyncThrowingStream<CommandEvent, Error> {
-        let (stream, continuation) = AsyncThrowingStream<CommandEvent, Error>.makeStream(bufferingPolicy: .bufferingOldest(256))
-        do {
-            guard let executable = resolver.resolve() else {
-                continuation.finish(throwing: ContainerClientError.executableNotFound)
-                return stream
-            }
-            let job = ProcessJob(executable: executable, request: request, continuation: continuation)
-            continuation.onTermination = { @Sendable _ in job.cancel() }
-            try job.launch()
-        } catch {
-            continuation.finish(throwing: ContainerClientError.launchFailed(request.redact(error.localizedDescription)))
-        }
-        return stream
+        do { return try launch(request).events }
+        catch { return AsyncThrowingStream { $0.finish(throwing: error) } }
+    }
+
+    public func launch(_ request: CommandRequest) throws -> ManagedProcessExecution {
+        guard let executable = resolver.resolve() else { throw ContainerClientError.executableNotFound }
+        return try ProcessExecutableClient(executableURL: executable).launch(request)
     }
 }
 
@@ -42,12 +32,8 @@ public struct ProcessExecutableClient: ContainerClient {
     }
 
     public func run(_ request: CommandRequest) async throws -> CommandResult {
-        var result: CommandResult?
-        for try await event in stream(request) {
-            if case .completed(let value) = event { result = value }
-        }
-        guard let result else { throw ContainerClientError.launchFailed("The process ended without a result.") }
-        return result
+        try Task.checkCancellation()
+        return try await launch(request).completedResult()
     }
 
     public func stream(_ request: CommandRequest) -> AsyncThrowingStream<CommandEvent, Error> {
@@ -80,6 +66,25 @@ public struct ManagedProcessExecution: Sendable {
 
     public var isLeaderRunning: Bool { leaderRunningBody() }
     public func terminateAndWait() async { await terminateBody() }
+}
+
+private extension ManagedProcessExecution {
+    func completedResult() async throws -> CommandResult {
+        let outcome: Result<CommandResult, any Error>
+        do {
+            var result: CommandResult?
+            for try await event in events {
+                if case .completed(let value) = event { result = value }
+            }
+            try Task.checkCancellation()
+            guard let result else { throw ContainerClientError.launchFailed("The command ended without a result.") }
+            outcome = .success(result)
+        } catch { outcome = .failure(error) }
+        // Stream iteration ends immediately on cancellation; process shutdown
+        // does not. Keep callers suspended until TERM/KILL, waitpid and drains finish.
+        await terminateAndWait()
+        return try outcome.get()
+    }
 }
 
 private final class ProcessJob: @unchecked Sendable {

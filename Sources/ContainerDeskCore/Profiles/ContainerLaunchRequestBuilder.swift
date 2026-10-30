@@ -103,16 +103,10 @@ public enum ContainerLaunchRequestBuilder {
         guard (try? Parser.volumes(configuration.volumes.map(trimmed))) != nil else {
             throw ContainerLaunchValidationError.invalidField("volume")
         }
-        for rawPath in configuration.environmentFiles {
-            let path = try environmentFilePath(rawPath)
-            for pair in try environmentFileAssignments(path: path) {
-                availableKeys.insert(pair.key)
-                redactions.append(pair.value)
-                // Snapshot each parsed value once: the CLI must not reread a changed file.
-                // Joined option syntax also safely handles the broader key syntax in env files.
-                arguments.append("--env=\(pair.key)=\(pair.value)")
-            }
-        }
+        let snapshot = try snapshotEnvironment(files: configuration.environmentFiles, values: [])
+        availableKeys.formUnion(snapshot.keys)
+        redactions += snapshot.redactions
+        arguments += snapshot.arguments
         for entry in environment {
             let pair = try environmentAssignment(entry)
             availableKeys.insert(pair.key)
@@ -126,6 +120,33 @@ public enum ContainerLaunchRequestBuilder {
         arguments += ["--", trimmed(configuration.image)]
         arguments += try ContainerCommandTokenizer.tokenize(configuration.command)
         return CommandRequest(arguments: arguments, redactions: redactions)
+    }
+
+    public struct EnvironmentSnapshot: Sendable {
+        public let arguments: [String]
+        public let keys: Set<String>
+        public let redactions: [String]
+    }
+
+    /// Snapshots file and inherited inputs so execution and redaction use identical values.
+    public static func snapshotEnvironment(files: [String], values: [String], inherited: [String: String] = ProcessInfo.processInfo.environment) throws -> EnvironmentSnapshot {
+        var assignments: [(key: String, value: String)] = []
+        for file in files {
+            assignments += try environmentFileAssignments(path: environmentFilePath(file), inherited: inherited)
+        }
+        for entry in values {
+            guard !entry.contains("\0") else { throw ContainerLaunchValidationError.invalidEnvironment }
+            if let equals = entry.firstIndex(of: "=") {
+                let key = String(entry[..<equals])
+                guard !key.isEmpty, !key.contains(where: \.isWhitespace) else { throw ContainerLaunchValidationError.invalidEnvironment }
+                assignments.append((key, String(entry[entry.index(after: equals)...])))
+            } else {
+                guard !entry.isEmpty, !entry.contains(where: \.isWhitespace) else { throw ContainerLaunchValidationError.invalidEnvironment }
+                if let value = inherited[entry] { assignments.append((entry, value)) }
+            }
+        }
+        guard !assignments.contains(where: { $0.value.contains("\0") }) else { throw ContainerLaunchValidationError.invalidEnvironment }
+        return EnvironmentSnapshot(arguments: assignments.map { "--env=\($0.key)=\($0.value)" }, keys: Set(assignments.map(\.key)), redactions: assignments.map(\.value))
     }
 
     private static func validateVolumeSyntax(_ value: String) throws {
@@ -171,7 +192,7 @@ public enum ContainerLaunchRequestBuilder {
         return (key, String(entry[entry.index(after: equals)...]))
     }
 
-    private static func environmentFileAssignments(path: String) throws -> [(key: String, value: String)] {
+    private static func environmentFileAssignments(path: String, inherited: [String: String]) throws -> [(key: String, value: String)] {
         let maximumBytes = 1_048_576
         // Check the opened descriptor so path replacement cannot substitute a FIFO or device.
         let descriptor = Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
@@ -208,7 +229,7 @@ public enum ContainerLaunchRequestBuilder {
                 assignments.append((key, String(value[value.index(after: equals)...])))
             } else {
                 guard !value.contains(where: { $0 == " " || $0 == "\t" }) else { throw ContainerLaunchValidationError.invalidEnvironmentFile }
-                if let inherited = ProcessInfo.processInfo.environment[value] { assignments.append((value, inherited)) }
+                if let inheritedValue = inherited[value] { assignments.append((value, inheritedValue)) }
             }
         }
         return assignments

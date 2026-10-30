@@ -102,6 +102,15 @@ struct HybridLiveReadTests {
         #expect(firstMemoryMilliseconds != nil, "AppStore did not publish memory metrics within 15 seconds.")
         #expect(firstCPUMilliseconds != nil, "AppStore did not publish CPU metrics within 15 seconds.")
 
+        let sampleCount = store.monitoring.history.samples.values.reduce(0) { $0 + $1.count }
+        #expect(sampleCount > 0, "Live metrics were not retained in session history.")
+        store.setVisibleSection(.logs, for: sceneID)
+        let historyDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while store.monitoring.history.samples.values.reduce(0, { $0 + $1.count }) <= sampleCount, ContinuousClock.now < historyDeadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(store.monitoring.history.samples.values.reduce(0, { $0 + $1.count }) > sampleCount, "History stopped collecting after navigation to Logs.")
+
         print("hybrid_live sections=\(sections.count) native_list_items=\(nativeListItemCount) cli_list_items=\(cliListItemCount) native_id_parity=\(parityCount)/\(nativeSections.count) stats_samples=\(stats.value.count) inspect_redaction=\(inspectionRedactionPassed ? "passed" : "failed") store_list_ms=\(Self.formatMilliseconds(firstListMilliseconds)) store_list_count=\(listedCount) first_ram_ms=\(Self.formatMilliseconds(firstMemoryMilliseconds)) ram_count=\(memoryCount) first_cpu_ms=\(Self.formatMilliseconds(firstCPUMilliseconds)) cpu_count=\(cpuCount) list_backend=\(store.resourceReadBackends[.containers]?.rawValue ?? "unavailable") stats_backend=\(store.containerMetricsBackend?.rawValue ?? "unavailable")")
     }
 

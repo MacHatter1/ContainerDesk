@@ -2,6 +2,13 @@
 set -euo pipefail
 
 MODE="${1:-run}"
+usage() { echo "usage: $0 [run|--build-only|--debug|--logs|--telemetry|--navigation-metrics|--navigation-benchmark|--verify]"; }
+if (( $# > 1 )); then usage >&2; exit 2; fi
+case "$MODE" in
+  --help|-h|help) usage; exit 0 ;;
+  run|--build-only|build-only|--debug|debug|--logs|logs|--telemetry|telemetry|--navigation-metrics|navigation-metrics|--navigation-benchmark|navigation-benchmark|--verify|verify) ;;
+  *) usage >&2; exit 2 ;;
+esac
 APP_NAME="ContainerDesk"
 BUNDLE_ID="com.thomasswift.ContainerDesk"
 MIN_SYSTEM_VERSION="26.0"

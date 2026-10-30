@@ -3,6 +3,22 @@ import Testing
 @testable import ContainerDeskApp
 
 struct ResourceActionValidationTests {
+    @Test func deletionRoutingIsExplicitAndNeverFallsBackToContainerDeletion() throws {
+        let supported: [(ContainerSection, [String])] = [
+            (.containers, ["delete"]), (.images, ["image", "delete"]),
+            (.volumes, ["volume", "delete"]), (.networks, ["network", "delete"]),
+            (.machines, ["machine", "delete"]),
+        ]
+        for (section, prefix) in supported {
+            #expect(ResourceActionRouting.supportsDelete(section))
+            #expect(try ResourceActionRouting.deletionArguments(section: section, target: "--all") == prefix + ["--", "--all"])
+        }
+        for section in ContainerSection.allCases where !supported.contains(where: { $0.0 == section }) {
+            #expect(!ResourceActionRouting.supportsDelete(section))
+            #expect(throws: (any Error).self) { try ResourceActionRouting.deletionArguments(section: section, target: "localhost") }
+        }
+    }
+
     @Test func selectedActionTargetSeedsAndUsesOneTrimmedEditableValue() {
         #expect(ResourceActionTargetValue.initial(selectedResourceID: "container-123") == "container-123")
         #expect(ResourceActionTargetValue.initial(selectedResourceID: "  image:tag  ") == "image:tag")

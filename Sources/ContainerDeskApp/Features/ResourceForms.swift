@@ -44,13 +44,15 @@ struct ResourceFormSheet: View {
                         TextField(nameLabel, text: $name, prompt: Text(namePlaceholder))
                     }
                     if section == .registries {
-                        TextField("Registry host", text: $name, prompt: Text("https://index.docker.io/v1/"))
+                        TextField("Registry host", text: $name, prompt: Text("registry.example:5000"))
                         TextField("Username", text: $username)
                         SecureField("Password or token", text: $password)
                         Picker("Registry scheme", selection: $registryScheme) {
                             Text("HTTPS").tag("https")
                             Text("HTTP").tag("http")
                         }
+                        Text("An HTTP or HTTPS URL may include a port. A scheme included in the URL takes precedence over this selection.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 }
 
@@ -158,9 +160,7 @@ struct ResourceFormSheet: View {
             for line in optionsText.lines { args += ["--option", line] }
             args.append(name)
         case .registries:
-            let server = name.hasPrefix("https://") || name.hasPrefix("http://") ? URL(string: name)?.host ?? name : name
-            args = ["registry", "login", "--scheme", registryScheme, "--username", username, "--password-stdin", server]
-            return CommandRequest(arguments: args, stdin: Data((password + "\n").utf8), redactions: [password])
+            return try RegistryLoginRequestBuilder.request(server: name, scheme: registryScheme, username: username, password: password)
         case .machines:
             args = ["machine", "create"]
             if !name.isEmpty { args += ["--name", name] }
@@ -181,6 +181,7 @@ struct ResourceActionSheet: View {
     let onResult: (FeatureNotice, String) -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @State private var runtime: AppStore.ReviewedRuntime
     @State private var target = ""
     @State private var secondary = ""
     @State private var tagBeforePush = false
@@ -191,6 +192,7 @@ struct ResourceActionSheet: View {
     @State private var failure: String?
 
     init(action: ResourcePendingAction, section: ContainerSection, store: AppStore, onResult: @escaping (FeatureNotice, String) -> Void) {
+        self._runtime = State(initialValue: store.captureReviewedRuntime())
         self.action = action
         self.section = section
         self.store = store
@@ -295,7 +297,8 @@ struct ResourceActionSheet: View {
         }
     }
     private var canRun: Bool {
-        switch action.kind {
+        if action.kind == .delete && !ResourceActionRouting.supportsDelete(section) { return false }
+        return switch action.kind {
         case .stopAll, .prune: true
         case .push: !normalizedTarget.isEmpty && (!tagBeforePush || !normalizedSecondary.isEmpty)
         case .tag: !normalizedTarget.isEmpty && !normalizedSecondary.isEmpty
@@ -321,16 +324,7 @@ struct ResourceActionSheet: View {
             case .stop: args = (section == .machines ? ["machine", "stop"] : ["stop"]) + targetArguments
             case .stopAll: args = ["stop", "--all"]
             case .delete:
-                let prefix: [String]
-                switch section {
-                case .containers: prefix = ["delete"]
-                case .images: prefix = ["image", "delete"]
-                case .volumes: prefix = ["volume", "delete"]
-                case .networks: prefix = ["network", "delete"]
-                case .machines: prefix = ["machine", "delete"]
-                default: prefix = ["delete"]
-                }
-                args = prefix + targetArguments
+                args = try ResourceActionRouting.deletionArguments(section: section, target: id)
             case .prune:
                 switch section {
                 case .containers: args = ["prune"]
@@ -341,7 +335,7 @@ struct ResourceActionSheet: View {
                 }
             case .push:
                 if tagBeforePush {
-                    _ = try await store.execute(CommandRequest(arguments: ["image", "tag"] + targetArguments + [normalizedSecondary]), title: "Tag Image")
+                    _ = try await store.execute(CommandRequest(arguments: ["image", "tag"] + targetArguments + [normalizedSecondary]), title: "Tag Image", reviewedRuntime: runtime)
                     args = ["image", "push"] + ResourceActionTargetValue.positionalArguments(normalizedSecondary)
                 } else { args = ["image", "push"] + targetArguments }
             case .save: args = ["image", "save", "--output", normalizedSecondary] + targetArguments
@@ -353,12 +347,12 @@ struct ResourceActionSheet: View {
             case .exec: args = ["exec", "--interactive", "--tty"] + targetArguments + ["/bin/sh"]
             case .start: args = ["start"] + targetArguments
             case .restart:
-                _ = try await store.execute(CommandRequest(arguments: ["stop"] + targetArguments), title: "Stop Container for Restart")
+                _ = try await store.execute(CommandRequest(arguments: ["stop"] + targetArguments), title: "Stop Container for Restart", reviewedRuntime: runtime)
                 args = ["start"] + targetArguments
             case .signal: args = ["kill", "--signal", normalizedSecondary.isEmpty ? "SIGTERM" : normalizedSecondary] + targetArguments
             case .tag: args = ["image", "tag"] + targetArguments + [normalizedSecondary]
             }
-            let result = try await store.execute(CommandRequest(arguments: args), title: actionTitle)
+            let result = try await store.execute(CommandRequest(arguments: args), title: actionTitle, reviewedRuntime: runtime)
             output = result.standardOutput + (result.standardError.isEmpty ? "" : "\n" + result.standardError)
             guard result.succeeded else { throw FeatureCommandError(result: result) }
             if ![.logs, .stats].contains(action.kind) { await store.refresh(section, force: true) }
@@ -390,8 +384,9 @@ enum ResourceActionTargetValue {
 struct FeatureCommandError: Error, LocalizedError {
     let text: String
     init(result: CommandResult) {
+        if result.timedOut { text = "Command timed out."; return }
         let message = result.standardError.trimmingCharacters(in: .whitespacesAndNewlines)
-        text = message.isEmpty ? "Command failed with exit code \(result.exitCode)." : message
+        text = message.isEmpty ? (result.failureDescription ?? "Command did not complete.") : message
     }
     init(message: String) { text = message }
     var errorDescription: String? { text }

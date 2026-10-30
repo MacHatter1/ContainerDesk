@@ -40,6 +40,7 @@ struct AdvancedCommandSheet: View {
         return targets.isEmpty ? "\(spec.title)?" : "\(spec.title): \(targets)?"
     }
     private var confirmationMessage: String {
+        if let message = spec?.confirmationMessage { return message }
         let targets = confirmationTargets
         if !targets.isEmpty { return "This command targets: \(targets)" }
         return flags.contains("all") ? "The command will apply to the full scope named above." : "Review the selected action and scope before continuing."
@@ -122,11 +123,9 @@ struct AdvancedCommandSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    HStack {
-                        Button(running ? "Running…" : "Run") { if destructive { showingConfirmation = true } else { launch() } }
-                        if running { Button("Cancel", role: .destructive) { cancelOperation() } }
-                    }
-                        .buttonStyle(.borderedProminent).disabled(running || !valid)
+                    AdvancedCommandControls(running: running, valid: valid && spec.map { store.runtimeOperations.canStart(CommandRequest(arguments: $0.arguments)) } == true, run: {
+                        if destructive { showingConfirmation = true } else { launch() }
+                    }, cancel: cancelOperation)
                 }
             }
             .confirmationDialog(confirmationTitle, isPresented: $showingConfirmation, titleVisibility: .visible) {
@@ -163,7 +162,11 @@ struct AdvancedCommandSheet: View {
     }
     private func reset(for id: String) { positionals = []; values = [:]; flags = []; output = ""; error = nil }
 
-    private func launch() { runningTask = Task { await run() } }
+    private func launch() {
+        guard !running else { return }
+        running = true
+        runningTask = Task { await run() }
+    }
     private func cancelOperation() {
         if let operationID { store.cancelOperation(operationID) }
         runningTask?.cancel()
@@ -175,57 +178,22 @@ struct AdvancedCommandSheet: View {
         running = true
         error = nil
         do {
-            let redactOutput = spec.id == "inspect"
-            var inspectOutput = ""
-            var inspectOutputBytes = 0
-            var inspectOutputTruncated = false
-            let inspectOutputLimit = 1_000_000
-            var sensitiveValues: [String] = []
-            let flagArguments = spec.flags.flatMap { descriptor -> [String] in
-                if descriptor.kind == .boolean { return flags.contains(descriptor.name) ? ["--\(descriptor.name)"] : [] }
-                let raw = values[descriptor.name, default: ""]
-                guard !raw.isEmpty else { return [] }
-                let vals = descriptor.repeats ? raw.split(whereSeparator: \.isNewline).map(String.init) : [raw]
-                if descriptor.sensitive { sensitiveValues += vals.map { entry in entry.split(separator: "=", maxSplits: 1).dropFirst().first.map(String.init) ?? entry } }
-                let name = descriptor.shortName ?? "--\(descriptor.name)"
-                return vals.flatMap { [name, $0] }
-            }
-            let positionalArguments = try positionalValues(for: spec)
-            let positionalTerminator = AdvancedCommandScopeValidation.positionalTerminator(
-                section: section,
-                commandID: spec.id,
-                positionals: positionalArguments
-            )
-            let args = spec.arguments + flagArguments + positionalTerminator + positionalArguments
-            let request = CommandRequest(arguments: args, redactions: sensitiveValues)
-            let stream = store.stream(request, title: spec.title)
-            operationID = store.operations.first?.id
-            for try await event in stream {
+            let request = try AdvancedCommandRequestBuilder.make(section: section, spec: spec, flags: flags, values: values, positionalArguments: positionalValues(for: spec))
+            var commandOutput = AdvancedCommandOutput(section: section, commandID: spec.id, arguments: request.arguments)
+            let stream = store.streamWithID(request, title: spec.title)
+            operationID = stream.operationID
+            for try await event in stream.events {
                 try Task.checkCancellation()
                 switch event {
-                case .standardOutput(let chunk):
-                    if redactOutput {
-                        if inspectOutputBytes + chunk.utf8.count <= inspectOutputLimit {
-                            inspectOutput += chunk
-                            inspectOutputBytes += chunk.utf8.count
-                        } else { inspectOutputTruncated = true }
-                    } else { append(chunk) }
-                case .standardError(let chunk):
-                    if redactOutput {
-                        if inspectOutputBytes + chunk.utf8.count <= inspectOutputLimit {
-                            inspectOutput += chunk
-                            inspectOutputBytes += chunk.utf8.count
-                        } else { inspectOutputTruncated = true }
-                    } else { append(chunk) }
+                case .standardOutput(let chunk), .standardError(let chunk):
+                    commandOutput.append(chunk)
+                    output = commandOutput.text
                 case .completed(let result):
+                    commandOutput.finish(succeeded: result.succeeded)
+                    output = commandOutput.text
                     if !result.succeeded {
-                        if redactOutput { throw FeatureCommandError(message: "Inspect failed with exit code \(result.exitCode); raw error output was hidden.") }
+                        if commandOutput.requiresDocument { throw FeatureCommandError(message: "Command failed with exit code \(result.exitCode); raw output was hidden.") }
                         throw FeatureCommandError(result: result)
-                    }
-                    if redactOutput {
-                        output = inspectOutputTruncated
-                            ? "Inspect output exceeded 1 MB. It was hidden because a complete document is required for safe redaction."
-                            : InspectRedactor.redact(inspectOutput)
                     }
                 }
             }
@@ -235,8 +203,6 @@ struct AdvancedCommandSheet: View {
         operationID = nil
         running = false
     }
-    private func append(_ text: String) { output += text; if output.count > 150_000 { output = String(output.suffix(150_000)) } }
-
     private static func memoryMiB(_ value: String) -> Double? {
         let input = value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard !input.isEmpty else { return nil }
@@ -298,7 +264,7 @@ enum AdvancedCommandScopeValidation {
     }
 }
 
-private struct AdvancedCommandSpec: Identifiable {
+struct AdvancedCommandSpec: Identifiable {
     struct Positional { let name: String; let placeholder: String; let required: Bool; var repeats = false; var multiline = false; var tokenized = false }
     struct Flag: Identifiable {
         enum Kind { case boolean, value }
@@ -322,10 +288,11 @@ private struct AdvancedCommandSpec: Identifiable {
     var positionals: [Positional] = []
     var flags: [Flag] = []
     var destructive = false
+    var confirmationMessage: String? = nil
     var refreshSection = true
 }
 
-private enum AdvancedCommandCatalog {
+enum AdvancedCommandCatalog {
     typealias Flag = AdvancedCommandSpec.Flag
     typealias Positional = AdvancedCommandSpec.Positional
     static func specs(for section: ContainerSection) -> [AdvancedCommandSpec] {
@@ -342,6 +309,7 @@ private enum AdvancedCommandCatalog {
         case .kubernetes: []
         case .system: system
         case .activity: []
+        case .logs: []
         case .mlxModels: []
         case .cleanup: []
         }
@@ -354,7 +322,7 @@ private enum AdvancedCommandCatalog {
         .init(id: "create", title: "Create Container", summary: "Create without starting; accepts the run process, resource, network and filesystem options.", arguments: ["create"], positionals: [.init(name: "Image", placeholder: "alpine:latest", required: true), .init(name: "Command and arguments", placeholder: "Optional", required: false, tokenized: true)], flags: [
             .bool("detach", "Do not attach process"), .bool("interactive", "Keep stdin open"), .bool("tty", "Allocate TTY"), .value("name", "Name"), .value("cidfile", "Write the container ID to a file"), .value("env", "Environment variables", "KEY=value per line", repeats: true, multiline: true, sensitive: true), .value("env-file", "Environment files", "One path per line", repeats: true, multiline: true), .value("cpus", "CPU limit"), .value("memory", "Memory limit"), .value("platform", "Platform"), .value("arch", "Architecture"), .value("os", "Operating system"), .value("entrypoint", "Entrypoint"), .value("workdir", "Working directory"), .value("user", "User"), .value("uid", "UID"), .value("gid", "GID"), .value("ulimit", "Ulimits", "type=soft:hard", repeats: true), .value("publish", "Published ports", "HOST:CONTAINER per line", repeats: true, multiline: true), .value("publish-socket", "Published sockets", repeats: true, multiline: true), .value("volume", "Volumes", "SOURCE:DESTINATION per line", repeats: true, multiline: true), .value("mount", "Mount specs", "type=...,source=...,target=...", repeats: true, multiline: true), .value("network", "Networks", "One per line", repeats: true, multiline: true), .value("dns", "DNS servers", repeats: true), .value("dns-domain", "DNS domain"), .value("dns-search", "DNS search domains", repeats: true), .value("dns-option", "DNS options", repeats: true), .value("label", "Labels", "KEY=value per line", repeats: true, multiline: true), .value("tmpfs", "Tmpfs mounts", repeats: true), .value("cap-add", "Capabilities to add", repeats: true), .value("cap-drop", "Capabilities to drop", repeats: true), .value("kernel", "Custom kernel path"), .value("kernel-arg", "Kernel arguments", repeats: true), .value("runtime", "Runtime handler"), .value("init-image", "Init image"), .value("shm-size", "/dev/shm size"), .bool("init", "Run init process"), .bool("rm", "Remove after exit"), .bool("rosetta", "Enable Rosetta"), .bool("read-only", "Read-only root filesystem"), .bool("ssh", "Forward SSH agent"), .bool("virtualization", "Expose virtualization"), .bool("no-dns", "Disable DNS setup"), .value("masked-path", "Masked paths", repeats: true), .value("read-only-path", "Read-only paths", repeats: true), .value("scheme", "Registry scheme"), .value("max-concurrent-downloads", "Max concurrent image downloads")
         ]),
-        .init(id: "list", title: "List Containers", summary: "List running containers or include stopped containers; the workspace refresh uses curated JSON summaries.", arguments: ["list"], flags: [.bool("all", "Include stopped containers"), .value("format", "Output format", "json, table, yaml, or toml"), .bool("quiet", "Only container IDs")], refreshSection: false),
+        .init(id: "list", title: "List Containers", summary: "List running containers or include stopped containers; structured output is shown as redacted JSON.", arguments: ["list"], flags: [.bool("all", "Include stopped containers"), .value("format", "Output format", "json, table, yaml, or toml"), .bool("quiet", "Only container IDs")], refreshSection: false),
         .init(id: "start", title: "Start", summary: "Start a stopped container and optionally attach to its output.", arguments: ["start"], positionals: [.init(name: "Container ID", placeholder: "container-id", required: true)], flags: [.bool("attach", "Attach output"), .bool("interactive", "Attach stdin")]),
         .init(id: "stop", title: "Stop", summary: "Gracefully stop selected containers.", arguments: ["stop"], positionals: [.init(name: "Container IDs", placeholder: "One ID per line", required: false, repeats: true, multiline: true)], flags: [.bool("all", "Stop all running containers"), .value("signal", "Signal", "SIGTERM"), .value("time", "Timeout seconds")], destructive: true),
         .init(id: "kill", title: "Kill", summary: "Immediately signal selected containers.", arguments: ["kill"], positionals: [.init(name: "Container IDs", placeholder: "One ID per line", required: false, repeats: true, multiline: true)], flags: [.bool("all", "Signal all running containers"), .value("signal", "Signal", "KILL")], destructive: true),
@@ -423,7 +391,7 @@ private enum AdvancedCommandCatalog {
 
     private static let system: [AdvancedCommandSpec] = [
         .init(id: "start", title: "Start Services", summary: "Start container services and optionally install a kernel.", arguments: ["system", "start"], flags: [.value("app-root", "Application data root"), .value("install-root", "Executables and plugins root"), .value("log-root", "Log root"), .bool("enable-kernel-install", "Allow default kernel installation"), .bool("disable-kernel-install", "Do not install a kernel"), .value("timeout", "Startup timeout seconds")]),
-        .init(id: "stop", title: "Stop Services", summary: "Stop the launchd services. Running containers remain until stopped separately.", arguments: ["system", "stop"], flags: [.value("prefix", "Launchd prefix")], destructive: true),
+        .init(id: "stop", title: "Stop Services", summary: SystemServiceActions.stopConfirmation, arguments: ["system", "stop"], flags: [.value("prefix", "Launchd prefix")], destructive: true, confirmationMessage: SystemServiceActions.stopConfirmation),
         .init(id: "status", title: "Service Status", summary: "Check service status and API health.", arguments: ["system", "status"], flags: [.value("prefix", "Launchd prefix"), .value("format", "Output format")], refreshSection: false),
         .init(id: "version", title: "Version", summary: "Show CLI and API server version information.", arguments: ["system", "version"], flags: [.value("format", "Output format")], refreshSection: false),
         .init(id: "df", title: "Disk Usage", summary: "Show image, container and volume storage use.", arguments: ["system", "df"], flags: [.value("format", "Output format")], refreshSection: false),

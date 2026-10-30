@@ -6,14 +6,27 @@ import Observation
 @Observable
 public final class AppStore {
     let cleanupStore = CleanupStore()
+    let pluginLibrary: PluginLibraryStore
+    let kubernetesOperations = KubernetesOperationStore()
     let environmentProfiles: EnvironmentProfilesStore
     let managedStacks: ManagedStacksStore
-    public private(set) var limitsOperationContainerID: String?
+    let monitoring: ContainerMonitoringStore
+    let runtimeOperations = RuntimeOperationPolicy()
+    public var limitsOperationContainerID: String? { runtimeOperations.limitsContainerID }
     public private(set) var operations: [OperationRecord] = []
     public private(set) var snapshots: [ContainerSection: ResourceSnapshot] = [:]
     public private(set) var resourceReadBackends: [ContainerSection: ResourceReadBackend] = [:]
     public private(set) var resourceReadFallbackReasons: [ContainerSection: String] = [:]
     public private(set) var containerMetrics: [String: ContainerMetric] = [:]
+    public var stackWorkspaces: [StackWorkspace] {
+        workspaceCache.workspaces(
+            containers: snapshots[.containers]?.items ?? [], images: snapshots[.images]?.items ?? [],
+            volumes: snapshots[.volumes]?.items ?? [], networks: snapshots[.networks]?.items ?? [],
+            metrics: containerMetrics, managedStacks: managedStacks.stacks,
+            ungroupedContainerIDs: managedStacks.collection.ungroupedContainerIDs
+        )
+    }
+    @ObservationIgnored private var workspaceCache = StackWorkspaceCache()
     public private(set) var containerMetricsError: String?
     public private(set) var containerMetricsUpdatedAt: Date?
     public private(set) var containerMetricsBackend: ResourceReadBackend?
@@ -64,10 +77,13 @@ public final class AppStore {
             client = ProcessContainerClient(resolver: ExecutableResolver(overridePath: cliPath))
             resourceReader = ContainerResourceReader(cli: client, nativeAllowed: cliPath == nil)
             clientEpoch += 1
+            monitoring.reset()
             managedStacks.setRuntime(cliPath: cliPath)
             cleanupStore.invalidate()
             for section in listSections { refreshGenerations[section, default: 0] += 1 }
             refreshingSections.removeAll()
+            for waiters in resourceRefreshWaiters.values { for waiter in waiters.values { waiter.resume() } }
+            resourceRefreshWaiters.removeAll()
             lastResourceRefreshAt.removeAll()
             for section in ContainerSection.allCases {
                 cliCapabilities[section] = .unknown
@@ -121,8 +137,10 @@ public final class AppStore {
     @ObservationIgnored private var resourcePollingTasks: [ContainerSection: Task<Void, Never>] = [:]
     @ObservationIgnored private var resourcePollingTokens: [ContainerSection: UUID] = [:]
     @ObservationIgnored private var refreshingSections = Set<ContainerSection>()
+    @ObservationIgnored private var resourceRefreshWaiters: [ContainerSection: [UUID: CheckedContinuation<Void, Never>]] = [:]
     @ObservationIgnored private var lastResourceRefreshAt: [ContainerSection: Date] = [:]
     @ObservationIgnored private var refreshGenerations: [ContainerSection: Int] = [:]
+    @ObservationIgnored private var completedRefreshGenerations: [ContainerSection: Int] = [:]
     @ObservationIgnored private var clientEpoch = 0
     @ObservationIgnored private var healthPollingGeneration = 0
     @ObservationIgnored private var capabilitiesPollingGeneration = 0
@@ -147,6 +165,8 @@ public final class AppStore {
     public init(client: (any ContainerClient)? = nil, defaults: UserDefaults = .standard, stackRepository: ManagedStackRepository = .init()) {
         self.environmentProfiles = EnvironmentProfilesStore()
         self.defaults = defaults
+        self.pluginLibrary = PluginLibraryStore(defaults: defaults)
+        self.monitoring = ContainerMonitoringStore(defaults: defaults)
         let savedPath = defaults.string(forKey: Self.cliPathKey)
         self.managedStacks = ManagedStacksStore(repository: stackRepository, cliPath: savedPath)
         self.cliPath = savedPath
@@ -161,6 +181,18 @@ public final class AppStore {
     @discardableResult
     public func execute(_ request: CommandRequest, title: String) async throws -> CommandResult {
         try await execute(request, title: title, using: client)
+    }
+
+    struct ReviewedRuntime {
+        fileprivate let client: any ContainerClient
+        fileprivate let epoch: Int
+    }
+
+    func captureReviewedRuntime() -> ReviewedRuntime { .init(client: client, epoch: clientEpoch) }
+
+    func execute(_ request: CommandRequest, title: String, reviewedRuntime: ReviewedRuntime) async throws -> CommandResult {
+        guard reviewedRuntime.epoch == clientEpoch else { throw RuntimeOperationError.runtimeChanged }
+        return try await execute(request, title: title, using: reviewedRuntime.client)
     }
 
     /// Retains full recreation inputs inside Core; the sheet receives only non-secret review fields.
@@ -197,11 +229,12 @@ public final class AppStore {
     ) async -> ContainerLimitsApplyResult {
         guard cliPath == nil, let service = limitsService,
               limitsPlanEpochs.removeValue(forKey: plan.id) == clientEpoch,
-              limitsOperationContainerID == nil else {
+              limitsOperationContainerID == nil,
+              let limitsToken = runtimeOperations.beginLimitsChange(plan.containerID) else {
             return .unchanged(reason: .staleReview)
         }
-        limitsOperationContainerID = plan.containerID
-        defer { limitsOperationContainerID = nil }
+        monitoring.beginLimitsChange(plan.containerID)
+        defer { runtimeOperations.endLimitsChange(limitsToken) }
         let description = "Recreate \(plan.containerID) · CPU \(plan.currentLimits.cpus) → \(limits.cpus) · memory \(plan.currentLimits.memoryBytes / 1_048_576) → \(limits.memoryBytes / 1_048_576) MiB"
         var record = OperationRecord(title: "Edit Limits: \(plan.containerID)", commandPreview: description, canRetry: false, canCancel: false)
         operations.insert(record, at: 0)
@@ -211,9 +244,11 @@ public final class AppStore {
         switch result {
         case .updated:
             record.state = .succeeded
+            monitoring.finishLimitsChange(plan.containerID, restarted: plan.wasRunning)
         case .unchanged(let reason), .rolledBack(_, let reason), .recoveryNeeded(_, let reason):
             record.state = .failed
             record.error = reason.localizedDescription
+            monitoring.finishLimitsChange(plan.containerID, restarted: false)
         }
         updateOperation(record)
         previousCPUUsage[plan.containerID] = nil
@@ -225,6 +260,11 @@ public final class AppStore {
     /// Binds a reviewed operation to the client that produced its inventory.
     @discardableResult
     public func execute(_ request: CommandRequest, title: String, using requestClient: any ContainerClient, allowRetry: Bool = true, allowCancellation: Bool = true) async throws -> CommandResult {
+        try Task.checkCancellation()
+        let lease = try runtimeOperations.beginCommand(request)
+        defer { runtimeOperations.endCommand(lease) }
+        let commandEpoch = clientEpoch
+        let affected = monitoring.beginCommand(request, containers: snapshots[.containers]?.items ?? [])
         let canRetry = allowRetry && request.isSafeToRetry
         var record = OperationRecord(title: title, commandPreview: request.preview, canRetry: canRetry, canCancel: allowCancellation)
         operations.insert(record, at: 0)
@@ -233,9 +273,12 @@ public final class AppStore {
         do {
             let task = Task { try await requestClient.run(request) }
             if allowCancellation { operationCancellers[record.id] = { task.cancel() } }
-            let result = try await task.value
+            let result = try await withTaskCancellationHandler { try await task.value } onCancel: {
+                if allowCancellation { task.cancel() }
+            }
+            if clientEpoch == commandEpoch { monitoring.finishCommand(request, affected: affected, succeeded: result.succeeded) }
             operationCancellers[record.id] = nil
-            let wasCancelled = operations.first(where: { $0.id == record.id })?.state == .cancelled
+            let wasCancelled = (allowCancellation && Task.isCancelled) || operations.first(where: { $0.id == record.id })?.state == .cancelled
             record.finishedAt = .now
             record.exitCode = result.exitCode
             if wasCancelled {
@@ -243,15 +286,23 @@ public final class AppStore {
                 record.error = "Cancelled by user."
             } else {
                 record.state = result.succeeded ? .succeeded : .failed
-                if !result.succeeded { record.error = "Command failed with exit code \(result.exitCode)." }
+                if !result.succeeded { record.error = result.failureDescription }
             }
             updateOperation(record)
+            if allowCancellation { try Task.checkCancellation() }
             guard result.succeeded else { throw CommandFailure(result: result, request: request) }
             retryRequests[record.id] = nil
             return result
         } catch {
+            if clientEpoch == commandEpoch { monitoring.finishCommand(request, affected: affected, succeeded: false) }
             operationCancellers[record.id] = nil
-            let wasCancelled = operations.first(where: { $0.id == record.id })?.state == .cancelled
+            let wasCancelled = (allowCancellation && Task.isCancelled) || operations.first(where: { $0.id == record.id })?.state == .cancelled
+            if allowCancellation && Task.isCancelled {
+                record.finishedAt = operations.first(where: { $0.id == record.id })?.finishedAt ?? .now
+                record.state = .cancelled
+                record.error = "Cancelled by user."
+                updateOperation(record)
+            }
             if record.state == .running && !wasCancelled {
                 record.finishedAt = .now
                 record.state = .failed
@@ -270,81 +321,116 @@ public final class AppStore {
         streamWithID(request, title: title).events
     }
 
-    public func streamWithID(_ request: CommandRequest, title: String) -> (operationID: UUID, events: AsyncThrowingStream<CommandEvent, Error>) {
+    public func streamWithID(_ request: CommandRequest, title: String) -> TrackedCommandStream {
+        let lease: UUID?
+        let rejection: (any Error)?
+        do { lease = try runtimeOperations.beginCommand(request); rejection = nil }
+        catch { lease = nil; rejection = error }
         let requestClient = client
-        let record = OperationRecord(title: title, commandPreview: request.preview, canRetry: request.isSafeToRetry)
+        let commandEpoch = clientEpoch
+        let affected = rejection == nil ? monitoring.beginCommand(request, containers: snapshots[.containers]?.items ?? []) : []
+        var record = OperationRecord(title: title, commandPreview: request.preview, canRetry: request.isSafeToRetry)
+        if let rejection {
+            record.state = .failed
+            record.error = rejection.localizedDescription
+            record.finishedAt = .now
+            record.canRetry = false
+        }
         operations.insert(record, at: 0)
         if request.isSafeToRetry { retryRequests[record.id] = request }
         trimHistory()
-        let events = AsyncThrowingStream<CommandEvent, Error>(bufferingPolicy: .bufferingOldest(256)) { continuation in
-            let task = Task { @MainActor [weak self] in
-                guard let self else { continuation.finish(); return }
-                do {
-                    var relayOverflowed = false
-                    var sawCompletion = false
-                    for try await event in requestClient.stream(request) {
-                        if case .completed(let result) = event {
-                            sawCompletion = true
-                            var final = operations.first(where: { $0.id == record.id }) ?? record
-                            final.finishedAt = .now
-                            final.exitCode = result.exitCode
-                            if final.state == .cancelled {
-                                final.error = "Cancelled by user."
-                            } else {
-                                final.state = result.succeeded ? .succeeded : .failed
-                                if !result.succeeded { final.error = "Command failed with exit code \(result.exitCode)." }
-                            }
-                            if result.succeeded || final.state == .cancelled || !request.isSafeToRetry { retryRequests[record.id] = nil }
-                            updateOperation(final)
-                            operationCancellers[record.id] = nil
-                            trimHistory()
+        if let rejection {
+            return TrackedCommandStream(operationID: record.id, events: AsyncThrowingStream { $0.finish(throwing: rejection) })
+        }
+        let submittedRecord = record
+        let (events, continuation) = AsyncThrowingStream<CommandEvent, Error>.makeStream(bufferingPolicy: .bufferingOldest(256))
+        let operationPolicy = runtimeOperations
+        let task = Task { @MainActor [weak self] in
+            defer { operationPolicy.endCommand(lease) }
+            guard let self else { continuation.finish(); return }
+            let record = submittedRecord
+            var execution: ManagedProcessExecution?
+            var terminalError: (any Error)?
+            do {
+                try Task.checkCancellation()
+                let launched = try requestClient.launch(request)
+                execution = launched
+                var relayOverflowed = false
+                var sawCompletion = false
+                for try await event in launched.events {
+                    if case .completed(let result) = event {
+                        if clientEpoch == commandEpoch { monitoring.finishCommand(request, affected: affected, succeeded: result.succeeded) }
+                        sawCompletion = true
+                        var final = operations.first(where: { $0.id == record.id }) ?? record
+                        final.finishedAt = .now
+                        final.exitCode = result.exitCode
+                        if final.state == .cancelled {
+                            final.error = "Cancelled by user."
+                        } else {
+                            final.state = result.succeeded ? .succeeded : .failed
+                            if !result.succeeded { final.error = result.failureDescription }
                         }
-                        if case .dropped = continuation.yield(event) {
-                            relayOverflowed = true
-                            withUnsafeCurrentTask { $0?.cancel() }
-                            var failed = operations.first(where: { $0.id == record.id }) ?? record
-                            failed.finishedAt = .now
-                            failed.state = .failed
-                            failed.canRetry = false
-                            failed.error = ContainerClientError.outputBufferExceeded.localizedDescription
-                            updateOperation(failed)
-                            operationCancellers[record.id] = nil
-                            retryRequests[record.id] = nil
-                            trimHistory()
-                            continuation.finish(throwing: ContainerClientError.outputBufferExceeded)
-                            break
-                        }
-                    }
-                    if !relayOverflowed {
-                        if !sawCompletion,
-                           var unfinished = operations.first(where: { $0.id == record.id }),
-                           unfinished.state == .running {
-                            unfinished.finishedAt = .now
-                            unfinished.state = .failed
-                            unfinished.error = "Command stream ended before completion."
-                            updateOperation(unfinished)
-                        }
+                        if result.succeeded || final.state == .cancelled || !request.isSafeToRetry { retryRequests[record.id] = nil }
+                        updateOperation(final)
                         operationCancellers[record.id] = nil
                         trimHistory()
-                        continuation.finish()
                     }
-                } catch {
-                    let wasCancelled = operations.first(where: { $0.id == record.id })?.state == .cancelled
-                    if !wasCancelled {
+                    if case .dropped = continuation.yield(event) {
+                        relayOverflowed = true
+                        withUnsafeCurrentTask { $0?.cancel() }
                         var failed = operations.first(where: { $0.id == record.id }) ?? record
-                        failed.finishedAt = .now; failed.state = .failed; failed.error = request.redact(error.localizedDescription)
+                        failed.finishedAt = .now
+                        failed.state = .failed
+                        failed.canRetry = false
+                        failed.error = ContainerClientError.outputBufferExceeded.localizedDescription
                         updateOperation(failed)
+                        operationCancellers[record.id] = nil
+                        retryRequests[record.id] = nil
+                        trimHistory()
+                        terminalError = ContainerClientError.outputBufferExceeded
+                        break
                     }
-                    operationCancellers[record.id] = nil
-                    if wasCancelled || !request.isSafeToRetry { retryRequests[record.id] = nil }
-                    trimHistory()
-                    continuation.finish(throwing: error)
                 }
+                if !relayOverflowed {
+                    if !sawCompletion { try Task.checkCancellation() }
+                    if !sawCompletion,
+                       var unfinished = operations.first(where: { $0.id == record.id }),
+                       unfinished.state == .running {
+                        unfinished.finishedAt = .now
+                        unfinished.state = .failed
+                        unfinished.error = "Command stream ended before completion."
+                        updateOperation(unfinished)
+                    }
+                    if !sawCompletion, clientEpoch == commandEpoch { monitoring.finishCommand(request, affected: affected, succeeded: false) }
+                    operationCancellers[record.id] = nil
+                    trimHistory()
+                }
+            } catch {
+                if clientEpoch == commandEpoch { monitoring.finishCommand(request, affected: affected, succeeded: false) }
+                let wasCancelled = Task.isCancelled || operations.first(where: { $0.id == record.id })?.state == .cancelled
+                if wasCancelled {
+                    var cancelled = operations.first(where: { $0.id == record.id }) ?? record
+                    cancelled.finishedAt = cancelled.finishedAt ?? .now
+                    cancelled.state = .cancelled
+                    cancelled.error = "Cancelled by user."
+                    updateOperation(cancelled)
+                } else {
+                    var failed = operations.first(where: { $0.id == record.id }) ?? record
+                    failed.finishedAt = .now; failed.state = .failed; failed.error = request.redact(error.localizedDescription)
+                    updateOperation(failed)
+                }
+                operationCancellers[record.id] = nil
+                if wasCancelled || !request.isSafeToRetry { retryRequests[record.id] = nil }
+                trimHistory()
+                terminalError = error
             }
-            operationCancellers[record.id] = { task.cancel() }
-            continuation.onTermination = { @Sendable _ in task.cancel() }
+            await execution?.terminateAndWait()
+            if let terminalError { continuation.finish(throwing: terminalError) }
+            else { continuation.finish() }
         }
-        return (record.id, events)
+        operationCancellers[record.id] = { task.cancel() }
+        continuation.onTermination = { @Sendable _ in task.cancel() }
+        return TrackedCommandStream(operationID: record.id, events: events, completion: task)
     }
 
     public func cancelOperation(_ id: UUID) {
@@ -368,25 +454,52 @@ public final class AppStore {
 
     /// A read-only refresh; sensitive JSON stays transient and is reduced to curated identifiers and labels.
     public func refresh(_ section: ContainerSection, force: Bool = false) async {
+        await refresh(section, minimumGeneration: force ? (refreshGenerations[section] ?? 0) + 1 : nil, epoch: clientEpoch)
+    }
+
+    private func refresh(_ section: ContainerSection, minimumGeneration: Int?, epoch requestedEpoch: Int) async {
         guard !Task.isCancelled else { return }
+        guard clientEpoch == requestedEpoch else { return }
         guard listArguments(for: section) != nil else { return }
+        if let minimumGeneration, (completedRefreshGenerations[section] ?? 0) >= minimumGeneration { return }
         // A fresh snapshot is already suitable for navigation and the next visible poll.
         // Forced/manual callers still bypass this age check.
-        if !force,
+        if minimumGeneration == nil,
            let lastRefresh = lastResourceRefreshAt[section],
            snapshots[section]?.state == .loaded,
            Date.now.timeIntervalSince(lastRefresh) < resourceRefreshFreshnessInterval {
             return
         }
-        // A read already in progress satisfies concurrent navigation/poll/manual callers.
-        if refreshingSections.contains(section) { return }
+        // Joining callers (including initial Logs source selection) must see the
+        // completed inventory. Cancelling a waiter does not cancel the owning read.
+        if refreshingSections.contains(section) {
+            let id = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if Task.isCancelled { continuation.resume() }
+                    else { resourceRefreshWaiters[section, default: [:]][id] = continuation }
+                }
+            } onCancel: {
+                Task { @MainActor in self.resourceRefreshWaiters[section]?.removeValue(forKey: id)?.resume() }
+            }
+            if let minimumGeneration, !Task.isCancelled, clientEpoch == requestedEpoch,
+               (completedRefreshGenerations[section] ?? 0) < minimumGeneration {
+                await refresh(section, minimumGeneration: minimumGeneration, epoch: requestedEpoch)
+            }
+            return
+        }
         refreshingSections.insert(section)
         let generation = (refreshGenerations[section] ?? 0) + 1
         refreshGenerations[section] = generation
         let epoch = clientEpoch
         let reader = resourceReader ?? ContainerResourceReader(cli: client, nativeAllowed: cliPath == nil)
         defer {
-            if refreshGenerations[section] == generation { refreshingSections.remove(section) }
+            if refreshGenerations[section] == generation {
+                completedRefreshGenerations[section] = generation
+                refreshingSections.remove(section)
+                let waiters = resourceRefreshWaiters.removeValue(forKey: section) ?? [:]
+                for waiter in waiters.values { waiter.resume() }
+            }
         }
         let initialSnapshot = snapshots[section] ?? ResourceSnapshot()
         if initialSnapshot.fetchedAt == nil, initialSnapshot.state != .loading {
@@ -398,6 +511,7 @@ public final class AppStore {
             let result = try await reader.list(section)
             guard !Task.isCancelled, clientEpoch == epoch, refreshGenerations[section] == generation else { return }
             let refreshedAt = Date.now
+            if section == .containers { monitoring.observe(result.value, at: refreshedAt) }
             lastResourceRefreshAt[section] = refreshedAt
             let currentSnapshot = snapshots[section] ?? ResourceSnapshot()
             // Keep the observation graph quiet when a successful poll returns identical data.
@@ -444,10 +558,12 @@ public final class AppStore {
         let selectedSections = activeWindowIDs.compactMap { visibleSectionsByWindow[$0] }
         // A Stacks window consumes the same snapshots as the resource browsers. Keep those
         // existing polling tasks alive; Set deduplicates them when another window shows a source.
-        let visibleSections = Set(selectedSections.flatMap { section -> [ContainerSection] in
+        var visibleSections = Set(selectedSections.flatMap { section -> [ContainerSection] in
             if section == .stacks { return [.containers, .images, .volumes, .networks] }
             return listSections.contains(section) ? [section] : []
         })
+        // History and exit events need inventory even when a different feature is visible.
+        if !activeWindowIDs.isEmpty { visibleSections.insert(.containers) }
         for (section, task) in Array(resourcePollingTasks) where !visibleSections.contains(section) {
             task.cancel()
             resourcePollingTasks[section] = nil
@@ -513,7 +629,10 @@ public final class AppStore {
     }
 
     public func capability(for section: ContainerSection) -> CLIFeatureAvailability {
-        cliCapabilities[section] ?? .unknown
+        // Local operation history and cancellation remain useful when the CLI
+        // is missing or broken, including work submitted through an older client.
+        if section == .activity { return .available }
+        return cliCapabilities[section] ?? .unknown
     }
 
     private func checkPlugin(section: ContainerSection, arguments: [String], client requestClient: any ContainerClient, epoch: Int) async {
@@ -611,7 +730,7 @@ public final class AppStore {
         updateSelectedStatsTarget()
     }
 
-    /// Tracks each window's selected section so table-wide metrics only run while Containers is visible.
+    /// Tracks each window's selected section for resource polling and selected Stats routing.
     public func setVisibleSection(_ section: ContainerSection?, for sceneID: String) {
         visibleSectionsByWindow[sceneID] = section
         updateVisibleResourcePolling()
@@ -720,16 +839,9 @@ public final class AppStore {
         updateContainerMetricsPolling()
     }
 
-    private var isContainerSectionVisible: Bool {
-        activeWindowIDs.contains {
-            let section = visibleSectionsByWindow[$0]
-            return section == .containers || section == .stacks
-        }
-    }
-
     private func updateContainerMetricsPolling() {
         let hasContainerSnapshot = snapshots[.containers]?.fetchedAt != nil
-        let shouldPoll = pollingTask != nil && isContainerSectionVisible && hasContainerSnapshot
+        let shouldPoll = pollingTask != nil && hasContainerSnapshot
         guard shouldPoll else {
             containerMetricsTask?.cancel()
             containerMetricsTask = nil
@@ -798,6 +910,7 @@ public final class AppStore {
             containerMetricsFallbackReason = result.fallbackReason
             containerMetricsError = result.failures.values.first
             containerMetricsUpdatedAt = .now
+            monitoring.append(metrics, containers: snapshots[.containers]?.items ?? [], at: containerMetricsUpdatedAt ?? .now)
             if let statsTarget {
                 selectedContainerMetric = metrics[statsTarget]
                 if let failure = result.failures[statsTarget] { statsError = failure }
@@ -845,7 +958,7 @@ public final class AppStore {
         case .networks: ["network", "list", "--format", "json"]
         case .registries: ["registry", "list", "--format", "json"]
         case .machines: ["machine", "list", "--format", "json"]
-        case .stacks, .builds, .compose, .kubernetes, .system, .cleanup, .activity, .mlxModels: nil
+        case .stacks, .builds, .compose, .kubernetes, .system, .cleanup, .activity, .logs, .mlxModels: nil
         }
     }
 
@@ -936,9 +1049,10 @@ private final class BoundedOutput: @unchecked Sendable {
 private struct CommandFailure: LocalizedError {
     let message: String
     init(result: CommandResult, request: CommandRequest) {
+        if result.timedOut { message = "Command timed out."; return }
         let raw = result.standardError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? result.standardOutput : result.standardError
         let safe = request.sanitizeOutput(raw).trimmingCharacters(in: .whitespacesAndNewlines)
-        let fallback = "Command failed with exit code \(result.exitCode)."
+        let fallback = result.failureDescription ?? "Command did not complete."
         message = safe.isEmpty ? fallback : safe + (result.outputTruncated ? "\n(Output truncated.)" : "")
     }
     var errorDescription: String? { message }

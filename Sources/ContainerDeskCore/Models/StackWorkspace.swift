@@ -47,9 +47,9 @@ public struct StackWorkspace: Identifiable, Sendable, Equatable {
     public let otherCount: Int
     public var missingContainerIDs: [String] = []
     /// Sum of member CPU percentages. Nil when no running member has a current sample.
-    public let cpuPercent: Double?
+    public private(set) var cpuPercent: Double?
     /// Sum of live member memory. Nil when no running member has a current sample.
-    public let memoryUsageBytes: Int64?
+    public private(set) var memoryUsageBytes: Int64?
     /// Sum of configured member limits. Members without an explicit limit do
     /// not prevent the workspace from reporting the limits that are known.
     public let memoryLimitBytes: Int64?
@@ -58,6 +58,22 @@ public struct StackWorkspace: Identifiable, Sendable, Equatable {
         if case .managed = grouping { return true }
         if case .explicitLabel = grouping { return true }
         return false
+    }
+
+    /// Live samples do not change membership or related-resource topology.
+    func applyingMetrics(_ metrics: [String: ContainerMetric]) -> StackWorkspace {
+        var result = self
+        var cpu = 0.0
+        var memory: Int64 = 0
+        var hasCPU = runningCount > 0
+        var hasMemory = runningCount > 0
+        for container in containers where (container.state ?? "").localizedCaseInsensitiveContains("running") {
+            if let value = metrics[container.id]?.cpuPercent, value.isFinite { cpu += value } else { hasCPU = false }
+            if let value = metrics[container.id]?.memoryUsageBytes { memory += value } else { hasMemory = false }
+        }
+        result.cpuPercent = hasCPU ? cpu : nil
+        result.memoryUsageBytes = hasMemory ? memory : nil
+        return result
     }
 
     public init(
@@ -257,28 +273,20 @@ public enum StackWorkspaceCatalog {
     }
 
     private static func inferNamePrefixGroups(_ containers: [ResourceSummary]) -> [(prefix: String, members: [ResourceSummary])] {
-        var candidateNames = Set<String>()
-        for container in containers {
-            for separator in container.title.indices where container.title[separator] == "-" || container.title[separator] == "_" {
-                let prefix = String(container.title[..<separator])
-                if isSafePrefix(prefix) { candidateNames.insert(prefix) }
-            }
+        let prefixesByContainer = containers.map { namePrefixes($0.title) }
+        var candidateCounts: [String: Int] = [:]
+        for prefixes in prefixesByContainer {
+            for prefix in prefixes { candidateCounts[prefix, default: 0] += 1 }
         }
 
         // A more-specific prefix from only one name must not steal that
         // container from a broader prefix genuinely shared by the stack.
-        let sharedCandidates = candidateNames.filter { prefix in
-            containers.lazy.filter { hasNamePrefix($0.title, prefix: prefix) }.prefix(2).count == 2
-        }
-
         // Prefer the longest shared segment prefix. This avoids collapsing
         // independent `la-abc-*` and `la-def-*` projects into a broad `la` group.
         var membersByPrefix: [String: [ResourceSummary]] = [:]
-        for container in containers {
-            let matched = sharedCandidates
-                .filter { hasNamePrefix(container.title, prefix: $0) }
-                .sorted { $0.count > $1.count }
-            guard let longest = matched.first else { continue }
+        for (container, prefixes) in zip(containers, prefixesByContainer) {
+            let matched = prefixes.filter { candidateCounts[$0, default: 0] >= 2 }
+            guard let longest = matched.max(by: { $0.count < $1.count }) else { continue }
             membersByPrefix[longest, default: []].append(container)
         }
 
@@ -288,16 +296,19 @@ public enum StackWorkspaceCatalog {
             .sorted { $0.prefix.localizedStandardCompare($1.prefix) == .orderedAscending }
     }
 
-    private static func hasNamePrefix(_ name: String, prefix: String) -> Bool {
-        guard name.hasPrefix(prefix), name.count > prefix.count else { return false }
-        let boundaryIndex = name.index(name.startIndex, offsetBy: prefix.count)
-        return name[boundaryIndex] == "-" || name[boundaryIndex] == "_"
+    private static func namePrefixes(_ name: String) -> [String] {
+        name.indices.compactMap { index in
+            guard name[index] == "-" || name[index] == "_" else { return nil }
+            let prefix = String(name[..<index])
+            return isSafePrefix(prefix) ? prefix : nil
+        }
     }
+
+    private static let safePrefixCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
 
     private static func isSafePrefix(_ prefix: String) -> Bool {
         guard prefix.count >= 3, prefix.count <= 40 else { return false }
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
-        return prefix.unicodeScalars.allSatisfy(allowed.contains)
+        return prefix.unicodeScalars.allSatisfy { safePrefixCharacters.contains($0) }
     }
 
     private static func isRunning(_ resource: ResourceSummary) -> Bool {

@@ -1,8 +1,60 @@
 import Foundation
+import Darwin
 import Testing
+import Synchronization
 @testable import ContainerDeskCore
 
 struct MLXExternalServerDiscoveryTests {
+    @Test func stockServerDiscoveryRequiresLocalProcessIdentityAndTheRealHealthRoute() async {
+        let stock = MLXLocalListener(processID: 1001, processName: "python3", address: "127.0.0.1", port: 18080, isMLXLMServer: true)
+        let generic = MLXLocalListener(processID: 1002, processName: "python3", address: "127.0.0.1", port: 18081)
+        let prober = LoopbackMLXServerProber(sessionConfiguration: {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [StockMLXURLProtocol.self]
+            return configuration
+        })
+        let records = await MLXExternalServerDiscoverer(listenerEnumerator: FixedMLXListeners([stock, generic]), serverProber: prober).discover()
+        #expect(records.map(\.processID) == [1001])
+        #expect(records.first?.backend == "mlx-lm")
+        #expect(records.first?.models.map(\.name) == ["owner/stock-model"])
+        let stockPaths = StockMLXURLProtocol.paths.withLock { $0[18080] ?? [] }
+        #expect(stockPaths == ["/v1/models", "/health"])
+    }
+
+    @Test func stockIdentityIsRecheckedAfterTheHTTPProbe() async {
+        let listener = MLXLocalListener(processID: 1001, processName: "python3", address: "127.0.0.1", port: 18082, isMLXLMServer: true)
+        let records = await MLXExternalServerDiscoverer(
+            listenerEnumerator: ChangingStockListeners(listener: listener),
+            serverProber: FixedMLXProber(results: [18082: MLXExternalProbeResult(status: .reachable, backend: "mlx-lm", requiresProcessIdentity: true)])
+        ).discover()
+        #expect(records.isEmpty)
+    }
+
+    @Test func processIdentityCannotComeFromAModelArgumentOrEnvironmentValue() {
+        for arguments in [["python3", "-m", "mlx_lm.server", "--model", "owner/model"], ["/venv/python3.14", "/venv/bin/mlx_lm", "server"], ["mlx_lm.server", "--port", "8080"], ["python3", "-u", "-m", "mlx_lm", "server"]] {
+            #expect(MLXServerProcessIdentity.isServer(arguments: arguments))
+        }
+        for arguments in [["python3", "other_server.py", "--model", "mlx_lm.server"], ["python3", "-m", "generic", "mlx_lm", "server"], ["mlx_lm", "generate"], ["python3", "-c", "import mlx_lm.server"]] {
+            #expect(!MLXServerProcessIdentity.isServer(arguments: arguments))
+        }
+        let args = ["python3", "-m", "mlx_lm.server"]
+        var count = Int32(args.count)
+        var data = withUnsafeBytes(of: &count) { Data($0) }
+        data.append(Data(("/venv/python3\0\0" + args.joined(separator: "\0") + "\0SECRET=do-not-retain\0").utf8))
+        #expect(MLXServerProcessIdentity.decodeArguments(data) == args)
+        #expect(MLXServerProcessIdentity.decodeArguments(data.prefix(10)).isEmpty)
+        #expect(!MLXServerProcessIdentity.arguments(processID: getpid()).isEmpty)
+    }
+
+    @Test func advertisedMLXLMBackendDoesNotRequirePythonArgv() async {
+        let listener = MLXLocalListener(processID: 1010, processName: "jev", address: "127.0.0.1", port: 18083)
+        let records = await MLXExternalServerDiscoverer(
+            listenerEnumerator: FixedMLXListeners([listener]),
+            serverProber: FixedMLXProber(results: [18083: MLXExternalProbeResult(status: .reachable, backend: "mlx-lm")])
+        ).discover()
+        #expect(records.count == 1)
+    }
+
     @Test func parsesOnlyCurrentUserIPv4LoopbackListenerFields() {
         let output = [
             "p9146", "cpython", "f12", "n127.0.0.1:8765",
@@ -98,6 +150,35 @@ struct MLXExternalServerDiscoveryTests {
         #expect(failed.servers.isEmpty)
         #expect(failed.failure != nil)
     }
+}
+
+private actor ChangingStockListeners: MLXListenerEnumerating {
+    let listener: MLXLocalListener
+    private var calls = 0
+    init(listener: MLXLocalListener) { self.listener = listener }
+    func listeners() async throws -> [MLXLocalListener] {
+        calls += 1
+        return [MLXLocalListener(processID: listener.processID, processName: listener.processName, address: listener.address, port: listener.port, isMLXLMServer: calls == 1)]
+    }
+}
+
+private final class StockMLXURLProtocol: URLProtocol, @unchecked Sendable {
+    static let paths = Mutex<[Int: [String]]>([:])
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        guard let url = request.url else { return }
+        Self.paths.withLock { $0[url.port ?? 0, default: []].append(url.path) }
+        let status = url.path == "/healthz" && url.port == 18080 ? 404 : 200
+        let body = url.path == "/v1/models"
+            ? #"{"object":"list","data":[{"id":"owner/stock-model","object":"model","created":123}]}"#
+            : #"{"status":"ok"}"#
+        let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
 }
 
 @Suite(.serialized)

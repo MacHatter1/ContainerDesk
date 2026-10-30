@@ -30,7 +30,6 @@ final class MLXStore {
     private var chatTaskIDs: [String: UUID] = [:]
     private var activeChatRequestIDs: [String: UUID] = [:]
     private var activeChatAssistantTurnIDs: [String: UUID] = [:]
-    private var isConfigured = false
     private var configurationGeneration: UInt64 = 0
     private var refreshGeneration: UInt64 = 0
     private var serverStateRevision: UInt64 = 0
@@ -79,20 +78,17 @@ final class MLXStore {
     func configureAndRefresh() async {
         configurationGeneration &+= 1
         let generation = configurationGeneration
-        isConfigured = false
         let requestedConfiguration = configuration
         await service.configure(requestedConfiguration)
         guard generation == configurationGeneration else {
             await service.configure(configuration)
             return
         }
-        isConfigured = true
         await refresh(configurationGeneration: generation)
     }
 
     func refresh() async {
-        guard isConfigured else { await configureAndRefresh(); return }
-        await refresh(configurationGeneration: configurationGeneration)
+        await configureAndRefresh()
     }
 
     private func refresh(configurationGeneration expectedConfiguration: UInt64) async {

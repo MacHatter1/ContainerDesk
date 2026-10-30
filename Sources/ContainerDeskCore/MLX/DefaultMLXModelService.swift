@@ -28,7 +28,7 @@ public actor DefaultMLXModelService: MLXModelService {
     private let catalogScanner: any MLXModelCatalogScanning
     private var catalogScan: CatalogScan?
     private var cachedCapability: MLXCapability?
-    private var capabilityTask: Task<MLXCapability, Never>?
+    private var capabilityTask: (id: UUID, task: Task<MLXCapability, Never>)?
     private var servers: [UUID: ServerEntry] = [:]
     private var downloads: [UUID: ManagedProcessExecution] = [:]
     private var downloadTasks: [UUID: Task<Void, Never>] = [:]
@@ -71,41 +71,42 @@ public actor DefaultMLXModelService: MLXModelService {
 
     public func configure(_ configuration: MLXConfiguration) async {
         guard !isShuttingDown else { return }
+        // An explicit recheck must see installation/repair at an unchanged path.
+        cachedCapability = nil
+        capabilityTask?.task.cancel()
+        capabilityTask = nil
         guard self.configuration != configuration else { return }
         self.configuration = configuration
         catalogScan?.cancellation.cancel()
         catalogScan?.task.cancel()
-        cachedCapability = nil
-        capabilityTask?.cancel()
-        capabilityTask = nil
     }
 
     public func capability() async -> MLXCapability {
-        guard !isShuttingDown else {
-            return MLXCapability(available: false, reason: "The MLX service is shutting down.")
-        }
-        if let cachedCapability { return cachedCapability }
-        if let capabilityTask {
-            let result = await capabilityTask.value
+        while true {
             guard !isShuttingDown else {
                 return MLXCapability(available: false, reason: "The MLX service is shutting down.")
             }
-            return result
-        }
-        let config = configuration
-        let environment = environment
-        let probe = capabilityProbe
-        let task = Task.detached(priority: .utility) { await probe.detect(configuration: config, environment: environment) }
-        capabilityTask = task
-        let result = await task.value
-        guard !isShuttingDown else {
-            return MLXCapability(available: false, reason: "The MLX service is shutting down.")
-        }
-        if configuration == config {
+            if let cachedCapability { return cachedCapability }
+            let active: (id: UUID, task: Task<MLXCapability, Never>)
+            if let capabilityTask { active = capabilityTask }
+            else {
+                let config = configuration
+                let environment = environment
+                let probe = capabilityProbe
+                active = (UUID(), Task.detached(priority: .utility) { await probe.detect(configuration: config, environment: environment) })
+                capabilityTask = active
+            }
+            let result = await active.task.value
+            guard !isShuttingDown else {
+                return MLXCapability(available: false, reason: "The MLX service is shutting down.")
+            }
+            // Equality of configuration values cannot detect an A→B→A change
+            // or a force recheck. Only this probe may publish/clear its result.
+            guard capabilityTask?.id == active.id else { continue }
             cachedCapability = result
             capabilityTask = nil
+            return result
         }
-        return result
     }
 
     public func listLocalModels() async throws -> [MLXModelRecord] {
@@ -475,7 +476,7 @@ public actor DefaultMLXModelService: MLXModelService {
         }
         guard !isShuttingDown else { return }
         isShuttingDown = true
-        capabilityTask?.cancel()
+        capabilityTask?.task.cancel()
         capabilityTask = nil
         cachedCapability = nil
 

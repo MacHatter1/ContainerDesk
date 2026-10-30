@@ -14,6 +14,7 @@ public enum ContainerSection: String, CaseIterable, Identifiable, Sendable {
     case system
     case cleanup
     case activity
+    case logs
     case mlxModels
 
     public var id: String { rawValue }
@@ -33,6 +34,7 @@ public enum ContainerSection: String, CaseIterable, Identifiable, Sendable {
         case .system: "System"
         case .cleanup: "Cleanup"
         case .activity: "Activity"
+        case .logs: "Logs"
         case .mlxModels: "MLX Models"
         }
     }

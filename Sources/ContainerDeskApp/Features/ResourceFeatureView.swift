@@ -55,7 +55,7 @@ struct ResourceFeatureView: View {
             if let notice {
                 HStack(spacing: 10) {
                     InlineNotice(message: notice.message, kind: .success, title: notice.title) { dismissNotice() }
-                    if !transientText.isEmpty, selected != nil {
+                    if !transientText.isEmpty, selected != nil, section == .containers || section == .machines || ResourceActionRouting.supportsInspect(section) {
                         Button("View output", systemImage: "text.alignleft") {
                             detailTab = section == .containers || section == .machines ? .logs : .inspect
                         }
@@ -242,7 +242,9 @@ struct ResourceFeatureView: View {
 
     @ViewBuilder private func resourceContextMenu(_ ids: Set<String>) -> some View {
         if ids.count == 1, let id = ids.first {
-            Button("Inspect…") { selection = [id]; focusedID = id; detailTab = .inspect }
+            if ResourceActionRouting.supportsInspect(section) {
+                Button("Inspect…") { selection = [id]; focusedID = id; detailTab = .inspect }
+            }
             if section == .containers {
                 let isRecreating = store.limitsOperationContainerID == id
                 Button("Start") { pendingAction = .init(kind: .start, id: id) }
@@ -262,8 +264,12 @@ struct ResourceFeatureView: View {
                 Button("Signal…") { pendingAction = .init(kind: .signal, id: id) }
                     .disabled(isRecreating)
             }
-            Button("Delete \(snapshot.items.first(where: { $0.id == id })?.title ?? "Resource")…", role: .destructive) { pendingAction = .init(kind: .delete, id: id) }
-                .disabled(section == .containers && store.limitsOperationContainerID == id)
+            if ResourceActionRouting.supportsDelete(section) {
+                Button("Delete \(snapshot.items.first(where: { $0.id == id })?.title ?? "Resource")…", role: .destructive) { pendingAction = .init(kind: .delete, id: id) }
+                    .disabled(section == .containers && store.limitsOperationContainerID == id)
+            } else if section == .registries {
+                Button("Log Out…", role: .destructive) { pendingAction = .init(kind: .logout, id: id) }
+            }
         } else if ids.count > 1 {
             Text("Choose one row to act on")
         }
@@ -318,10 +324,12 @@ struct ResourceFeatureView: View {
                     .help(store.cliPath != nil ? "Edit Limits requires the default Apple Container CLI; a CLI override is active" : store.limitsOperationContainerID != nil ? "A container limits recreation is already in progress" : "Recreate the selected container with new CPU and memory limits")
                 }
                 Divider()
-                Button(selection.count > 1 ? "Delete One Resource…" : "Delete Selected…", systemImage: "trash", role: .destructive) {
-                    pendingAction = .init(kind: .delete, id: selected?.id)
+                if ResourceActionRouting.supportsDelete(section) {
+                    Button(selection.count > 1 ? "Delete One Resource…" : "Delete Selected…", systemImage: "trash", role: .destructive) {
+                        pendingAction = .init(kind: .delete, id: selected?.id)
+                    }
+                    .disabled(selected == nil || selection.count > 1 || selected.map { section == .containers && store.limitsOperationContainerID == $0.id } == true)
                 }
-                .disabled(selected == nil || selection.count > 1 || selected.map { section == .containers && store.limitsOperationContainerID == $0.id } == true)
                 if supportsAdvanced { Button("Advanced CLI Command…", systemImage: "terminal") { showingAdvanced = true } }
             } label: { Image(systemName: "ellipsis.circle") }
                 .help("More actions")
@@ -349,6 +357,7 @@ struct ResourceFeatureView: View {
         case .kubernetes: .cyan
         case .system: .blue
         case .activity: .purple
+        case .logs: .teal
         case .mlxModels: .teal
         case .cleanup: .teal
         }
@@ -606,6 +615,13 @@ private struct ResourceNameCell: View {
 enum ResourceDetailTab: String, CaseIterable, Identifiable {
     case overview = "Overview", logs = "Logs", terminal = "Terminal", stats = "Stats", inspect = "Inspect", files = "Files"
     var id: String { rawValue }
+    static func available(for section: ContainerSection) -> [Self] {
+        switch section {
+        case .containers: allCases
+        case .machines: [.overview, .logs, .terminal, .inspect]
+        default: ResourceActionRouting.supportsInspect(section) ? [.overview, .inspect] : [.overview]
+        }
+    }
 }
 
 struct ResourcePendingAction: Identifiable {
@@ -647,7 +663,7 @@ private struct ContainerRuntimeBanner: View {
             Image(systemName: "shippingbox.fill").foregroundStyle(.tint)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Apple Container Runtime").font(.headline)
-                Text("Stopping the service does not stop running containers.").font(.caption).foregroundStyle(.secondary)
+                Text(SystemServiceActions.stopConfirmation).font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
             Button("Service…", action: onServiceControl)
@@ -679,6 +695,7 @@ extension ContainerSection {
         case .kubernetes: "ship"
         case .system: "gearshape.2"
         case .activity: "clock.arrow.circlepath"
+        case .logs: "text.alignleft"
         case .mlxModels: "cpu"
         case .cleanup: "sparkles"
         }

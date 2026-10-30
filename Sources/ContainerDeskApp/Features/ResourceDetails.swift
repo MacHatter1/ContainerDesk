@@ -244,12 +244,7 @@ struct ResourceDetailPane: View {
     }
 
     private var availableTabs: [ResourceDetailTab] {
-        switch section {
-        case .containers: ResourceDetailTab.allCases
-        case .machines: [.overview, .logs, .terminal, .inspect]
-        case .images: [.overview, .inspect]
-        default: [.overview, .inspect]
-        }
+        ResourceDetailTab.available(for: section)
     }
 
     private var logsPanel: some View {
@@ -272,57 +267,32 @@ struct ResourceDetailPane: View {
     private var statsPanel: some View {
         let isSelectedTarget = store.statsTarget == resource.id
         let metric = isSelectedTarget ? store.selectedContainerMetric : store.containerMetrics[resource.id]
-        let allocatedCPUs = (resource.details.cpuCount ?? resource.details.cpuAllocation).flatMap { $0 > 0 ? $0 : nil }
-        let oneCorePercent = metric?.cpuPercent
-        let allocationPercent = ContainerCPUUsage.allocationPercent(oneCorePercent: oneCorePercent, allocatedCPUs: allocatedCPUs)
-        let cpuTitle: String
-        let cpuValue: String
-        let cpuDetail: String
-        let cpuAccessibility: String
-        if let allocatedCPUs, let allocationPercent {
-            cpuTitle = "CPU of limit"
-            cpuValue = String(format: "%.1f%%", allocationPercent)
-            cpuDetail = "\(allocatedCPUs) CPUs allocated · \(String(format: "%.1f", oneCorePercent ?? 0))% of one core"
-            cpuAccessibility = "CPU is \(String(format: "%.1f", allocationPercent)) percent of the configured \(allocatedCPUs)-CPU limit. Raw usage is \(String(format: "%.1f", oneCorePercent ?? 0)) percent of one core."
-        } else if let oneCorePercent, let coreEquivalents = ContainerCPUUsage.coreEquivalents(oneCorePercent: oneCorePercent) {
-            cpuTitle = "CPU · one core"
-            cpuValue = String(format: "%.1f%%", oneCorePercent)
-            cpuDetail = "\(String(format: "%.2f", coreEquivalents)) core equivalents · CPU limit unavailable"
-            cpuAccessibility = "CPU usage is \(String(format: "%.1f", oneCorePercent)) percent of one core, or \(String(format: "%.2f", coreEquivalents)) core equivalents. Configured CPU limit is unavailable."
-        } else {
-            cpuTitle = allocatedCPUs == nil ? "CPU · one core" : "CPU of limit"
-            cpuValue = "—"
-            cpuDetail = allocatedCPUs.map { "\($0) CPUs allocated · waiting for sample" } ?? "CPU limit unavailable · waiting for sample"
-            cpuAccessibility = cpuDetail
-        }
-        let memoryLimit = resource.details.memoryLimitBytes
-        let memoryUsage = metric?.memoryUsageBytes
-        let memoryValue = memoryUsage.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .memory) } ?? "—"
-        let memoryDetail = memoryLimit.map { "Limit \(ByteCountFormatter.string(fromByteCount: $0, countStyle: .memory))" } ?? "No memory limit reported"
-        let memoryAccessibility = "Memory use \(memoryValue). \(memoryDetail)."
+        let allocatedCPUs = resource.details.cpuCount ?? resource.details.cpuAllocation
+        let cpuDetail = allocatedCPUs.map { "\($0) CPUs allocated" } ?? "CPU limit unavailable"
+        let rawCPU = metric?.cpuPercent.map { String(format: "%.1f%% of one core", $0) } ?? "Waiting for CPU sample"
+        let memoryLimit = resource.details.memoryLimitBytes ?? resource.details.memoryBytes
+        let memoryDetail = memoryLimit.map { "Memory limit \(ByteCountFormatter.string(fromByteCount: $0, countStyle: .memory))" } ?? "Memory limit unavailable"
         let source: String
         switch store.containerMetricsBackend {
-        case .some(.nativeAPI): source = "Native API · every second; CPU after the second sample"
-        case .some(.cli): source = "CLI · about 3 seconds; CPU after the second sample"
+        case .some(.nativeAPI): source = "Native API · every second"
+        case .some(.cli): source = "CLI · about every 3 seconds"
         case nil: source = "Waiting for the first stats sample"
         }
         return ScrollView(.vertical) {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 14) {
+                ContainerMetricsHistoryView(containerID: resource.id, monitoring: store.monitoring)
                 ViewThatFits(in: .horizontal) {
                     HStack {
-                        Text("Live resource usage").font(.headline)
-                        Spacer(minLength: 8)
-                        Text(source).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Label("\(cpuDetail) · \(rawCPU)", systemImage: "cpu")
+                        Spacer(minLength: 12)
+                        Label(memoryDetail, systemImage: "memorychip")
                     }
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Live resource usage").font(.headline)
-                        Text(source).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label("\(cpuDetail) · \(rawCPU)", systemImage: "cpu")
+                        Label(memoryDetail, systemImage: "memorychip")
                     }
-                }
-                HStack(spacing: 14) {
-                    metricCard(cpuTitle, value: cpuValue, detail: cpuDetail, accessibility: cpuAccessibility, symbol: "cpu")
-                    metricCard("Memory use", value: memoryValue, detail: memoryDetail, accessibility: memoryAccessibility, symbol: "memorychip")
-                }
+                }.font(.caption).foregroundStyle(.secondary)
+                Text(source).font(.caption).foregroundStyle(.tertiary)
                 Label("Use Edit Limits… to change these values. Apple Container 1.5 recreates the container, causing downtime and resetting its processes and ephemeral network state.", systemImage: "info.circle")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 if let reason = store.containerMetricsFallbackReason { Text(reason).font(.caption).foregroundStyle(.secondary) }
@@ -334,25 +304,14 @@ struct ResourceDetailPane: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    private func metricCard(_ title: String, value: String, detail: String, accessibility: String, symbol: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label(title, systemImage: symbol).font(.caption).foregroundStyle(.secondary)
-            Text(value).font(.system(.title2, design: .rounded, weight: .semibold)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.75)
-            Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading).padding(14)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibility)
-        .help(accessibility)
-    }
-
     private var terminalPanel: some View {
         Group {
-            if section == .containers {
-                ContainerTerminalView(arguments: ["exec", "--interactive", "--tty", resource.id, "/bin/sh"], executablePath: store.cliPath)
+            if store.limitsOperationContainerID != nil {
+                ContentUnavailableView("Limits change in progress", systemImage: "terminal", description: Text("The terminal will be available when the container limits change finishes."))
+            } else if section == .containers {
+                ContainerTerminalView(arguments: ["exec", "--interactive", "--tty", resource.id, "/bin/sh"], runtimeOperations: store.runtimeOperations, executablePath: store.cliPath)
             } else if section == .machines {
-                ContainerTerminalView(arguments: ["machine", "run", "--name", resource.id], executablePath: store.cliPath)
+                ContainerTerminalView(arguments: ["machine", "run", "--name", resource.id], runtimeOperations: store.runtimeOperations, executablePath: store.cliPath)
             } else {
                 ContentUnavailableView("Terminal unavailable", systemImage: "terminal", description: Text("A terminal is available for running containers and Linux machines."))
             }
@@ -494,14 +453,12 @@ struct ResourceDetailPane: View {
         case .logs: args = logsCommand
         case .stats: isLoading = false; return
         case .inspect:
-            switch section {
-            case .containers: args = ["inspect", resource.id]
-            case .images: args = ["image", "inspect", resource.id]
-            case .volumes: args = ["volume", "inspect", resource.id]
-            case .networks: args = ["network", "inspect", resource.id]
-            case .machines: args = ["machine", "inspect", resource.id]
-            default: args = ["inspect", resource.id]
+            guard let inspection = ResourceActionRouting.inspectionArguments(section: section, target: resource.id) else {
+                isLoading = false
+                error = "This resource does not support inspection."
+                return
             }
+            args = inspection
         case .files: args = ["exec", resource.id, "ls", "-la", "/"]
         default: isLoading = false; return
         }
@@ -558,39 +515,12 @@ struct ResourceDetailPane: View {
     }
 
     private func appendTransient(_ chunk: String) {
-        transientText += chunk
-        if transientText.count > 150_000 { transientText = String(transientText.suffix(150_000)) }
+        BoundedText.append(chunk, to: &transientText)
     }
 }
 
 enum InspectRedactor {
     static func redact(_ source: String) -> String {
-        guard let data = source.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) else {
-            return source.split(separator: "\n", omittingEmptySubsequences: false).map { redactEnvironmentLine(String($0)) }.joined(separator: "\n")
-        }
-        let safe = redactObject(object)
-        guard let safeData = try? JSONSerialization.data(withJSONObject: safe, options: [.prettyPrinted, .sortedKeys]), let text = String(data: safeData, encoding: .utf8) else { return "(Inspect output hidden because it could not be safely redacted.)" }
-        return text
-    }
-
-    private static func redactObject(_ value: Any) -> Any {
-        if let dictionary = value as? [String: Any] {
-            return dictionary.mapValues { item in redactObject(item) }.reduce(into: [String: Any]()) { result, pair in
-                if pair.key.lowercased() == "environment", let environment = dictionary[pair.key] as? [Any] {
-                    result[pair.key] = environment.map { value -> String in
-                        guard let item = value as? String else { return "••••" }
-                        return redactEnvironmentLine(item)
-                    }
-                } else { result[pair.key] = pair.value }
-            }
-        }
-        if let array = value as? [Any] { return array.map(redactObject) }
-        return value
-    }
-
-    private static func redactEnvironmentLine(_ line: String) -> String {
-        guard let equals = line.firstIndex(of: "=") else { return "••••" }
-        return String(line[...equals]) + "••••"
+        (try? ResourceJSONRedactor.redact(source)) ?? "(Inspect output hidden because it could not be safely redacted.)"
     }
 }
-

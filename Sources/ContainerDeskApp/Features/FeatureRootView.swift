@@ -52,7 +52,7 @@ struct FeatureRootView: View {
     }
 
     @ViewBuilder private var nonResourceContent: some View {
-        if section == .mlxModels || section == .cleanup || section == .stacks {
+        if section == .mlxModels || section == .cleanup || section == .stacks || section == .logs {
             nonResourceScreen
         } else if case .unavailable = store.capability(for: section) {
             unavailableContent
@@ -85,6 +85,7 @@ struct FeatureRootView: View {
         case .system: SystemFeatureView(store: store)
         case .cleanup: CleanupFeatureView(store: store.cleanupStore, appStore: store, initialCategory: cleanupCategory)
         case .activity: ActivityFeatureView(store: store)
+        case .logs: UnifiedLogsFeatureView(store: store)
         case .mlxModels: MLXFeatureView(store: mlxStore, externalStore: externalMLXStore, sceneID: sceneID)
         }
     }
