@@ -206,6 +206,8 @@ Chat prompts, transcripts, generated replies, download output, and server logs a
 
 ## Development
 
+CI runs release tests and validates the app bundle; a separate manual workflow covers a dedicated live runtime. See [CI and live integration](docs/CI.md) for runner setup, reports, and branch protection.
+
 ```sh
 swift test
 ./script/build_and_run.sh --build-only
@@ -240,7 +242,7 @@ git tag -a v1.0.0 -m "ContainerDesk v1.0.0"
 git push origin v1.0.0
 ```
 
-The workflow runs `swift test`, builds the optimized macOS app, and publishes a GitHub Release with generated notes, a drag-to-Applications DMG, a ZIP, and a SHA-256 checksum for each. Tags such as `v1.0.0-rc.1` are published as prereleases. The downloads are not Developer ID signed or notarized; see [macOS Gatekeeper](#macos-gatekeeper) before distributing them.
+The workflow tests and builds in release configuration with locked package versions, validates the app bundle, and publishes a GitHub Release with generated notes, a drag-to-Applications DMG, a ZIP, and a SHA-256 checksum for each. Tags such as `v1.0.0-rc.1` are published as prereleases. The downloads are not Developer ID signed or notarized; see [macOS Gatekeeper](#macos-gatekeeper) before distributing them.
 
 After downloading a release file and its matching `.sha256` file into the same folder, verify either download with:
 

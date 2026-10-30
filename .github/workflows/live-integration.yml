@@ -1,0 +1,107 @@
+name: Live integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugins:
+        description: Run Compose and Kubernetes plugin smoke checks
+        type: boolean
+        default: false
+      mlx:
+        description: Run the cached-model MLX server and chat check
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# All runs share one runtime, including runs dispatched from different refs.
+concurrency:
+  group: containerdesk-live-runtime
+  cancel-in-progress: false
+
+jobs:
+  live-integration:
+    name: Live integration
+    # This guard is defense in depth, not a runner access policy.
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, macOS, ARM64, containerdesk-live]
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      CONTAINERDESK_PROFILES_IMAGE: docker.io/library/alpine:3.20
+      CONTAINER_CLI: /opt/homebrew/bin/container
+
+    steps:
+      - name: Check out reviewed main
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check runner and existing runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == arm64 ]]
+          [[ "$(sw_vers -productVersion)" == 26.* ]]
+          sw_vers
+          xcodebuild -version
+          swift --version
+          test -x "$CONTAINER_CLI"
+          "$CONTAINER_CLI" system version --format json | /usr/bin/python3 -c 'import json,sys; rows=json.load(sys.stdin); assert any(x.get("appName") == "container" and x.get("version") == "1.5.0" for x in rows), "Apple container CLI 1.5.0 required"'
+          "$CONTAINER_CLI" system status --format json >/dev/null
+          "$CONTAINER_CLI" builder status --format json | /usr/bin/python3 -c 'import json,sys; rows=json.load(sys.stdin); assert any(x.get("id") == "buildkit" and x.get("status", {}).get("state") == "running" for x in rows), "Existing running buildkit builder required"'
+          "$CONTAINER_CLI" image inspect -- "$CONTAINERDESK_PROFILES_IMAGE" >/dev/null
+          "$CONTAINER_CLI" image inspect -- alpine:3.20 >/dev/null
+
+      - name: Check optional plugin prerequisites
+        if: inputs.plugins
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$CONTAINER_CLI" compose --help >/dev/null
+          "$CONTAINER_CLI" k8s --help >/dev/null
+          "$CONTAINER_CLI" image inspect -- redis:7.2.4-alpine >/dev/null
+          "$CONTAINER_CLI" image inspect -- 'docker.io/kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95' >/dev/null
+
+      - name: Check optional MLX prerequisites
+        if: inputs.mlx
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v mlx_lm >/dev/null
+          # The gated test validates toolchain capability and requires a ready model.
+          mlx_lm --version
+
+      - name: Run live read checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONTAINERDESK_LIVE_READ_CHECK=1 swift test --configuration release --force-resolved-versions --filter HybridLiveReadTests --xunit-output live-hybrid.xml
+          CONTAINERDESK_CLEANUP_LIVE_READ_CHECK=1 swift test --configuration release --force-resolved-versions --filter CleanupLiveReadTests --xunit-output live-cleanup.xml
+
+      - name: Run live profile check
+        run: CONTAINERDESK_PROFILES_LIVE_CHECK=1 swift test --configuration release --force-resolved-versions --filter EnvironmentProfilesLiveTests --xunit-output live-profiles.xml
+
+      - name: Run runtime smoke checks
+        timeout-minutes: 20
+        run: ./script/smoke_test.sh
+
+      - name: Run plugin smoke checks
+        if: inputs.plugins
+        timeout-minutes: 40
+        run: ./script/plugin_smoke_test.sh
+
+      - name: Run live MLX check
+        if: inputs.mlx
+        timeout-minutes: 20
+        run: CONTAINERDESK_MLX_LIVE_CHECK=1 swift test --configuration release --force-resolved-versions --filter MLXLiveTests --xunit-output live-mlx.xml
+
+      - name: Upload live test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-test-results
+          path: live-*.xml
+          if-no-files-found: warn
+          retention-days: 7

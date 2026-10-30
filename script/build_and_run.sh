@@ -43,8 +43,8 @@ if [[ "$MODE" != "--build-only" && "$MODE" != "build-only" ]]; then
     fi
   fi
 fi
-swift build --configuration "$BUILD_CONFIGURATION"
-BUILD_BIN_PATH="$(swift build --configuration "$BUILD_CONFIGURATION" --show-bin-path)"
+swift build --force-resolved-versions --configuration "$BUILD_CONFIGURATION"
+BUILD_BIN_PATH="$(swift build --force-resolved-versions --configuration "$BUILD_CONFIGURATION" --show-bin-path)"
 BUILD_BINARY="$BUILD_BIN_PATH/$APP_NAME"
 
 rm -rf "$APP_BUNDLE"
@@ -71,6 +71,8 @@ shopt -s nullglob
 for RESOURCE_BUNDLE in "$BUILD_BIN_PATH"/*.bundle; do
   cp -R "$RESOURCE_BUNDLE" "$APP_RESOURCES/"
 done
+
+"$ROOT_DIR/script/validate_app_bundle.sh" "$APP_BUNDLE"
 
 case "$MODE" in
   --build-only|build-only) ;;

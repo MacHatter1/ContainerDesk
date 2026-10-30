@@ -146,11 +146,11 @@ struct ContainerResourceReaderTests {
 
         let result = try await reader.stats(ids: ["healthy", "stopped"])
 
-        #expect(result.backend == .nativeAPI)
+        #expect(result.backend == .nativeAPI, "Fallback reason: \(result.fallbackReason ?? "none")")
         #expect(result.value == [sample])
         #expect(result.value.first?.sampledAtUptimeNanoseconds == 900)
         #expect(result.failures["stopped"] != nil)
-        #expect(!cli.requests.map(\.arguments).contains(["stats", "--no-stream", "--format", "json", "healthy", "stopped"]))
+        #expect(!cli.requests.map(\.arguments).contains(["stats", "--no-stream", "--format", "json"]))
     }
 
     @Test func cliStatsFallbackIgnoresStaleIDsWithoutDroppingHealthySamples() async throws {

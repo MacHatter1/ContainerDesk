@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -14,10 +14,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    name: Lint workflows and scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install pinned linters
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/linters"
+          cd "$RUNNER_TEMP/linters"
+          curl -fsSLo actionlint.tar.gz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          curl -fsSLo shellcheck.tar.gz https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz
+          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz' | sha256sum -c -
+          echo 'b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6  shellcheck.tar.gz' | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          tar -xzf shellcheck.tar.gz --strip-components=1 shellcheck-v0.11.0/shellcheck
+          echo "$RUNNER_TEMP/linters" >> "$GITHUB_PATH"
+
+      - name: Check workflows
+        run: actionlint -shellcheck=
+
+      - name: Check scripts
+        run: shellcheck -x script/*.sh
+
   test-and-build:
     name: Test and build
     runs-on: macos-26
     timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
 
     steps:
       - name: Check out repository
@@ -26,12 +58,38 @@ jobs:
           persist-credentials: false
 
       - name: Show toolchain versions
+        id: toolchain
+        shell: bash
         run: |
+          set -euo pipefail
           sw_vers
+          xcodebuild -version
           swift --version
+          fingerprint="$( { uname -m; xcodebuild -version; swift --version; } | shasum -a 256 | cut -d ' ' -f 1)"
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
 
-      - name: Run tests
-        run: swift test
+      - name: Cache SwiftPM dependencies and build outputs
+        uses: actions/cache@v5
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.resolved', 'Package.swift') }}-${{ github.sha }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.resolved', 'Package.swift') }}-
 
-      - name: Build app bundle
+      - name: Run release tests
+        run: swift test --configuration release --force-resolved-versions --xunit-output test-results.xml
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results
+          path: test-results.xml
+          if-no-files-found: warn
+
+      - name: Build release app bundle
         run: ./script/build_and_run.sh --build-only
+        env:
+          CONTAINERDESK_BUILD_CONFIGURATION: release

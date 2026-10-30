@@ -9,10 +9,10 @@ struct MLXLiveTests {
         let service = DefaultMLXModelService()
         do {
             let capability = await service.capability()
-            #expect(capability.available, "The gated live check requires the verified local mlx_lm toolchain.")
+            try #require(capability.available, "The gated live check requires the verified local mlx_lm toolchain.")
             let localModels = try await service.listLocalModels()
             let models = localModels.filter(\.isReady)
-            guard let model = models.min(by: { $0.diskBytes < $1.diskBytes }) else { return }
+            let model = try #require(models.min(by: { $0.diskBytes < $1.diskBytes }), "The gated live check requires a ready, locally cached MLX model.")
             let port = try availableLoopbackPort()
             let server = try await service.startServer(modelID: model.id, options: MLXServerOptions(port: port, maxTokens: 32, temperature: 0))
 
