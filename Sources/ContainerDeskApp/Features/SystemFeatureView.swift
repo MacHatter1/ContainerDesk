@@ -27,24 +27,10 @@ struct SystemFeatureView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            WorkspaceHeader(title: "System", subtitle: "Service, kernel, DNS and storage", symbol: "gearshape.2.fill", tint: .blue)
-            HStack(alignment: .top, spacing: 14) {
-                serviceCard.frame(maxWidth: .infinity)
-                quickActions
-            }
-            .padding(.horizontal, 16)
-            systemTabs
-            selectedPanel
-            footer
-        }
-        .navigationTitle("System")
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+            WorkspaceHeader(title: "System", subtitle: "Service, kernel, DNS and storage", symbol: "gearshape.2.fill", tint: .blue) {
                 Button("Refresh", systemImage: "arrow.clockwise") { Task { await refreshCurrentScreen() } }
                     .disabled(busy)
                     .help("Refresh runtime and system information")
-            }
-            ToolbarItem {
                 Menu {
                     Button("Advanced System Commands…", systemImage: "terminal") { showAdvanced = true }
                     Divider()
@@ -53,7 +39,16 @@ struct SystemFeatureView: View {
                     Button("Install Recommended Kernel…", systemImage: "arrow.down.circle") { installRecommended = true; showKernelSheet = true }
                 } label: { Image(systemName: "ellipsis.circle") }
                 .help("System actions")
+                .accessibilityLabel("System actions")
             }
+            HStack(alignment: .top, spacing: 14) {
+                serviceCard.frame(maxWidth: .infinity)
+                quickActions
+            }
+            .padding(.horizontal, 16)
+            systemTabs
+            selectedPanel
+            footer
         }
         .task { await refreshCurrentScreen() }
         .sheet(isPresented: $showDNSCreate) { dnsCreateSheet }

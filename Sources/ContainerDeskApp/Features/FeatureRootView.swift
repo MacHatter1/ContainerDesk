@@ -8,7 +8,10 @@ struct FeatureRootView: View {
     let externalMLXStore: ExternalMLXStore
     let sceneID: String
     let navigationPerformance: NavigationPerformanceTracker
+    let resourceStates: ResourceFeatureStateCache
     var cleanupCategory: CleanupCategory? = nil
+    @State private var destinationCache = FeatureDestinationCache()
+    @SceneStorage("containerDesk.selectedStackWorkspace") private var selectedWorkspaceID = ""
 
     private let resourceSections: [ContainerSection] = [.containers, .images, .volumes, .networks, .registries, .machines]
 
@@ -16,7 +19,12 @@ struct FeatureRootView: View {
         // The split view owns these bounds. Keep its sizing probes from
         // recursively measuring the destination's tables and native hosts.
         GeometryReader { geometry in
-            destination
+            FeatureDestinationHost(
+                cache: destinationCache,
+                key: .init(section: section, unavailable: unavailableReason != nil),
+                revision: .init(cleanupCategory: section == .cleanup ? cleanupCategory : nil, unavailableReason: unavailableReason),
+                makeRoot: { activation in AnyView(destination(activation: activation)) }
+            )
                 .frame(width: geometry.size.width, height: geometry.size.height)
         }
         .frame(minWidth: 520, minHeight: 360)
@@ -29,55 +37,41 @@ struct FeatureRootView: View {
         }
     }
 
-    private var destination: some View {
-        ZStack(alignment: .topLeading) {
-            ResourceFeatureHost(section: section, store: store, sceneID: sceneID, selectedResourceIsAvailable: isAvailableResource)
-                .opacity(isAvailableResource ? 1 : 0)
-                .allowsHitTesting(isAvailableResource)
-                .accessibilityHidden(!isAvailableResource)
-
-            if resourceSections.contains(section), !isAvailableResource {
-                unavailableContent
-            } else if !resourceSections.contains(section) {
-                nonResourceContent
-            }
-        }
-    }
-
-    private var isAvailableResource: Bool {
-        resourceSections.contains(section) && {
-            if case .unavailable = store.capability(for: section) { return false }
-            return true
-        }()
-    }
-
-    @ViewBuilder private var nonResourceContent: some View {
-        if section == .mlxModels || section == .cleanup || section == .stacks || section == .logs {
-            nonResourceScreen
-        } else if case .unavailable = store.capability(for: section) {
-            unavailableContent
+    @ViewBuilder private func destination(activation: ResourceFeatureActivation) -> some View {
+        if let reason = unavailableReason {
+            unavailableContent(reason: reason)
+        } else if resourceSections.contains(section) {
+            ResourceFeatureView(section: section, store: store, sceneID: sceneID, activation: activation, state: resourceStates.state(for: section))
         } else {
             nonResourceScreen
         }
     }
 
-    @ViewBuilder private var unavailableContent: some View {
-        if case .unavailable(let reason) = store.capability(for: section) {
-            ContentUnavailableView {
-                Label("\(section.title) Unavailable", systemImage: "shippingbox.circle")
-            } description: {
-                Text(reason)
-            } actions: {
-                Button("Check Again", systemImage: "arrow.clockwise") {
-                    Task { await store.refreshCapabilities() }
-                }
+    private var unavailableReason: String? {
+        if section == .mlxModels || section == .cleanup || section == .stacks || section == .logs {
+            return nil
+        }
+        if case .unavailable(let reason) = store.capability(for: section) { return reason }
+        return nil
+    }
+
+    private func unavailableContent(reason: String) -> some View {
+        let store = store
+        let title = section.title
+        return ContentUnavailableView {
+            Label("\(title) Unavailable", systemImage: "shippingbox.circle")
+        } description: {
+            Text(reason)
+        } actions: {
+            Button("Check Again", systemImage: "arrow.clockwise") {
+                Task { await store.refreshCapabilities() }
             }
         }
     }
 
     @ViewBuilder private var nonResourceScreen: some View {
         switch section {
-        case .stacks: StackWorkspaceFeatureView(store: store)
+        case .stacks: StackWorkspaceFeatureView(store: store, selectedWorkspaceID: $selectedWorkspaceID)
         case .containers, .images, .volumes, .networks, .registries, .machines: EmptyView()
         case .builds: BuildFeatureView(store: store)
         case .compose: ComposeFeatureView(store: store)

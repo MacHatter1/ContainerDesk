@@ -3,7 +3,7 @@ import ContainerDeskCore
 import SwiftTerm
 import SwiftUI
 
-/// Embeds a disposable SwiftTerm PTY for interactive CLI actions. Terminal contents are never persisted.
+/// Embeds a SwiftTerm PTY. An optional owner can retain it while this wrapper is unmounted.
 struct ContainerTerminalView: NSViewRepresentable {
     let runtimeOperations: RuntimeOperationPolicy
     var arguments: [String]
@@ -11,19 +11,27 @@ struct ContainerTerminalView: NSViewRepresentable {
     var environment: [String: String]
     var currentDirectory: String?
     var onExit: ((Int32?) -> Void)?
+    var session: ContainerTerminalSession?
 
-    init(arguments: [String], runtimeOperations: RuntimeOperationPolicy, executablePath: String? = nil, environment: [String: String] = [:], currentDirectory: String? = nil, onExit: ((Int32?) -> Void)? = nil) {
+    init(arguments: [String], runtimeOperations: RuntimeOperationPolicy, executablePath: String? = nil, environment: [String: String] = [:], currentDirectory: String? = nil, onExit: ((Int32?) -> Void)? = nil, session: ContainerTerminalSession? = nil) {
         self.runtimeOperations = runtimeOperations
         self.arguments = arguments
         self.executablePath = executablePath
         self.environment = environment
         self.currentDirectory = currentDirectory
         self.onExit = onExit
+        self.session = session
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(onExit: onExit) }
 
     func makeNSView(context: Context) -> LocalProcessTerminalView {
+        let configuration = ContainerTerminalSession.Configuration(runtimeOperations: runtimeOperations, arguments: arguments, executablePath: executablePath, environment: environment, currentDirectory: currentDirectory)
+        context.coordinator.session = session
+        if let retained = session?.reuse(configuration: configuration, coordinator: context.coordinator) {
+            applyTerminalAppearance(retained, colorScheme: context.environment.colorScheme)
+            return retained
+        }
         let view = LocalProcessTerminalView(frame: .zero)
         view.processDelegate = context.coordinator
         applyTerminalAppearance(view, colorScheme: context.environment.colorScheme)
@@ -44,6 +52,7 @@ struct ContainerTerminalView: NSViewRepresentable {
         ProcessDescriptorLock.withLock {
             view.startProcess(executable: executable.path, args: arguments, environment: childEnvironment.map { "\($0.key)=\($0.value)" }, currentDirectory: currentDirectory)
         }
+        session?.retain(view, configuration: configuration, coordinator: context.coordinator)
         return view
     }
 
@@ -53,6 +62,7 @@ struct ContainerTerminalView: NSViewRepresentable {
     }
 
     static func dismantleNSView(_ nsView: LocalProcessTerminalView, coordinator: Coordinator) {
+        guard coordinator.session?.terminalView !== nsView else { return }
         nsView.terminate()
     }
 
@@ -69,6 +79,7 @@ struct ContainerTerminalView: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, LocalProcessTerminalViewDelegate {
         var onExit: ((Int32?) -> Void)?
+        weak var session: ContainerTerminalSession?
         init(onExit: ((Int32?) -> Void)?) { self.onExit = onExit }
         func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
         func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}

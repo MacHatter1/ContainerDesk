@@ -8,7 +8,7 @@ struct StackWorkspaceFeatureView: View {
     private let cpuUsageExplanation = "CPU is shown as fully utilized core equivalents; 1.00 core means one fully utilized CPU core."
 
     @Environment(\.openCleanup) private var openCleanup
-    @SceneStorage("containerDesk.selectedStackWorkspace") private var selectedWorkspaceID = ""
+    @Binding var selectedWorkspaceID: String
 
     @State private var searchText = ""
     @State private var detailTab: DetailTab = .overview
@@ -21,7 +21,7 @@ struct StackWorkspaceFeatureView: View {
     @State private var logOperationIDs: [UUID] = []
     @State private var activeLogStreamIDs: Set<UUID> = []
     @State private var followingLogs = false
-    @State private var detailWidth: CGFloat = 0
+    @State private var compactDetailHeader = true
     @State private var editorRequest: StackEditorRequest?
     @State private var runStack: ManagedStack?
     @State private var deletingStack: ManagedStack?
@@ -62,6 +62,10 @@ struct StackWorkspaceFeatureView: View {
     var body: some View {
         VStack(spacing: 0) {
             WorkspaceHeader(title: "Stacks", subtitle: "Operate related containers together", symbol: "square.stack.3d.up.fill", tint: .indigo) {
+                TextField("Search stacks and containers", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 120, idealWidth: 200, maxWidth: 260)
+                    .accessibilityLabel("Search stacks and containers")
                 Button("New Stack", systemImage: "plus") { editorRequest = StackEditorRequest() }
                     .disabled(isRunningAction || store.managedStacks.loadError != nil)
                 Button("Refresh", systemImage: "arrow.clockwise") {
@@ -109,8 +113,6 @@ struct StackWorkspaceFeatureView: View {
 
             footer
         }
-        .navigationTitle("Stacks")
-        .searchable(text: $searchText, prompt: "Search stacks and containers")
         .task {
             await refreshWorkspaceResources()
             if selectedWorkspaceID.isEmpty { selectedWorkspaceID = filteredWorkspaces.first?.id ?? "" }
@@ -223,12 +225,12 @@ struct StackWorkspaceFeatureView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { detailWidth = $0 }
+        .onGeometryChange(for: Bool.self) { $0.size.width < 720 } action: { compactDetailHeader = $0 }
     }
 
     private func detailHeader(_ workspace: StackWorkspace) -> some View {
         Group {
-            if detailWidth < 720 {
+            if compactDetailHeader {
                 VStack(alignment: .leading, spacing: 10) {
                     identity(workspace)
                     actionButtons(workspace)

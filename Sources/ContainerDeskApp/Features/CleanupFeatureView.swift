@@ -11,7 +11,6 @@ struct CleanupFeatureView: View {
     let appStore: AppStore
     let initialCategory: CleanupCategory?
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var searchText = ""
     @State private var selectedCategory: CleanupCategory?
     @State private var selectedIDs = Set<String>()
@@ -98,7 +97,6 @@ struct CleanupFeatureView: View {
                 .frame(maxWidth: .infinity)
             }
         }
-        .navigationTitle("Cleanup")
         .background(Color(nsColor: .windowBackgroundColor))
         .task {
             if scan == nil { await store.scan(using: appStore) }
@@ -165,8 +163,6 @@ struct CleanupFeatureView: View {
                 .font(.caption.weight(.semibold)).foregroundStyle(.secondary).lineLimit(1)
             Text(byteLabel(usage.sizeInBytes))
                 .font(.title3.weight(.semibold))
-                .contentTransition(.numericText())
-                .animation(ContainerDeskMotion.animation(reduceMotion: reduceMotion), value: usage.sizeInBytes)
             Text("\(usage.active.map { String($0) } ?? "—") active")
                 .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             Text("\(usage.reclaimable.map { byteLabel($0) } ?? "—") reclaimable")
@@ -182,8 +178,6 @@ struct CleanupFeatureView: View {
             Text("Total").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             Text(byteLabel(total))
                 .font(.title3.weight(.semibold))
-                .contentTransition(.numericText())
-                .animation(ContainerDeskMotion.animation(reduceMotion: reduceMotion), value: total)
             Text("runtime reported").font(.caption).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, minHeight: 76, alignment: .leading)

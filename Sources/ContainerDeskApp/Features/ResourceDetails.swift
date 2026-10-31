@@ -31,6 +31,10 @@ struct ResourceDetailPane: View {
     let store: AppStore
     let limitsOperationInProgress: Bool
     @ObservedObject var activation: ResourceFeatureActivation
+    var operationState: String?
+    var actionsUnavailable = false
+    @Bindable var detailState: ResourceDetailState = .init()
+    var terminalSession: ContainerTerminalSession? = nil
 
     private var isActive: Bool { activation.isActive }
     let onNotice: (FeatureNotice) -> Void
@@ -38,20 +42,6 @@ struct ResourceDetailPane: View {
     let onRun: (String) -> Void
     let onEditLimits: () -> Void
 
-    @State private var isLoading = false
-    @State private var followLogs = false
-    @State private var operationID: UUID?
-    @State private var error: String?
-    @State private var inspectBackend: ResourceReadBackend?
-    @State private var inspectFallbackReason: String?
-    @State private var logQuery = ""
-    @State private var hostPath = ""
-    @State private var hostDestinationPath = ""
-    @State private var containerSourcePath = "/tmp/"
-    @State private var containerDestinationPath = "/tmp/"
-    @State private var fileOutput = ""
-    @State private var fileImporter = false
-    @State private var fileOperationRunning = false
     @State private var detailHeaderWidth: CGFloat = 0
 
     var body: some View {
@@ -79,7 +69,7 @@ struct ResourceDetailPane: View {
             if !active { cancelFollowLogs() }
         }
         .onDisappear { cancelFollowLogs() }
-        .task(id: "\(resource.id)-\(tab.rawValue)-\(followLogs)-\(isActive)") {
+        .task(id: "\(resource.id)-\(tab.rawValue)-\(detailState.followLogs)-\(isActive)") {
             guard isActive else { return }
             if tab == .logs || tab == .inspect || tab == .files { await load() }
         }
@@ -112,7 +102,7 @@ struct ResourceDetailPane: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 8) {
                     Text(resource.title).font(.headline).lineLimit(1).truncationMode(.middle).frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
-                    if let state = resource.state { StateBadge(state: state).fixedSize(horizontal: true, vertical: false) }
+                    if let state = resource.state { StateBadge(state: operationState ?? state).fixedSize(horizontal: true, vertical: false) }
                 }
                 Text(resource.subtitle ?? resource.id).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
@@ -124,23 +114,23 @@ struct ResourceDetailPane: View {
     @ViewBuilder private var detailActions: some View {
         HStack(spacing: 8) {
             if section == .containers {
-                Button("Start", systemImage: "play.fill") { action(.start) }.disabled((resource.state ?? "").lowercased().contains("running") || limitsOperationInProgress)
-                Button("Restart", systemImage: "arrow.clockwise") { action(.restart) }.disabled(limitsOperationInProgress)
-                Button("Stop", systemImage: "stop.fill", role: .destructive) { action(.stop) }.disabled(!(resource.state ?? "").lowercased().contains("running") || limitsOperationInProgress)
+                Button("Start", systemImage: "play.fill") { action(.start) }.disabled((resource.state ?? "").lowercased().contains("running") || limitsOperationInProgress || actionsUnavailable)
+                Button("Restart", systemImage: "arrow.clockwise") { action(.restart) }.disabled(!(resource.state ?? "").lowercased().contains("running") || limitsOperationInProgress || actionsUnavailable)
+                Button("Stop", systemImage: "stop.fill", role: .destructive) { action(.stop) }.disabled(!(resource.state ?? "").lowercased().contains("running") || limitsOperationInProgress || actionsUnavailable)
                 Button("Edit Limits…", systemImage: "slider.horizontal.3", action: onEditLimits)
-                    .disabled(store.cliPath != nil || store.limitsOperationContainerID != nil)
+                    .disabled(store.cliPath != nil || store.limitsOperationContainerID != nil || actionsUnavailable)
                     .help(store.cliPath != nil ? "Edit Limits requires the default Apple Container CLI; a CLI override is active" : store.limitsOperationContainerID != nil ? "A container limits recreation is already in progress" : "Recreate this container with new CPU and memory limits")
             } else if section == .images {
-                Button("Run", systemImage: "play.fill") { onRun(resource.details.imageReference ?? resource.title) }
-                Button("Push", systemImage: "arrow.up.circle") { action(.push) }
+                Button("Run", systemImage: "play.fill") { onRun(resource.details.imageReference ?? resource.title) }.disabled(actionsUnavailable)
+                Button("Push", systemImage: "arrow.up.circle") { action(.push) }.disabled(actionsUnavailable)
                 Menu {
-                    Button("Save Archive…", systemImage: "square.and.arrow.down") { action(.save) }
-                    Button("Add Tag…", systemImage: "tag") { action(.tag) }
+                Button("Save Archive…", systemImage: "square.and.arrow.down") { action(.save) }.disabled(actionsUnavailable)
+                    Button("Add Tag…", systemImage: "tag") { action(.tag) }.disabled(actionsUnavailable)
                 } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton)
             } else if section == .machines {
-                Button("Stop", systemImage: "stop.fill", role: .destructive) { action(.stop) }
+                Button("Stop", systemImage: "stop.fill", role: .destructive) { action(.stop) }.disabled(actionsUnavailable)
             }
-            Button { Task { await load() } } label: { Image(systemName: "arrow.clockwise") }.help("Refresh details").disabled(isLoading || tab == .terminal)
+            Button { Task { await load() } } label: { Image(systemName: "arrow.clockwise") }.help("Refresh details").disabled(detailState.isLoading || tab == .terminal)
         }
         .fixedSize(horizontal: true, vertical: false)
     }
@@ -151,7 +141,7 @@ struct ResourceDetailPane: View {
             set: { value in
                 if let selected = ResourceDetailTab(rawValue: value) {
                     tab = selected
-                    error = nil
+                    detailState.error = nil
                 }
             }
         ), tabs: availableTabs.map(\.rawValue))
@@ -251,9 +241,9 @@ struct ResourceDetailPane: View {
         VStack(spacing: 8) {
             HStack {
                 Label("Container Logs", systemImage: "text.alignleft").font(.headline)
-                TextField("Search logs", text: $logQuery).textFieldStyle(.roundedBorder).frame(maxWidth: 210)
+                TextField("Search logs", text: $detailState.logQuery).textFieldStyle(.roundedBorder).frame(maxWidth: 210)
                 Spacer(minLength: 12)
-                Toggle("Follow", isOn: $followLogs).toggleStyle(.switch)
+                Toggle("Follow", isOn: $detailState.followLogs).toggleStyle(.switch)
                 Button("Copy", systemImage: "doc.on.doc") {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(visibleText, forType: .string)
@@ -309,9 +299,9 @@ struct ResourceDetailPane: View {
             if store.limitsOperationContainerID != nil {
                 ContentUnavailableView("Limits change in progress", systemImage: "terminal", description: Text("The terminal will be available when the container limits change finishes."))
             } else if section == .containers {
-                ContainerTerminalView(arguments: ["exec", "--interactive", "--tty", resource.id, "/bin/sh"], runtimeOperations: store.runtimeOperations, executablePath: store.cliPath)
+                ContainerTerminalView(arguments: ["exec", "--interactive", "--tty", resource.id, "/bin/sh"], runtimeOperations: store.runtimeOperations, executablePath: store.cliPath, session: terminalSession)
             } else if section == .machines {
-                ContainerTerminalView(arguments: ["machine", "run", "--name", resource.id], runtimeOperations: store.runtimeOperations, executablePath: store.cliPath)
+                ContainerTerminalView(arguments: ["machine", "run", "--name", resource.id], runtimeOperations: store.runtimeOperations, executablePath: store.cliPath, session: terminalSession)
             } else {
                 ContentUnavailableView("Terminal unavailable", systemImage: "terminal", description: Text("A terminal is available for running containers and Linux machines."))
             }
@@ -320,67 +310,67 @@ struct ResourceDetailPane: View {
 
     private var filesPanel: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack { Text("Container file transfer").font(.headline); Spacer(); if fileOperationRunning { ProgressView().controlSize(.small) } }
+            HStack { Text("Container file transfer").font(.headline); Spacer(); if detailState.fileOperationRunning { ProgressView().controlSize(.small) } }
             Text("Copy files between this Mac and the running container. Choose the source and destination paths below.")
                 .font(.caption).foregroundStyle(.secondary)
             Label("A mounted volume can hide files copied into its mount path. Use the volume workflow or choose an unmounted container path.", systemImage: "externaldrive.badge.exclamationmark")
                 .font(.caption).foregroundStyle(.secondary)
             GroupBox("Mac to container") {
                 VStack(alignment: .leading, spacing: 8) {
-                    HStack { TextField("Local source path", text: $hostPath, prompt: Text("~/Desktop/config.json")); Button("Choose…") { fileImporter = true } }
-                    TextField("Container destination path", text: $containerDestinationPath, prompt: Text("/etc/app/"))
+                    HStack { TextField("Local source path", text: $detailState.hostPath, prompt: Text("~/Desktop/config.json")); Button("Choose…") { detailState.fileImporter = true } }
+                    TextField("Container destination path", text: $detailState.containerDestinationPath, prompt: Text("/etc/app/"))
                     Button("Copy to Container", systemImage: "arrow.right") { Task { await copyToContainer() } }
-                        .disabled(hostPath.isEmpty || containerDestinationPath.isEmpty || fileOperationRunning)
+                        .disabled(detailState.hostPath.isEmpty || detailState.containerDestinationPath.isEmpty || detailState.fileOperationRunning)
                 }.padding(.top, 5)
             }
             GroupBox("Container to Mac") {
                 VStack(alignment: .leading, spacing: 8) {
-                    TextField("Container source path", text: $containerSourcePath, prompt: Text("/var/log/app.log"))
-                    HStack { TextField("Mac destination path", text: $hostDestinationPath, prompt: Text("~/Downloads/")); Button("Choose…") { chooseHostDestination() } }
+                    TextField("Container source path", text: $detailState.containerSourcePath, prompt: Text("/var/log/app.log"))
+                    HStack { TextField("Mac destination path", text: $detailState.hostDestinationPath, prompt: Text("~/Downloads/")); Button("Choose…") { chooseHostDestination() } }
                     Button("Copy to Mac", systemImage: "arrow.left") { Task { await copyFromContainer() } }
-                        .disabled(hostDestinationPath.isEmpty || containerSourcePath.isEmpty || fileOperationRunning)
+                        .disabled(detailState.hostDestinationPath.isEmpty || detailState.containerSourcePath.isEmpty || detailState.fileOperationRunning)
                 }.padding(.top, 5)
             }
             HStack {
-                Button("Export Filesystem as Tar…", systemImage: "archivebox") { exportContainer() }.disabled(fileOperationRunning)
+                Button("Export Filesystem as Tar…", systemImage: "archivebox") { exportContainer() }.disabled(detailState.fileOperationRunning)
                 Spacer()
-                Button("List Root Files", systemImage: "list.bullet") { Task { await loadRootFiles() } }.disabled(fileOperationRunning)
+                Button("List Root Files", systemImage: "list.bullet") { Task { await loadRootFiles() } }.disabled(detailState.fileOperationRunning)
             }
-            if !fileOutput.isEmpty {
-                ScrollView([.horizontal, .vertical]) { Text(fileOutput).font(.system(.caption, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(8) }
+            if !detailState.fileOutput.isEmpty {
+                ScrollView([.horizontal, .vertical]) { Text(detailState.fileOutput).font(.system(.caption, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(8) }
                     .background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 8)).frame(minHeight: 90)
             }
-            if let error { Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
+            if let currentError = detailState.error { Text(currentError).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
             Spacer()
         }
         .padding(.horizontal)
-        .fileImporter(isPresented: $fileImporter, allowedContentTypes: [.content, .data], allowsMultipleSelection: false) { result in
-            switch result { case .success(let urls): if let url = urls.first { hostPath = url.path }; case .failure(let issue): error = issue.localizedDescription }
+        .fileImporter(isPresented: $detailState.fileImporter, allowedContentTypes: [.content, .data], allowsMultipleSelection: false) { result in
+            switch result { case .success(let urls): if let url = urls.first { detailState.hostPath = url.path }; case .failure(let issue): detailState.error = issue.localizedDescription }
         }
     }
 
     private func copyToContainer() async {
-        await runFileCommand(["copy", localPath(hostPath), "\(resource.id):\(containerDestinationPath)"], title: "Copy File to Container")
+        await runFileCommand(["copy", localPath(detailState.hostPath), "\(resource.id):\(detailState.containerDestinationPath)"], title: "Copy File to Container")
     }
     private func copyFromContainer() async {
-        await runFileCommand(["copy", "\(resource.id):\(containerSourcePath)", localPath(hostDestinationPath)], title: "Copy File from Container")
+        await runFileCommand(["copy", "\(resource.id):\(detailState.containerSourcePath)", localPath(detailState.hostDestinationPath)], title: "Copy File from Container")
     }
     private func loadRootFiles() async {
         await runFileCommand(["exec", resource.id, "ls", "-la", "/"], title: "List Container Files")
     }
     private func runFileCommand(_ arguments: [String], title: String) async {
-        fileOperationRunning = true; error = nil; fileOutput = ""
+        detailState.fileOperationRunning = true; detailState.error = nil; detailState.fileOutput = ""
         do {
             let result = try await store.execute(CommandRequest(arguments: arguments, captureLimit: 200_000, suppressOutputEvents: true), title: title)
-            fileOutput = result.standardOutput + (result.standardError.isEmpty ? "" : "\n" + result.standardError)
+            detailState.fileOutput = result.standardOutput + (result.standardError.isEmpty ? "" : "\n" + result.standardError)
             guard result.succeeded else { throw FeatureCommandError(result: result) }
-        } catch { self.error = error.localizedDescription }
-        fileOperationRunning = false
+        } catch let issue { detailState.error = issue.localizedDescription }
+        detailState.fileOperationRunning = false
     }
     private func chooseHostDestination() {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "container-file"
-        if panel.runModal() == .OK, let url = panel.url { hostDestinationPath = url.path }
+        if panel.runModal() == .OK, let url = panel.url { detailState.hostDestinationPath = url.path }
     }
     private func exportContainer() {
         let panel = NSSavePanel()
@@ -396,11 +386,11 @@ struct ResourceDetailPane: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Environment values are redacted before display.")
                 .font(.caption).foregroundStyle(.secondary)
-            if let inspectBackend {
-                Label(inspectBackend == .nativeAPI ? "Native API" : (inspectFallbackReason == nil ? "Container CLI" : "CLI fallback"), systemImage: inspectBackend == .nativeAPI ? "bolt.horizontal.circle" : "terminal")
+            if let backend = detailState.inspectBackend {
+                Label(backend == .nativeAPI ? "Native API" : (detailState.inspectFallbackReason == nil ? "Container CLI" : "CLI fallback"), systemImage: backend == .nativeAPI ? "bolt.horizontal.circle" : "terminal")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            if let inspectFallbackReason { Text(inspectFallbackReason).font(.caption).foregroundStyle(.secondary) }
+            if let fallbackReason = detailState.inspectFallbackReason { Text(fallbackReason).font(.caption).foregroundStyle(.secondary) }
             outputText
         }
         .padding(.horizontal)
@@ -408,16 +398,16 @@ struct ResourceDetailPane: View {
 
     private func outputPanel(title: String, command: [String], sensitive: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack { Text(title).font(.headline); Spacer(); if isLoading { ProgressView().controlSize(.small) } }
+            HStack { Text(title).font(.headline); Spacer(); if detailState.isLoading { ProgressView().controlSize(.small) } }
             outputText
         }
         .padding(.horizontal)
     }
 
     @ViewBuilder private var outputText: some View {
-        if let error { ContentUnavailableView("Command failed", systemImage: "exclamationmark.triangle", description: Text(error)) }
+        if let currentError = detailState.error { ContentUnavailableView("Command failed", systemImage: "exclamationmark.triangle", description: Text(currentError)) }
         else if transientText.isEmpty {
-            if isLoading { ProgressView("Loading…").frame(maxWidth: .infinity, maxHeight: .infinity) }
+            if detailState.isLoading { ProgressView("Loading…").frame(maxWidth: .infinity, maxHeight: .infinity) }
             else { ContentUnavailableView("No output", systemImage: "text.alignleft") }
         }
         else {
@@ -437,37 +427,37 @@ struct ResourceDetailPane: View {
     }
 
     private var visibleText: String {
-        guard tab == .logs, !logQuery.isEmpty else { return transientText }
+        guard tab == .logs, !detailState.logQuery.isEmpty else { return transientText }
         return transientText.split(separator: "\n", omittingEmptySubsequences: false)
-            .filter { $0.localizedCaseInsensitiveContains(logQuery) }.joined(separator: "\n")
+            .filter { $0.localizedCaseInsensitiveContains(detailState.logQuery) }.joined(separator: "\n")
     }
 
     private func load() async {
         var loadOperationID: UUID?
-        isLoading = true
-        error = nil
+        detailState.isLoading = true
+        detailState.error = nil
         transientText = ""
-        if tab == .inspect { inspectBackend = nil; inspectFallbackReason = nil }
+        if tab == .inspect { detailState.inspectBackend = nil; detailState.inspectFallbackReason = nil }
         let args: [String]
         switch tab {
         case .logs: args = logsCommand
-        case .stats: isLoading = false; return
+        case .stats: detailState.isLoading = false; return
         case .inspect:
             guard let inspection = ResourceActionRouting.inspectionArguments(section: section, target: resource.id) else {
-                isLoading = false
-                error = "This resource does not support inspection."
+                detailState.isLoading = false
+                detailState.error = "This resource does not support inspection."
                 return
             }
             args = inspection
         case .files: args = ["exec", resource.id, "ls", "-la", "/"]
-        default: isLoading = false; return
+        default: detailState.isLoading = false; return
         }
         do {
-            if tab == .logs && followLogs {
+            if tab == .logs && detailState.followLogs {
                 transientText = ""
                 let ownedStream = store.streamWithID(CommandRequest(arguments: args + ["--follow"], captureLimit: 500_000), title: "Follow Container Logs")
                 loadOperationID = ownedStream.operationID
-                operationID = loadOperationID
+                detailState.operationID = loadOperationID
                 for try await event in ownedStream.events {
                     try Task.checkCancellation()
                     switch event {
@@ -487,31 +477,31 @@ struct ResourceDetailPane: View {
                 if tab == .inspect, section == .containers {
                     let result = try await store.inspectContainer(id: resource.id)
                     try Task.checkCancellation()
-                    inspectBackend = result.backend
-                    inspectFallbackReason = result.fallbackReason
+                    detailState.inspectBackend = result.backend
+                    detailState.inspectFallbackReason = result.fallbackReason
                     transientText = result.value.json
                 } else {
                     let result = try await store.client.run(CommandRequest(arguments: args, captureLimit: 500_000, suppressOutputEvents: true))
                     guard result.succeeded else { throw FeatureCommandError(result: result) }
                     // Raw inspect bytes are never kept in view state; persist only the sanitized rendering.
                     transientText = tab == .inspect ? InspectRedactor.redact(result.standardOutput) : result.standardOutput
-                    if tab == .inspect { inspectBackend = .cli; inspectFallbackReason = nil }
+                    if tab == .inspect { detailState.inspectBackend = .cli; detailState.inspectFallbackReason = nil }
                 }
             }
         } catch is CancellationError {
             if let loadOperationID {
                 store.cancelOperation(loadOperationID)
-                if operationID == loadOperationID { operationID = nil }
+                if detailState.operationID == loadOperationID { detailState.operationID = nil }
             }
-        } catch { self.error = error.localizedDescription }
-        if operationID == loadOperationID { operationID = nil }
-        isLoading = false
+        } catch let issue { detailState.error = issue.localizedDescription }
+        if detailState.operationID == loadOperationID { detailState.operationID = nil }
+        detailState.isLoading = false
     }
 
     private func cancelFollowLogs() {
-        guard let operationID else { return }
-        store.cancelOperation(operationID)
-        self.operationID = nil
+        guard let activeOperationID = detailState.operationID else { return }
+        store.cancelOperation(activeOperationID)
+        detailState.operationID = nil
     }
 
     private func appendTransient(_ chunk: String) {

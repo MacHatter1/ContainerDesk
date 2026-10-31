@@ -46,7 +46,6 @@ struct BuildFeatureView: View {
             HStack { Label(running ? "Running BuildKit operation" : "BuildKit image builder", systemImage: running ? "hammer.fill" : "shippingbox"); Spacer(); Button("Advanced Build Options…", systemImage: "slider.horizontal.3") { showAdvanced = true }.disabled(running) }
                 .font(.caption).foregroundStyle(.secondary).padding(10).background(.bar)
         }
-        .navigationTitle("Builds")
         .task { await refreshBuilderStatus() }
         .onDisappear { operation.cancel() }
         .fileImporter(isPresented: $contextImporter, allowedContentTypes: [.folder], allowsMultipleSelection: false) { result in switch result { case .success(let urls): if let url = urls.first { contextURL = url }; case .failure(let error): formError = error.localizedDescription } }

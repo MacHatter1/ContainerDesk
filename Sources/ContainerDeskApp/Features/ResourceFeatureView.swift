@@ -9,135 +9,137 @@ struct ResourceFeatureView: View {
     let activation: ResourceFeatureActivation
 
     private var isActive: Bool { activation.isActive }
-    private var openCleanup: CleanupNavigationAction { activation.cleanupNavigation }
+    @Environment(\.openCleanup) private var openCleanup
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    @State private var query = ""
-    @State private var selection = Set<String>()
-    @State private var focusedID: String?
-    @State private var sortOrder = [KeyPathComparator(\ResourceSummary.title)]
-    @State private var showingCreate = false
-    @State private var showingProfiles = false
-    @State private var initialImage = ""
-    @State private var showingAdvanced = false
-    @State private var pendingAction: ResourcePendingAction?
-    @State private var limitsTarget: ResourceSummary?
-    @State private var notice: FeatureNotice?
-    @State private var detailTab = ResourceDetailTab.overview
-    @State private var transientText = ""
+    @Bindable var state: ResourceFeatureState
 
     private var snapshot: ResourceSnapshot { store.snapshots[section] ?? ResourceSnapshot() }
     private var items: [ResourceSummary] {
-        guard !query.isEmpty else { return snapshot.items }
+        guard !state.query.isEmpty else { return snapshot.items }
         return snapshot.items.filter {
-            $0.title.localizedCaseInsensitiveContains(query) ||
-            $0.id.localizedCaseInsensitiveContains(query) ||
-            ($0.subtitle?.localizedCaseInsensitiveContains(query) ?? false) ||
-            ($0.state?.localizedCaseInsensitiveContains(query) ?? false) ||
-            ($0.details.imageReference?.localizedCaseInsensitiveContains(query) ?? false) ||
-            ($0.details.driver?.localizedCaseInsensitiveContains(query) ?? false)
+            $0.title.localizedCaseInsensitiveContains(state.query) ||
+            $0.id.localizedCaseInsensitiveContains(state.query) ||
+            ($0.subtitle?.localizedCaseInsensitiveContains(state.query) ?? false) ||
+            ($0.state?.localizedCaseInsensitiveContains(state.query) ?? false) ||
+            ($0.details.imageReference?.localizedCaseInsensitiveContains(state.query) ?? false) ||
+            ($0.details.driver?.localizedCaseInsensitiveContains(state.query) ?? false)
         }
     }
     private var selected: ResourceSummary? {
-        if let focusedID, selection.contains(focusedID) { return snapshot.items.first { $0.id == focusedID } }
-        return sortedItems.first { selection.contains($0.id) }
+        if let focusedResourceID = state.focusedID, state.selection.contains(focusedResourceID) { return snapshot.items.first { $0.id == focusedResourceID } }
+        return sortedItems.first { state.selection.contains($0.id) }
     }
-    private var sortedItems: [ResourceSummary] { items.sorted(using: sortOrder) }
+    private var sortedItems: [ResourceSummary] { items.sorted(using: state.sortOrder) }
+    private var mutationsUnavailable: Bool { state.operation.isRunning || state.choosingArchive || store.limitsOperationContainerID != nil }
 
-    var body: some View {
-        content
-            .environment(\.openCleanup, activation.cleanupNavigation)
-    }
+    var body: some View { content }
 
     private var content: some View {
         VStack(spacing: 0) {
             resourceActionsBar
-            if let notice {
+            operationFeedback
+            if let currentNotice = state.notice {
                 HStack(spacing: 10) {
-                    InlineNotice(message: notice.message, kind: .success, title: notice.title) { dismissNotice() }
-                    if !transientText.isEmpty, selected != nil, section == .containers || section == .machines || ResourceActionRouting.supportsInspect(section) {
+                    InlineNotice(message: currentNotice.message, kind: .success, title: currentNotice.title) { dismissNotice() }
+                    if !state.transientText.isEmpty, selected != nil, section == .containers || section == .machines || ResourceActionRouting.supportsInspect(section) {
                         Button("View output", systemImage: "text.alignleft") {
-                            detailTab = section == .containers || section == .machines ? .logs : .inspect
+                            state.detailTab = section == .containers || section == .machines ? .logs : .inspect
                         }
                     }
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
                 .transition(.opacity)
-                .animation(ContainerDeskMotion.animation(reduceMotion: reduceMotion), value: notice.id)
+                .animation(ContainerDeskMotion.animation(reduceMotion: reduceMotion), value: currentNotice.id)
             }
             VSplitView {
                 resourceTable
+                    .scrollPosition(id: $state.scrolledResourceID)
                     .frame(minHeight: 180, idealHeight: 400, maxHeight: .infinity)
                 detailPaneContainer
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             footer
         }
-        .navigationTitle(section.title)
         .task {
             guard isActive else { return }
             await store.refresh(section)
         }
-        .sheet(isPresented: $showingCreate, onDismiss: { initialImage = "" }) {
-            if section == .containers || (section == .images && !initialImage.isEmpty) {
-                ContainerRunSheet(store: store, initialImage: initialImage) { presentNotice($0) }
+        .sheet(isPresented: $state.showingCreate, onDismiss: { state.initialImage = "" }) {
+            if section == .containers || (section == .images && !state.initialImage.isEmpty) {
+                ContainerRunSheet(store: store, initialImage: state.initialImage) { presentNotice($0) }
             } else {
-                ResourceFormSheet(section: section, store: store, initialImage: initialImage) { presentNotice($0) }
+                ResourceFormSheet(section: section, store: store, initialImage: state.initialImage) { presentNotice($0) }
             }
         }
-        .sheet(isPresented: $showingProfiles) {
+        .sheet(isPresented: $state.showingProfiles) {
             EnvironmentProfilesSheet(store: store)
         }
-        .sheet(isPresented: $showingAdvanced) {
+        .sheet(isPresented: $state.showingAdvanced) {
             AdvancedCommandSheet(section: section, store: store) { presentNotice($0) }
         }
-        .sheet(item: $pendingAction) { action in
+        .sheet(item: $state.pendingAction) { action in
             ResourceActionSheet(action: action, section: section, store: store) { newNotice, output in
-                transientText = output
+                state.transientText = output
                 presentNotice(newNotice)
             }
         }
-        .sheet(item: $limitsTarget) { target in
+        .sheet(item: $state.limitsTarget) { target in
             EditContainerLimitsSheet(container: target, store: store)
         }
-        .onChange(of: selection) { old, new in
-            if let focusedID, !new.contains(focusedID) { self.focusedID = new.first }
-            if focusedID == nil { focusedID = new.first }
-            if old.isEmpty != new.isEmpty { detailTab = .overview }
+        .confirmationDialog(state.actionReview?.confirmationTitle ?? "Confirm Action", isPresented: Binding(
+            get: { state.actionReview != nil },
+            set: { if !$0 { state.actionReview = nil } }
+        ), titleVisibility: .visible, presenting: state.actionReview) { review in
+            Button(review.title, role: .destructive) {
+                Task { await state.operation.perform(review, using: store) }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: { review in
+            Text(review.confirmationMessage)
+        }
+        .onChange(of: state.selection) { old, new in
+            if let focusedResourceID = state.focusedID, !new.contains(focusedResourceID) { state.focusedID = new.first }
+            if state.focusedID == nil { state.focusedID = new.first }
+            if old.isEmpty != new.isEmpty { state.detailTab = .overview }
         }
         .onAppear { if isActive { updateStatsTarget() } }
         .onReceive(activation.$isActive.dropFirst().removeDuplicates()) { active in
             if active { updateStatsTarget() }
             else {
                 clearStatsTargetIfNeeded()
-                if showingCreate { showingCreate = false }
-                if showingProfiles { showingProfiles = false }
-                if showingAdvanced { showingAdvanced = false }
-                if !initialImage.isEmpty { initialImage = "" }
-                if pendingAction != nil { pendingAction = nil }
-                if limitsTarget != nil { limitsTarget = nil }
+                state.dismissPresentations()
             }
         }
-        .onChange(of: detailTab) { _, _ in if isActive { updateStatsTarget() } }
+        .onChange(of: state.detailTab) { old, new in
+            if old == .terminal, new != .terminal { state.terminalSession.terminate() }
+            if isActive { updateStatsTarget() }
+        }
         .onChange(of: selected?.id) { _, _ in
             guard isActive else { return }
-            detailTab = .overview
-            store.setStatsTarget(nil, forWindow: sceneID)
+            state.terminalSession.terminate()
+            state.detailState = ResourceDetailState()
+            state.detailTab = state.requestedDetailTab ?? .overview
+            state.requestedDetailTab = nil
+            updateStatsTarget()
         }
-        .onDisappear { clearStatsTargetIfNeeded() }
+        .onDisappear {
+            clearStatsTargetIfNeeded()
+            state.dismissPresentations()
+        }
     }
 
     private var detailPaneContainer: some View {
         VStack(spacing: 0) {
             if let selected {
-                ResourceDetailPane(resource: selected, section: section, tab: $detailTab, transientText: $transientText, store: store, limitsOperationInProgress: store.limitsOperationContainerID == selected.id, activation: activation) { presentNotice($0) } action: { kind in
-                    pendingAction = .init(kind: kind, id: selected.id)
+                ResourceDetailPane(resource: selected, section: section, tab: $state.detailTab, transientText: $state.transientText, store: store, limitsOperationInProgress: store.limitsOperationContainerID == selected.id, activation: activation, operationState: operationState(for: selected.id), actionsUnavailable: mutationsUnavailable, detailState: state.detailState, terminalSession: state.terminalSession) { presentNotice($0) } action: { kind in
+                    requestAction(kind, for: selected)
                 } onRun: { image in
-                    initialImage = image
-                    showingCreate = true
+                    state.initialImage = image
+                    state.showingCreate = true
                 } onEditLimits: {
-                    limitsTarget = selected
+                    state.limitsTarget = selected
                 }
                 .id(selected.id)
             } else {
@@ -175,24 +177,33 @@ struct ResourceFeatureView: View {
     }
 
     private var containersTable: some View {
-        Table(sortedItems, selection: $selection, sortOrder: $sortOrder) {
+        Table(sortedItems, selection: $state.selection, sortOrder: $state.sortOrder) {
             TableColumn("Container", value: \.title) { item in
-                ResourceNameCell(item: item, section: .containers, title: item.title, id: shortID(item.id), isSelected: selection.contains(item.id))
+                ResourceNameCell(item: item, section: .containers, title: item.title, id: shortID(item.id), isSelected: state.selection.contains(item.id))
             }
             .width(min: 155, ideal: 230)
             TableColumn("Image") { Text($0.details.imageReference.map(shortImageReference) ?? "—").lineLimit(1).foregroundStyle(.secondary) }.width(min: 120, ideal: 180)
-            TableColumn("State", value: \.sortState) { StateBadge(state: $0.state ?? "Unknown") }.width(min: 85, ideal: 110)
+            TableColumn("State", value: \.sortState) { item in
+                if let operationStatus = operationState(for: item.id) {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(operationStatus).font(.caption)
+                    }
+                } else {
+                    StateBadge(state: item.state ?? "Unknown")
+                }
+            }.width(min: 85, ideal: 110)
             TableColumn("Ports") { Text(ports($0.details.publishedPorts)).font(.caption.monospaced()).lineLimit(1) }.width(min: 100, ideal: 150)
-            TableColumn("CPU % limit") { containerCPUGauge($0, isSelected: selection.contains($0.id)).help(cpuGaugeHelp($0)) }.width(min: 112, ideal: 132)
-            TableColumn("Memory") { containerMemoryGauge($0, isSelected: selection.contains($0.id)) }.width(min: 130, ideal: 150)
+            TableColumn("CPU % limit") { containerCPUGauge($0, isSelected: state.selection.contains($0.id)).help(cpuGaugeHelp($0)) }.width(min: 112, ideal: 132)
+            TableColumn("Memory") { containerMemoryGauge($0, isSelected: state.selection.contains($0.id)) }.width(min: 130, ideal: 150)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contextMenu(forSelectionType: String.self) { resourceContextMenu($0) }
     }
 
     private var imagesTable: some View {
-        Table(sortedItems, selection: $selection, sortOrder: $sortOrder) {
-            TableColumn("Image", value: \.title) { item in ResourceNameCell(item: item, section: .images, title: displayTitle(item), id: imageShortID(item), isSelected: selection.contains(item.id)) }.width(min: 155, ideal: 230)
+        Table(sortedItems, selection: $state.selection, sortOrder: $state.sortOrder) {
+            TableColumn("Image", value: \.title) { item in ResourceNameCell(item: item, section: .images, title: displayTitle(item), id: imageShortID(item), isSelected: state.selection.contains(item.id)) }.width(min: 155, ideal: 230)
             TableColumn("Tag") { Text($0.details.imageTag ?? "—").foregroundStyle(.secondary) }.width(min: 90, ideal: 130)
             TableColumn("Platform") { Text($0.details.platform ?? "—").foregroundStyle(.secondary) }.width(min: 100, ideal: 130)
             TableColumn("Size") { Text($0.details.sizeBytes.map(Self.byteCount) ?? "—").monospacedDigit().foregroundStyle(.secondary) }.width(min: 75, ideal: 95)
@@ -200,8 +211,8 @@ struct ResourceFeatureView: View {
     }
 
     private var volumesTable: some View {
-        Table(sortedItems, selection: $selection, sortOrder: $sortOrder) {
-            TableColumn("Name", value: \.title) { item in ResourceNameCell(item: item, section: .volumes, title: item.title, id: shortID(item.id), isSelected: selection.contains(item.id)) }.width(min: 155, ideal: 230)
+        Table(sortedItems, selection: $state.selection, sortOrder: $state.sortOrder) {
+            TableColumn("Name", value: \.title) { item in ResourceNameCell(item: item, section: .volumes, title: item.title, id: shortID(item.id), isSelected: state.selection.contains(item.id)) }.width(min: 155, ideal: 230)
             TableColumn("Driver") { Text($0.details.driver ?? "—").foregroundStyle(.secondary) }.width(min: 90, ideal: 120)
             TableColumn("Configured Capacity") { item in
                 Text(item.details.sizeBytes.map(Self.byteCount) ?? "—")
@@ -212,8 +223,8 @@ struct ResourceFeatureView: View {
     }
 
     private var networksTable: some View {
-        Table(sortedItems, selection: $selection, sortOrder: $sortOrder) {
-            TableColumn("Name", value: \.title) { item in ResourceNameCell(item: item, section: .networks, title: item.title, id: shortID(item.id), isSelected: selection.contains(item.id)) }.width(min: 155, ideal: 230)
+        Table(sortedItems, selection: $state.selection, sortOrder: $state.sortOrder) {
+            TableColumn("Name", value: \.title) { item in ResourceNameCell(item: item, section: .networks, title: item.title, id: shortID(item.id), isSelected: state.selection.contains(item.id)) }.width(min: 155, ideal: 230)
             TableColumn("Driver") { Text($0.details.driver ?? "—").foregroundStyle(.secondary) }.width(min: 90, ideal: 120)
             TableColumn("Subnet") { Text($0.details.ipv4Subnet ?? "—").foregroundStyle(.secondary) }.width(min: 120, ideal: 160)
             TableColumn("Internal") { Text($0.details.isInternal.map { $0 ? "Yes" : "No" } ?? "—").foregroundStyle(.secondary) }.width(min: 75, ideal: 90)
@@ -221,15 +232,15 @@ struct ResourceFeatureView: View {
     }
 
     private var registriesTable: some View {
-        Table(sortedItems, selection: $selection, sortOrder: $sortOrder) {
-            TableColumn("Registry", value: \.title) { item in ResourceNameCell(item: item, section: .registries, title: item.title, id: shortID(item.id), isSelected: selection.contains(item.id)) }.width(min: 200, ideal: 300)
+        Table(sortedItems, selection: $state.selection, sortOrder: $state.sortOrder) {
+            TableColumn("Registry", value: \.title) { item in ResourceNameCell(item: item, section: .registries, title: item.title, id: shortID(item.id), isSelected: state.selection.contains(item.id)) }.width(min: 200, ideal: 300)
             TableColumn("Username") { Text($0.details.registryUsername ?? "—").foregroundStyle(.secondary) }.width(min: 110, ideal: 150)
         }.frame(maxWidth: .infinity, maxHeight: .infinity).contextMenu(forSelectionType: String.self) { resourceContextMenu($0) }
     }
 
     private var machinesTable: some View {
-        Table(sortedItems, selection: $selection, sortOrder: $sortOrder) {
-            TableColumn("Machine", value: \.title) { item in ResourceNameCell(item: item, section: .machines, title: item.title, id: shortID(item.id), isSelected: selection.contains(item.id)) }.width(min: 155, ideal: 230)
+        Table(sortedItems, selection: $state.selection, sortOrder: $state.sortOrder) {
+            TableColumn("Machine", value: \.title) { item in ResourceNameCell(item: item, section: .machines, title: item.title, id: shortID(item.id), isSelected: state.selection.contains(item.id)) }.width(min: 155, ideal: 230)
             TableColumn("Default") { machine in
                 if machine.details.isDefault == true { Label("Default", systemImage: "star.fill").font(.caption).foregroundStyle(.yellow) }
                 else { Text("—").foregroundStyle(.secondary) }
@@ -241,37 +252,125 @@ struct ResourceFeatureView: View {
     }
 
     @ViewBuilder private func resourceContextMenu(_ ids: Set<String>) -> some View {
-        if ids.count == 1, let id = ids.first {
-            if ResourceActionRouting.supportsInspect(section) {
-                Button("Inspect…") { selection = [id]; focusedID = id; detailTab = .inspect }
-            }
+        if ids.count == 1, let id = ids.first, let resource = snapshot.items.first(where: { $0.id == id }) {
             if section == .containers {
-                let isRecreating = store.limitsOperationContainerID == id
-                Button("Start") { pendingAction = .init(kind: .start, id: id) }
-                    .disabled(isRecreating)
-                Button("Restart") { pendingAction = .init(kind: .restart, id: id) }
-                    .disabled(isRecreating)
-                Button("Edit Limits…", systemImage: "slider.horizontal.3") {
-                    limitsTarget = snapshot.items.first { $0.id == id }
+                let running = isRunning(resource)
+                let operationStatus = operationState(for: id)
+                let canChange = !mutationsUnavailable
+                if let operationStatus {
+                    Text(operationStatus)
+                } else if canChange {
+                    if running {
+                        Button("Stop…", systemImage: "stop.fill") { requestAction(.stop, for: resource) }
+                        Button("Restart…", systemImage: "arrow.clockwise") { requestAction(.restart, for: resource) }
+                    } else {
+                        Button("Start", systemImage: "play.fill") { requestAction(.start, for: resource) }
+                    }
                 }
-                .disabled(store.cliPath != nil || store.limitsOperationContainerID != nil)
-                .help(store.cliPath != nil ? "Edit Limits requires the default Apple Container CLI; a CLI override is active" : store.limitsOperationContainerID != nil ? "A container limits recreation is already in progress" : "Recreate this container with new CPU and memory limits")
-                Button("View Logs") { pendingAction = .init(kind: .logs, id: id) }
-                Button("View Stats") { pendingAction = .init(kind: .stats, id: id) }
                 Divider()
-                Button("Stop") { pendingAction = .init(kind: .stop, id: id) }
-                    .disabled(isRecreating)
-                Button("Signal…") { pendingAction = .init(kind: .signal, id: id) }
-                    .disabled(isRecreating)
+                Button("View Logs", systemImage: "text.alignleft") { showDetails(for: id, tab: .logs) }
+                Button("View Stats", systemImage: "chart.xyaxis.line") { showDetails(for: id, tab: .stats) }
+                if running && operationStatus == nil {
+                    Button("Open Terminal", systemImage: "terminal") { showDetails(for: id, tab: .terminal) }
+                }
+                Button("Inspect", systemImage: "info.circle") { showDetails(for: id, tab: .inspect) }
+                Divider()
+                if canChange && (store.cliPath == nil || running) {
+                    Menu("Advanced", systemImage: "slider.horizontal.3") {
+                        if store.cliPath == nil {
+                            Button("Edit Limits…", systemImage: "slider.horizontal.3") { state.limitsTarget = resource }
+                        }
+                        if running {
+                            Button("Send Signal…", systemImage: "bolt") { requestAction(.signal, for: resource) }
+                        }
+                    }
+                }
+            } else if ResourceActionRouting.supportsInspect(section) {
+                Button("Inspect", systemImage: "info.circle") { showDetails(for: id, tab: .inspect) }
+                Divider()
             }
             if ResourceActionRouting.supportsDelete(section) {
-                Button("Delete \(snapshot.items.first(where: { $0.id == id })?.title ?? "Resource")…", role: .destructive) { pendingAction = .init(kind: .delete, id: id) }
-                    .disabled(section == .containers && store.limitsOperationContainerID == id)
+                if !mutationsUnavailable {
+                    Button("Delete…", systemImage: "trash", role: .destructive) { requestAction(.delete, for: resource) }
+                }
             } else if section == .registries {
-                Button("Log Out…", role: .destructive) { pendingAction = .init(kind: .logout, id: id) }
+                Button("Log Out…", systemImage: "rectangle.portrait.and.arrow.right", role: .destructive) { requestAction(.logout, for: resource) }
             }
         } else if ids.count > 1 {
             Text("Choose one row to act on")
+        }
+    }
+
+    private func showDetails(for id: String, tab: ResourceDetailTab) {
+        if selected?.id != id { state.requestedDetailTab = tab }
+        state.selection = [id]
+        state.focusedID = id
+        state.detailTab = tab
+    }
+
+    private func requestAction(_ kind: ResourceActionKind, for resource: ResourceSummary? = nil) {
+        guard !mutationsUnavailable else { return }
+        if section == .images && (kind == .load || kind == .save) {
+            guard kind == .load || resource != nil else { return }
+            let runtime = store.captureReviewedRuntime()
+            state.choosingArchive = true
+            Task {
+                defer { state.choosingArchive = false }
+                let url: URL?
+                if kind == .save, let resource { url = await ImageArchivePanels.save(image: resource) }
+                else { url = await ImageArchivePanels.load() }
+                guard let url else { return }
+                let review = ResourceActionOperation.Review(kind: kind, section: section, resources: kind == .save ? resource.map { [$0] } ?? [] : [], runtime: runtime, archiveURL: url)
+                await state.operation.perform(review, using: store)
+            }
+        } else if kind == .delete || (section == .containers && [.start, .stop, .restart, .stopAll].contains(kind)) {
+            let resources: [ResourceSummary]
+            if kind == .stopAll {
+                resources = snapshot.items.filter(isRunning)
+                guard !resources.isEmpty else { return }
+            } else {
+                guard let resource else { return }
+                if section == .containers && [.stop, .restart].contains(kind), !isRunning(resource) { return }
+                if section == .containers && kind == .start && isRunning(resource) { return }
+                resources = [resource]
+            }
+            let review = ResourceActionOperation.Review(kind: kind, section: section, resources: resources, runtime: store.captureReviewedRuntime())
+            if review.requiresConfirmation { state.actionReview = review }
+            else { Task { await state.operation.perform(review, using: store) } }
+        } else {
+            state.pendingAction = .init(kind: kind, id: resource?.id)
+        }
+    }
+
+    private func operationState(for id: String) -> String? {
+        guard let review = state.operation.activeReview, review.resources.contains(where: { $0.id == id }) else { return nil }
+        switch review.kind {
+        case .start: return "Starting…"
+        case .stop, .stopAll: return "Stopping…"
+        case .restart: return "Restarting…"
+        case .delete: return "Deleting…"
+        default: return nil
+        }
+    }
+
+    @ViewBuilder private var operationFeedback: some View {
+        if let review = state.operation.activeReview {
+            HStack(spacing: 10) {
+                ProgressView().controlSize(.small)
+                Text(review.progressMessage).font(.callout)
+                Spacer()
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .accessibilityElement(children: .combine)
+        } else if let failure = state.operation.failure {
+            InlineNotice(message: failure, kind: .error, title: "Action Failed") { state.operation.clearResult() }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+        } else if let currentNotice = state.operation.notice {
+            InlineNotice(message: currentNotice.message, kind: .success, title: currentNotice.title) { state.operation.clearResult() }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
         }
     }
 
@@ -290,12 +389,12 @@ struct ResourceFeatureView: View {
                 .help("Refresh \(section.title)")
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Search", text: $query).textFieldStyle(.plain).frame(width: searchWidth)
+                TextField("Search", text: $state.query).textFieldStyle(.plain).frame(width: searchWidth)
             }
             .padding(.horizontal, 8).padding(.vertical, 6)
             .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
             if section == .containers {
-                Button { showingProfiles = true } label: {
+                Button { state.showingProfiles = true } label: {
                     if compact { Image(systemName: "square.stack") }
                     else { Label("Profiles", systemImage: "square.stack") }
                 }
@@ -307,33 +406,36 @@ struct ResourceFeatureView: View {
                         if action.kind == .prune {
                             openCleanup(CleanupCategory(rawValue: section.rawValue))
                         } else {
-                            pendingAction = .init(kind: action.kind, id: selected?.id)
+                            requestAction(action.kind, for: selected)
                         }
                     }
                     .disabled(
-                        (selection.count > 1 && requiresSingleTarget(action.kind)) ||
-                        (section == .containers && action.kind == .stopAll && store.limitsOperationContainerID != nil) ||
-                        (section == .containers && selected.map { store.limitsOperationContainerID == $0.id } == true && [.start, .restart].contains(action.kind))
+                        mutationsUnavailable ||
+                        (state.selection.count > 1 && requiresSingleTarget(action.kind)) ||
+                        ([.start, .restart, .save].contains(action.kind) && selected == nil) ||
+                        (action.kind == .start && selected.map(isRunning) == true) ||
+                        (action.kind == .restart && selected.map(isRunning) != true) ||
+                        (action.kind == .stopAll && !snapshot.items.contains(where: isRunning))
                     )
                 }
                 if section == .containers {
                     Button("Edit Limits…", systemImage: "slider.horizontal.3") {
-                        limitsTarget = selected
+                        state.limitsTarget = selected
                     }
-                    .disabled(selected == nil || selection.count > 1 || store.cliPath != nil || store.limitsOperationContainerID != nil)
+                    .disabled(selected == nil || state.selection.count > 1 || store.cliPath != nil || mutationsUnavailable)
                     .help(store.cliPath != nil ? "Edit Limits requires the default Apple Container CLI; a CLI override is active" : store.limitsOperationContainerID != nil ? "A container limits recreation is already in progress" : "Recreate the selected container with new CPU and memory limits")
                 }
                 Divider()
                 if ResourceActionRouting.supportsDelete(section) {
-                    Button(selection.count > 1 ? "Delete One Resource…" : "Delete Selected…", systemImage: "trash", role: .destructive) {
-                        pendingAction = .init(kind: .delete, id: selected?.id)
+                    Button(state.selection.count > 1 ? "Delete One Resource…" : "Delete Selected…", systemImage: "trash", role: .destructive) {
+                        requestAction(.delete, for: selected)
                     }
-                    .disabled(selected == nil || selection.count > 1 || selected.map { section == .containers && store.limitsOperationContainerID == $0.id } == true)
+                    .disabled(selected == nil || state.selection.count > 1 || mutationsUnavailable)
                 }
-                if supportsAdvanced { Button("Advanced CLI Command…", systemImage: "terminal") { showingAdvanced = true } }
+                if supportsAdvanced { Button("Advanced CLI Command…", systemImage: "terminal") { state.showingAdvanced = true } }
             } label: { Image(systemName: "ellipsis.circle") }
                 .help("More actions")
-            Button { showingCreate = true } label: {
+            Button { state.showingCreate = true } label: {
                 Label(compact ? "Create" : primaryActionTitle, systemImage: primaryActionSymbol)
                     .fontWeight(.semibold)
             }
@@ -364,11 +466,11 @@ struct ResourceFeatureView: View {
     }
 
     private func presentNotice(_ value: FeatureNotice) {
-        withAnimation(ContainerDeskMotion.animation(reduceMotion: reduceMotion)) { notice = value }
+        withAnimation(ContainerDeskMotion.animation(reduceMotion: reduceMotion)) { state.notice = value }
     }
 
     private func dismissNotice() {
-        withAnimation(ContainerDeskMotion.animation(reduceMotion: reduceMotion)) { notice = nil }
+        withAnimation(ContainerDeskMotion.animation(reduceMotion: reduceMotion)) { state.notice = nil }
     }
 
     private var footer: some View {
@@ -467,13 +569,15 @@ struct ResourceFeatureView: View {
         if let metric, let limit, limit > 0 {
             let utilization = Double(metric) / Double(limit)
             let warning = utilizationWarning(utilization)
+            let usageText = Self.byteCount(metric)
+            let limitText = Self.byteCount(limit)
             ResourceMetricGauge(
                 title: "Memory",
-                value: "\(Self.byteCount(metric)) / \(Self.byteCount(limit))",
+                value: "\(usageText) / \(limitText)",
                 fraction: min(max(utilization, 0), 1),
                 tint: utilizationTint(utilization),
                 warning: warning,
-                accessibilityValue: "\(resource.title), memory \(Self.byteCount(metric)) of \(Self.byteCount(limit)), \(formatPercent(utilization)) configured capacity. \(warning ?? "Normal utilization")",
+                accessibilityValue: "\(resource.title), memory \(usageText) of \(limitText), \(formatPercent(utilization)) configured capacity. \(warning ?? "Normal utilization")",
                 isSelected: isSelected
             )
         } else {
@@ -484,10 +588,10 @@ struct ResourceFeatureView: View {
     }
     private func isRunning(_ resource: ResourceSummary) -> Bool { (resource.state ?? "").localizedCaseInsensitiveContains("running") }
     private func updateStatsTarget() {
-        store.setStatsTarget(section == .containers && detailTab == .stats ? selected?.id : nil, forWindow: sceneID)
+        store.setStatsTarget(section == .containers && state.detailTab == .stats ? selected?.id : nil, forWindow: sceneID)
     }
     private func clearStatsTargetIfNeeded() {
-        guard section == .containers, detailTab == .stats, let id = selected?.id else { return }
+        guard section == .containers, state.detailTab == .stats, let id = selected?.id else { return }
         store.clearStatsTarget(id, forWindow: sceneID)
     }
     private func cpuGaugeHelp(_ resource: ResourceSummary) -> String {
@@ -539,7 +643,12 @@ struct ResourceFeatureView: View {
     private func formatPercent(_ ratio: Double) -> String {
         ratio.isFinite ? String(format: "%.0f%%", ratio * 100) : "—"
     }
-    private static func byteCount(_ bytes: Int64) -> String { ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file) }
+    private static let byteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+    private static func byteCount(_ bytes: Int64) -> String { byteFormatter.string(fromByteCount: bytes) }
 
     @ViewBuilder private var snapshotState: some View {
         switch snapshot.state {
@@ -571,7 +680,7 @@ struct ResourceFeatureView: View {
     }
     private var secondaryActions: [ResourceToolbarAction] {
         switch section {
-        case .containers: [.init("Start Selected…", "play.fill", .start), .init("Restart Selected…", "arrow.clockwise", .restart), .init("Stop All", "stop.fill", .stopAll), .init("Remove Stopped", "trash", .prune)]
+        case .containers: [.init("Start Selected", "play.fill", .start), .init("Restart Selected…", "arrow.clockwise", .restart), .init("Stop All…", "stop.fill", .stopAll), .init("Remove Stopped", "trash", .prune)]
         case .images: [.init("Push Image…", "arrow.up.circle", .push), .init("Load Archive…", "archivebox", .load), .init("Save Archive…", "square.and.arrow.down", .save), .init("Prune Unused", "trash", .prune)]
         case .volumes: [.init("Prune Unused", "trash", .prune)]
         case .networks: [.init("Prune Unused", "trash", .prune)]
@@ -703,7 +812,6 @@ extension ContainerSection {
 }
 
 private struct ResourceMetricGauge: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let title: String
     let value: String
     let fraction: Double?
@@ -721,8 +829,6 @@ private struct ResourceMetricGauge: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.72)
                 .foregroundStyle(isSelected ? Color.white : Color.primary)
-                .contentTransition(.numericText())
-                .animation(ContainerDeskMotion.animation(reduceMotion: reduceMotion), value: value)
             if let warning {
                 Text(warning)
                     .font(.system(size: 8, weight: .semibold))
@@ -734,7 +840,6 @@ private struct ResourceMetricGauge: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityValue)
         .accessibilityValue(value)
-        .animation(ContainerDeskMotion.animation(reduceMotion: reduceMotion), value: fraction)
     }
 
     private var openRing: some View {
