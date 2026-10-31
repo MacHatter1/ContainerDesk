@@ -69,7 +69,6 @@ struct MLXFeatureView: View {
             }
             footer
         }
-        .navigationTitle("MLX Models")
         .task { if page == .models { await store.refresh() } }
         .sheet(isPresented: $showingDownload) {
             MLXDownloadSheet(store: store) { errorMessage = $0 }

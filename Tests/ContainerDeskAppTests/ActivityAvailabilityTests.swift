@@ -29,7 +29,8 @@ struct ActivityAvailabilityTests {
         let mlx = MLXStore(service: ActivityUnusedMLXService(), defaults: defaults)
         let host = NSHostingView(rootView: FeatureRootView(section: .activity, store: store, mlxStore: mlx,
             externalMLXStore: ExternalMLXStore(), sceneID: "activity-fixture",
-            navigationPerformance: NavigationPerformanceTracker(enabled: false)))
+            navigationPerformance: NavigationPerformanceTracker(enabled: false), resourceStates: ResourceFeatureStateCache(),
+            selectedWorkspaceID: .constant("")))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1_100, height: 720), styleMask: .borderless, backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = host

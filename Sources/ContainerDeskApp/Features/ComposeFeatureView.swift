@@ -60,7 +60,6 @@ struct ComposeFeatureView: View {
             if !output.isEmpty || error != nil { outputPanel.transition(.opacity.combined(with: .move(edge: .bottom))) }
             footer
         }
-        .navigationTitle("Compose")
         .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.yaml, .plainText], allowsMultipleSelection: false) { result in
             switch result {
             case .success(let urls): if let url = urls.first { selectedFile = url; projectName = ""; add(url) }

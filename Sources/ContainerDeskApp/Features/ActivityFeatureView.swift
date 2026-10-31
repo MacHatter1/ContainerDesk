@@ -7,7 +7,6 @@ struct ActivityFeatureView: View {
     @State private var selectedID: UUID?
     @State private var retrying = false
     @State private var retryError: String?
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var records: [OperationRecord] {
         let filtered = store.operations.filter { query.isEmpty || $0.title.localizedCaseInsensitiveContains(query) || $0.commandPreview.localizedCaseInsensitiveContains(query) || ($0.error?.localizedCaseInsensitiveContains(query) ?? false) }
@@ -18,6 +17,10 @@ struct ActivityFeatureView: View {
     var body: some View {
         VStack(spacing: 0) {
             WorkspaceHeader(title: "Activity", subtitle: "Recent CLI operations", symbol: "clock.arrow.circlepath", tint: .purple) {
+                TextField("Search activity", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 120, idealWidth: 200, maxWidth: 260)
+                    .accessibilityLabel("Search activity")
                 ViewThatFits(in: .horizontal) {
                     countLabel(compact: false)
                     countLabel(compact: true)
@@ -101,8 +104,6 @@ struct ActivityFeatureView: View {
             }
             .font(.caption).foregroundStyle(.secondary).padding(10).background(.bar)
         }
-        .navigationTitle("Activity")
-        .searchable(text: $query, prompt: "Search activity")
     }
 
     private func duration(_ operation: OperationRecord) -> String {
@@ -116,8 +117,6 @@ struct ActivityFeatureView: View {
         Text(compact ? "\(records.count)" : "\(records.count) operation\(records.count == 1 ? "" : "s")")
             .font(.callout.monospacedDigit().weight(.medium))
             .foregroundStyle(.secondary)
-            .contentTransition(.numericText())
-            .animation(ContainerDeskMotion.animation(reduceMotion: reduceMotion), value: records.count)
             .accessibilityLabel("\(records.count) operation\(records.count == 1 ? "" : "s")")
     }
 

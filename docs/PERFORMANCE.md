@@ -1,6 +1,6 @@
 # Performance verification
 
-The benchmark runners use synthetic, offline fixtures. They compile release code with the local Swift toolchain, warm it up and alternate baseline/current execution order over three rounds. The two Core runners compare medians from 21 timed observations per version; the native chart and Stats runners use 15 selection updates per workload. Stats also records three fresh-process initial layouts. Source trees must be preserved before editing; a Git baseline alone omits uncommitted files. These runners do not contact a container runtime, download models or change app preferences.
+The component benchmark runners use synthetic, offline fixtures. They compile release code with the local Swift toolchain, warm it up and alternate baseline/current execution order over three rounds. The two Core runners compare medians from 21 timed observations per version; the native chart and Stats runners use 15 selection updates per workload. Stats also records three fresh-process initial layouts. Source trees must be preserved before editing; a Git baseline alone omits uncommitted files. These runners do not contact a container runtime, download models or change app preferences.
 
 `script/benchmark_performance.py` covers stack catalog rebuilding, metric-driven workspace reads, log eviction and repeated log projections. Its original baseline predates the stack/log cache and queue changes.
 
@@ -45,3 +45,21 @@ python3 script/benchmark_stats_performance.py \
 ```
 
 The Stats gate requires initial event-row evaluations below half the fixture’s event count, plus lower median initial-layout and hover costs for event-heavy workloads. JSON includes all raw timings, row evaluations, source/harness hashes and toolchain. These are native component settlement measurements with a 1 ms run-loop pump, with the same scope limits as the chart benchmark above.
+
+## Navigation and focused commands
+
+Keep focused-window observation in `ContainerDeskCommands`, rather than on the `App` that constructs the window scenes. The Cleanup action is published by each window. Observing that changing action on the App caused repeated scene reconciliation during menu/accessibility activity: the eleven-container Stacks reproduction produced about seventeen host updates and fifty Stacks body evaluations per switch. Isolating the observer in Commands reduced this to one host update and one or two Stacks evaluations, with measured settlement falling from roughly 0.9–1.8 seconds to 80–96 ms in the same interaction.
+
+The full-app benchmark can select the largest loaded stack instead of inadvertently timing an empty page or a one-container stack. Unlike the component runners, this reads the active local runtime's inventories. It does not start, stop or delete containers. Quit the app before rebuilding its bundle, then run:
+
+```sh
+CONTAINERDESK_BUILD_CONFIGURATION=release ./script/build_and_run.sh --build-only
+open -n dist/ContainerDesk.app --args \
+  --navigation-benchmark --navigation-benchmark-input=keyboard \
+  --navigation-benchmark-route=stacks --navigation-benchmark-stack=largest \
+  --navigation-benchmark-output=/tmp/containerdesk-stacks.json
+```
+
+The short route records four Containers/Stacks round trips, with the first as warmup. Omitting the route option retains the broader sidebar traversal. Omitting the largest-stack option retains the normal selected workspace. Preparation fails clearly if there is no loaded container data for the largest-stack scenario.
+
+Native event timing alone did not reliably expose the focused-command loop. Also repeat sidebar switches with the large stack selected while inspecting the real accessibility hierarchy or interacting with the menu bar. Verify Cleanup routes only to the focused workspace window, retains another window's selection, and is disabled with Settings focused. The before/after counters used to diagnose this were temporary and are not part of normal app launches. Settlement ends at a main-loop boundary; it is not a display-presentation timestamp.

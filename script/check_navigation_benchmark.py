@@ -7,9 +7,9 @@ import sys
 import time
 
 report = Path(sys.argv[1])
-# Keep the full destination cycle below half a second in a debug build. This
+# Keep each warm destination change below 200 ms in a debug build. This
 # includes first-run-loop layout, rather than just the selection-binding cost.
-budget_ms = 500
+budget_ms = 200
 deadline = time.monotonic() + 180
 while not report.exists():
     if time.monotonic() >= deadline:
@@ -21,6 +21,7 @@ if isinstance(samples, dict) and "error" in samples:
     sys.exit(f"FAIL: {samples['error']}")
 warm = [sample for sample in samples if not sample["warmup"]]
 route = [
+    ("containers", "stacks"), ("stacks", "containers"),
     ("containers", "images"), ("images", "containers"),
     ("containers", "activity"), ("activity", "containers"),
     ("containers", "cleanup"), ("cleanup", "system"),

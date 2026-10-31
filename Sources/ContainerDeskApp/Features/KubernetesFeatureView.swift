@@ -106,7 +106,6 @@ struct KubernetesFeatureView: View {
                 .font(.caption).foregroundStyle(.secondary).padding(10).background(.bar)
                 .animation(ContainerDeskMotion.animation(reduceMotion: reduceMotion), value: busy)
         }
-        .navigationTitle("Kubernetes")
         .sheet(isPresented: $showCreate) { createSheet }
         .sheet(isPresented: $showLoadImage) { loadImageSheet }
         .sheet(isPresented: $showWriteConfig) { writeConfigSheet }

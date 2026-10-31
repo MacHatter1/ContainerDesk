@@ -23,7 +23,7 @@ struct TerminalAdmissionTests {
         store.cliPath = executable.path
         let token = try #require(store.runtimeOperations.beginLimitsChange("other-container"))
         defer { store.runtimeOperations.endLimitsChange(token) }
-        let activation = ResourceFeatureActivation(isActive: false, cleanupNavigation: .init())
+        let activation = ResourceFeatureActivation(isActive: false)
         let host = NSHostingView(rootView: ResourceDetailPane(
             resource: .init(id: "fixture", title: "Fixture", state: "running"), section: section,
             tab: .constant(.terminal), transientText: .constant(""), store: store,
