@@ -9,9 +9,9 @@ struct FeatureRootView: View {
     let sceneID: String
     let navigationPerformance: NavigationPerformanceTracker
     let resourceStates: ResourceFeatureStateCache
+    @Binding var selectedWorkspaceID: String
     var cleanupCategory: CleanupCategory? = nil
     @State private var destinationCache = FeatureDestinationCache()
-    @SceneStorage("containerDesk.selectedStackWorkspace") private var selectedWorkspaceID = ""
 
     private let resourceSections: [ContainerSection] = [.containers, .images, .volumes, .networks, .registries, .machines]
 

@@ -7,6 +7,7 @@ struct ContentView: View {
     let externalMLXStore: ExternalMLXStore
     @SceneStorage("containerDesk.selectedSection") private var selectedRawValue = ContainerSection.containers.rawValue
     @SceneStorage("containerDesk.sceneID") private var sceneID = UUID().uuidString
+    @SceneStorage("containerDesk.selectedStackWorkspace") private var selectedStackWorkspaceID = ""
     @State private var cleanupCategory: CleanupCategory?
     @State private var navigationPerformance = NavigationPerformanceTracker()
     @State private var resourceStates = ResourceFeatureStateCache()
@@ -85,7 +86,7 @@ struct ContentView: View {
             }
             .navigationSplitViewColumnWidth(min: 215, ideal: 230, max: 280)
         } detail: {
-            FeatureRootView(section: ContainerSection(rawValue: selectedRawValue) ?? .containers, store: store, mlxStore: mlxStore, externalMLXStore: externalMLXStore, sceneID: sceneID, navigationPerformance: navigationPerformance, resourceStates: resourceStates, cleanupCategory: cleanupCategory)
+            FeatureRootView(section: ContainerSection(rawValue: selectedRawValue) ?? .containers, store: store, mlxStore: mlxStore, externalMLXStore: externalMLXStore, sceneID: sceneID, navigationPerformance: navigationPerformance, resourceStates: resourceStates, selectedWorkspaceID: $selectedStackWorkspaceID, cleanupCategory: cleanupCategory)
         }
         .environment(\.openCleanup, cleanupNavigation)
         .focusedSceneValue(\.cleanupNavigation, cleanupNavigation)
@@ -122,7 +123,7 @@ struct ContentView: View {
             store.setWindowActive(sceneID, active: true)
         }
         .task {
-            await navigationPerformance.runBenchmark { selection.wrappedValue = $0 }
+            await navigationPerformance.runBenchmark(prepare: prepareNavigationBenchmark) { selection.wrappedValue = $0 }
         }
         .onDisappear {
             store.setWindowActive(sceneID, active: false)
@@ -131,4 +132,15 @@ struct ContentView: View {
         }
     }
 
+    private func prepareNavigationBenchmark() async throws {
+        guard ProcessInfo.processInfo.arguments.contains("--navigation-benchmark-stack=largest") else { return }
+        for section: ContainerSection in [.containers, .images, .volumes, .networks] {
+            await store.refresh(section, force: true)
+        }
+        guard let largest = store.stackWorkspaces.max(by: { $0.containers.count < $1.containers.count }),
+              !largest.containers.isEmpty else {
+            throw FeatureCommandError(message: "The large-stack benchmark requires loaded container data.")
+        }
+        selectedStackWorkspaceID = largest.id
+    }
 }

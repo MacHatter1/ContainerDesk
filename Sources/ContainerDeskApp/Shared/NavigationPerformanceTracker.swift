@@ -139,19 +139,23 @@ final class NavigationPerformanceTracker {
 
     /// Drives the same selection binding as the sidebar, without accessibility
     /// traversal or screen capture during the measured intervals.
-    func runBenchmark(navigate: (ContainerSection) -> Void) async {
+    func runBenchmark(prepare: () async throws -> Void = {}, navigate: (ContainerSection) -> Void) async {
         let arguments = ProcessInfo.processInfo.arguments
         guard arguments.contains("--navigation-benchmark"), !benchmarkStarted,
               let output = arguments.first(where: { $0.hasPrefix("--navigation-benchmark-output=") }) else { return }
         benchmarkStarted = true
         let path = String(output.dropFirst("--navigation-benchmark-output=".count))
         let useKeyboard = arguments.contains("--navigation-benchmark-input=keyboard")
+        let route: [ContainerSection] = arguments.contains("--navigation-benchmark-route=stacks")
+            ? [.stacks, .containers]
+            : [.stacks, .containers, .images, .containers, .activity, .containers, .cleanup, .system, .containers]
         var samples: [Sample] = []
         do {
             try await Task.sleep(for: .seconds(2))
             NSApp.activate(ignoringOtherApps: true)
             let window = try await benchmarkWindow()
             window.makeKeyAndOrderFront(nil)
+            try await prepare()
             navigate(.containers)
             try await Task.sleep(for: .seconds(1))
             let sidebar = useKeyboard ? try benchmarkSidebar(in: window) : nil
@@ -160,7 +164,7 @@ final class NavigationPerformanceTracker {
             // The first cycle creates destinations; subsequent cycles measure
             // warm navigation through resource and ordinary feature pages.
             for cycle in 0..<4 {
-                for section: ContainerSection in [.stacks, .containers, .images, .containers, .activity, .containers, .cleanup, .system, .containers] {
+                for section in route {
                     let measurement: Sample
                     if let sidebar {
                         measurement = try await navigateWithKeyboard(to: section, in: sidebar)

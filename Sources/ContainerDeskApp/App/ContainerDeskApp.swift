@@ -10,7 +10,6 @@ struct ContainerDeskApp: App {
     @State private var externalMLXStore = ExternalMLXStore()
     @AppStorage(AppAppearance.defaultsKey) private var appearanceRawValue = AppAppearance.system.rawValue
     @NSApplicationDelegateAdaptor(ContainerDeskAppDelegate.self) private var appDelegate
-    @FocusedValue(\.cleanupNavigation) private var cleanupNavigation
 
     private var preferredColorScheme: ColorScheme? {
         AppAppearance.storedValue(appearanceRawValue).preferredColorScheme
@@ -27,13 +26,7 @@ struct ContainerDeskApp: App {
         }
         .defaultSize(width: 1280, height: 820)
         .commands {
-            CommandGroup(after: .newItem) {
-                Button("Cleanup…", systemImage: "sparkles") { cleanupNavigation?() }
-                    .keyboardShortcut("k", modifiers: [.command, .shift])
-                    .disabled(cleanupNavigation == nil)
-                Button("Refresh All Resources") { Task { await store.refreshAll(); await mlxStore.refresh(); await externalMLXStore.refresh(force: true) } }
-                    .keyboardShortcut("r", modifiers: [.command, .shift])
-            }
+            ContainerDeskCommands(store: store, mlxStore: mlxStore, externalMLXStore: externalMLXStore)
         }
 
         Settings {
