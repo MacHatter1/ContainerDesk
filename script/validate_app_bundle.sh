@@ -26,6 +26,10 @@ check_plist_value CFBundleName ContainerDesk
 check_plist_value CFBundlePackageType APPL
 check_plist_value CFBundleIconFile ContainerDesk
 check_plist_value LSMinimumSystemVersion 26.0
+version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST" 2>/dev/null)" || fail "missing app version"
+build_number="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST" 2>/dev/null)" || fail "missing build number"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "invalid app version"
+[[ "$build_number" =~ ^[0-9]+$ ]] || fail "invalid build number"
 
 BINARY="$APP_BUNDLE/Contents/MacOS/ContainerDesk"
 [[ -f "$BINARY" && -x "$BINARY" ]] || fail "executable Contents/MacOS/ContainerDesk is missing or not executable"
@@ -66,4 +70,5 @@ while IFS= read -r bundle || [[ -n "$bundle" ]]; do
   fi
 done < "$INVENTORY"
 [[ "$app_bundle_found" == true ]] || fail "SwiftPM resource bundle inventory does not list ContainerDesk_ContainerDeskApp.bundle"
+/usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE" || fail "code signature verification failed"
 echo "Validated app bundle: $APP_BUNDLE"

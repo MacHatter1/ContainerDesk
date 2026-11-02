@@ -36,6 +36,7 @@ struct ContainerLimitsServiceTests {
         #expect(try Data(contentsOf: recoveryURL.appendingPathComponent("kernel.bin")) == fixture.kernelBytes)
         let recoveryPermissions = try FileManager.default.attributesOfItem(atPath: recoveryURL.appendingPathComponent("recovery.json").path)[.posixPermissions] as? NSNumber
         #expect(recoveryPermissions?.intValue == 0o600)
+        #expect(LimitsRecoveryState.read(at: recoveryURL)?.outcome == .updated)
         #expect(final.initialFilesystem.source == recoveryURL.appendingPathComponent("initfs.ext4").path)
         #expect(final.kernel.path == recoveryURL.appendingPathComponent("kernel.bin"))
         #expect(FileManager.default.fileExists(atPath: fixture.volumeFile.path))
@@ -259,7 +260,7 @@ struct ContainerLimitsServiceTests {
             firstPlan,
             limits: ContainerResourceLimits(cpus: validCPUCount(firstPlan), memoryBytes: 200 * mebibyte)
         )
-        guard case .updated = firstResult else {
+        guard case .updated(let firstRecovery) = firstResult else {
             Issue.record("Expected the first replacement to succeed; received \(firstResult).")
             return
         }
@@ -278,7 +279,7 @@ struct ContainerLimitsServiceTests {
             secondPlan,
             limits: ContainerResourceLimits(cpus: validCPUCount(secondPlan), memoryBytes: 256 * mebibyte)
         )
-        guard case .updated = secondResult else {
+        guard case .updated(let secondRecovery) = secondResult else {
             Issue.record("Expected the second replacement to succeed; received \(secondResult).")
             return
         }
@@ -286,6 +287,17 @@ struct ContainerLimitsServiceTests {
         #expect(secondReplacement.snapshot.status == .running)
         #expect(secondReplacement.snapshot.configuration.resources.memoryInBytes == 256 * mebibyte)
         #expect((await fixture.runtime.activity()).filter { $0 == "delete" }.count == 2)
+        let reader = LimitsFixtureRecoveryReader(paths: try AppleLimitsRecoveryInventory.referencedFiles(in: secondReplacement))
+        let cleanup = ContainerLimitsRecoveryService(directory: fixture.recoveryRoot, reader: reader)
+        let sessions = try await cleanup.scan()
+        #expect(sessions.first(where: { $0.directory == firstRecovery })?.canRemove == true)
+        #expect(sessions.first(where: { $0.directory == secondRecovery })?.canRemove == false)
+        let result = try await cleanup.remove(sessions.filter { $0.directory == firstRecovery })
+        #expect(result.allSatisfy { $0.removed }, "\(result.map(\.message))")
+        #expect(!FileManager.default.fileExists(atPath: firstRecovery.path))
+        #expect(try Data(contentsOf: secondReplacement.kernel.path) == fixture.kernelBytes)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: secondReplacement.initialFilesystem.source)) == fixture.initfsBytes)
+
     }
 
     @Test func staleConfigurationAndInvalidLimitsNeverDeleteTheContainer() async throws {
@@ -772,4 +784,9 @@ private let mebibyte: UInt64 = 1_048_576
 
 private func validCPUCount(_ plan: ContainerLimitsPlan) -> Int {
     min(max(1, plan.currentLimits.cpus), plan.maximumCPUs)
+}
+
+private struct LimitsFixtureRecoveryReader: LimitsRecoveryInventoryReading {
+    let paths: [URL]
+    func inventory() async throws -> LimitsRecoveryInventory { .init(referencedFiles: paths, complete: true) }
 }

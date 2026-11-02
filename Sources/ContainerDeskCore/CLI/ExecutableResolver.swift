@@ -8,7 +8,7 @@ public struct ExecutableResolver: Sendable {
     public func resolve(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL? {
         if let overridePath, !overridePath.isEmpty {
             var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: overridePath, isDirectory: &isDirectory),
+            guard overridePath.hasPrefix("/"), FileManager.default.fileExists(atPath: overridePath, isDirectory: &isDirectory),
                   !isDirectory.boolValue,
                   FileManager.default.isExecutableFile(atPath: overridePath) else { return nil }
             return URL(fileURLWithPath: overridePath)
@@ -17,9 +17,11 @@ public struct ExecutableResolver: Sendable {
         var candidates: [String] = []
         candidates += ["/opt/homebrew/bin/container", "/usr/local/bin/container"]
         candidates += (environment["PATH"] ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
-            .split(separator: ":").map { String($0) + "/container" }
+            .split(separator: ":").filter { $0.hasPrefix("/") }.map { String($0) + "/container" }
         for path in candidates {
-            guard FileManager.default.isExecutableFile(atPath: path) else { continue }
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue,
+                  FileManager.default.isExecutableFile(atPath: path) else { continue }
             return URL(fileURLWithPath: path)
         }
         return nil
@@ -32,7 +34,7 @@ public struct ExecutableResolver: Sendable {
     ) -> [String: String] {
         var environment = inherited
         let currentPath = inherited["PATH"] ?? ""
-        var paths = ["/opt/homebrew/bin", "/usr/local/bin"] + currentPath.split(separator: ":").map(String.init)
+        var paths = ["/opt/homebrew/bin", "/usr/local/bin"] + currentPath.split(separator: ":").filter { $0.hasPrefix("/") }.map(String.init)
         var seen = Set<String>()
         paths = paths.filter { seen.insert($0).inserted }
         environment["PATH"] = paths.joined(separator: ":")

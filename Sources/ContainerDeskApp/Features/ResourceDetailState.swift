@@ -6,6 +6,7 @@ import Observation
 @MainActor @Observable
 final class ResourceDetailState {
     var isLoading = false
+    var loadToken: UUID?
     var followLogs = false
     var operationID: UUID?
     var error: String?

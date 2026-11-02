@@ -402,7 +402,7 @@ struct MLXModelServiceTests {
         #expect(models.contains(where: { $0.id == "managed:owner/tiny-model" }))
     }
 
-    @Test func cancellingDownloadWaitsForOwnedProcessAndLeavesPartialDataUnlisted() async throws {
+    @Test func cancellingDownloadWaitsForOwnedProcessAndListsPartialDataForRemoval() async throws {
         let fixture = try makeServiceFixture(processBehavior: .holdDownload)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let stream = await fixture.service.download(try MLXModelDownloadRequest(repositoryID: "owner/partial-model"))
@@ -421,7 +421,7 @@ struct MLXModelServiceTests {
             environment: ["HF_HUB_CACHE": fixture.root.appendingPathComponent("hf-cache", isDirectory: true).path]
         )
         let models = await catalog.listLocalModels()
-        #expect(!models.contains(where: { $0.id == "managed:owner/partial-model" }))
+        #expect(models.first(where: { $0.id == "managed:owner/partial-model" })?.isReady == false)
         let target = try MLXModelCatalog.managedPath(for: "owner/partial-model", root: fixture.managed)
         #expect(FileManager.default.fileExists(atPath: target.path))
         #expect(MLXModelCatalog.managedManifest(at: target)?.complete == false)
@@ -459,7 +459,21 @@ struct MLXModelServiceTests {
         await service.shutdown()
     }
 
-    private func makeServiceFixture(processBehavior: TestProcessBehavior) throws -> ServiceFixture {
+    @Test func startupDeadlineStopsAQuietServerAndReportsFailure() async throws {
+        let fixture = try makeServiceFixture(processBehavior: .quietServer, startupTimeout: .milliseconds(50))
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let model = try await fixture.service.validateModelDirectory(fixture.modelDirectory)
+        let session = try await fixture.service.startServer(modelID: model.id, options: MLXServerOptions(port: 18_399))
+        let events = await fixture.service.serverEvents(id: session.id)
+        let terminal = await collectUntilStreamFinishes(events, timeout: .seconds(2))
+        #expect(terminal != nil)
+        let final = await fixture.service.ownedServers().first(where: { $0.id == session.id })
+        #expect(final?.state == .failed)
+        #expect(final?.detail == "Server startup timed out.")
+        await fixture.service.shutdown()
+    }
+
+    private func makeServiceFixture(processBehavior: TestProcessBehavior, startupTimeout: Duration = .seconds(300)) throws -> ServiceFixture {
         let root = temporaryDirectory()
         let modelDirectory = root.appendingPathComponent("model", isDirectory: true)
         try makeModel(at: modelDirectory)
@@ -469,7 +483,8 @@ struct MLXModelServiceTests {
             configuration: MLXConfiguration(managedModelsDirectory: managed, importedModelDirectories: [modelDirectory]),
             environment: ["PATH": ""],
             capabilityProbe: FixedCapabilityProbe(executable: root.appendingPathComponent("mlx_lm"), python: root.appendingPathComponent("python")),
-            processFactory: factory
+            processFactory: factory,
+            startupTimeout: startupTimeout
         )
         return ServiceFixture(root: root, modelDirectory: modelDirectory, managed: managed, service: service, factory: factory)
     }
@@ -592,6 +607,7 @@ private actor CapabilityProbeGate {
 
 private enum TestProcessBehavior: Equatable {
     case holdServer
+    case quietServer
     case failServer
     case successServer
     case downloadSuccess
@@ -625,6 +641,9 @@ private final class TestProcessFactory: MLXExecutableProcessFactory, @unchecked 
         record(request)
         let token = MockExecutionHandleToken()
         lock.lock(); weakHandleTokens.append(WeakMockExecutionHandleToken(token)); lock.unlock()
+        if request.arguments.first == "server", behavior == .quietServer {
+            return TestProcessExecution(leaderRunning: true, token: token).managed()
+        }
         if request.arguments.first == "server", behavior == .holdServer {
             let port = request.arguments.firstIndex(of: "--port").flatMap { request.arguments.indices.contains($0 + 1) ? request.arguments[$0 + 1] : nil } ?? "0"
             return TestProcessExecution(output: "Starting httpd at127.0.0.1 on port \(port)", leaderRunning: true, token: token).managed()

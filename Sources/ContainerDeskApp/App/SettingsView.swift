@@ -5,6 +5,7 @@ import AppKit
 struct SettingsView: View {
     let store: AppStore
     let mlxStore: MLXStore
+    @State private var showRecoveryFiles = false
     @State private var cliPathDraft = ""
     @State private var mlxPathDraft = ""
     @AppStorage(AppAppearance.defaultsKey) private var appearanceRawValue = AppAppearance.system.rawValue
@@ -12,6 +13,12 @@ struct SettingsView: View {
     var body: some View {
         Form {
             MonitoringSettingsView(monitoring: store.monitoring)
+            Section {
+                Button("Review Limits Recovery Files…") { showRecoveryFiles = true }
+                    .disabled(store.cliPath != nil || store.limitsOperationContainerID != nil || store.isRecoveryCleanupInProgress)
+                Text("Review completed rollback copies and their allocated size before removing them. Files needed by a container or an unfinished recovery are kept.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: { Label("Limits Recovery", systemImage: "externaldrive.badge.timemachine") }
             Section {
                 Picker("Appearance", selection: $appearanceRawValue) {
                     ForEach(AppAppearance.allCases) { appearance in
@@ -36,8 +43,8 @@ struct SettingsView: View {
                 Text("The app looks in Homebrew’s Apple Silicon and Intel locations, then your inherited PATH.")
                     .font(.caption).foregroundStyle(.secondary)
                 HStack {
-                    Button("Save Path") { store.cliPath = cliPathDraft.isEmpty ? nil : cliPathDraft }
-                    Button("Use Automatic Discovery") { cliPathDraft = ""; store.cliPath = nil }
+                    Button("Save Path") { store.cliPath = cliPathDraft.isEmpty ? nil : cliPathDraft }.disabled((cliPathDraft.isEmpty ? nil : cliPathDraft) == store.cliPath || store.limitsOperationContainerID != nil || store.isRecoveryCleanupInProgress)
+                    Button("Use Automatic Discovery") { cliPathDraft = ""; store.cliPath = nil }.disabled(store.cliPath == nil || store.limitsOperationContainerID != nil || store.isRecoveryCleanupInProgress)
                 }
             } header: { Label("Container CLI", systemImage: "shippingbox.fill").foregroundStyle(.blue) }
             Section {
@@ -80,6 +87,7 @@ struct SettingsView: View {
         .padding(20)
         .frame(width: 560, height: 700)
         .navigationTitle("Settings")
+        .sheet(isPresented: $showRecoveryFiles) { LimitsRecoverySheet(store: store) }
         .onAppear {
             cliPathDraft = store.cliPath ?? ""
             mlxPathDraft = mlxStore.configuration.executableOverride?.path ?? ""

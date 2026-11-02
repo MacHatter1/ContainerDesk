@@ -3,11 +3,13 @@ import Foundation
 import Observation
 
 enum RuntimeOperationError: LocalizedError {
-    case limitsInProgress, runtimeChanged
+    case limitsInProgress, runtimeChanged, recoveryCleanupInProgress, shuttingDown
     var errorDescription: String? {
         switch self {
         case .limitsInProgress: "Wait for the container limits change to finish before changing runtime resources."
         case .runtimeChanged: "The selected runtime changed. Review this action again before running it."
+        case .recoveryCleanupInProgress: "Wait for recovery cleanup to finish before changing runtime resources."
+        case .shuttingDown: "ContainerDesk is shutting down. New commands cannot start."
         }
     }
 }
@@ -18,9 +20,22 @@ final class RuntimeOperationPolicy {
     private(set) var limitsContainerID: String?
     private var limitsToken: UUID?
     private var mutations = Set<UUID>()
+    private var recoveryToken: UUID?
+    private(set) var isShuttingDown = false
+    var isRecoveryCleanupInProgress: Bool { recoveryToken != nil }
+    func beginShutdown() { isShuttingDown = true }
+
+    func beginRecoveryCleanup() -> UUID? {
+        guard !isShuttingDown, limitsToken == nil, recoveryToken == nil, mutations.isEmpty else { return nil }
+        let token = UUID()
+        recoveryToken = token
+        return token
+    }
+
+    func endRecoveryCleanup(_ token: UUID) { if recoveryToken == token { recoveryToken = nil } }
 
     func beginLimitsChange(_ id: String) -> UUID? {
-        guard limitsToken == nil, mutations.isEmpty else { return nil }
+        guard !isShuttingDown, limitsToken == nil, recoveryToken == nil, mutations.isEmpty else { return nil }
         let token = UUID()
         limitsToken = token
         limitsContainerID = id
@@ -33,10 +48,11 @@ final class RuntimeOperationPolicy {
         limitsContainerID = nil
     }
 
-    func canStart(_ request: CommandRequest) -> Bool { limitsToken == nil || Self.isReadOnly(request.arguments) }
+    func canStart(_ request: CommandRequest) -> Bool { !isShuttingDown && ((limitsToken == nil && recoveryToken == nil) || Self.isReadOnly(request.arguments)) }
 
     func beginCommand(_ request: CommandRequest) throws -> UUID? {
-        guard canStart(request) else { throw RuntimeOperationError.limitsInProgress }
+        guard !isShuttingDown else { throw RuntimeOperationError.shuttingDown }
+        guard canStart(request) else { throw recoveryToken != nil ? RuntimeOperationError.recoveryCleanupInProgress : .limitsInProgress }
         guard !Self.isReadOnly(request.arguments) else { return nil }
         let token = UUID()
         mutations.insert(token)

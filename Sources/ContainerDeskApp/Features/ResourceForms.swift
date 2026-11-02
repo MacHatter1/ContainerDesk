@@ -119,7 +119,7 @@ struct ResourceFormSheet: View {
         switch section {
         case .machines: !image.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         case .images: !image.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        case .registries: !name.isEmpty && !username.isEmpty && !password.isEmpty
+        case .registries: !name.trimmedFormValue.isEmpty && !username.trimmedFormValue.isEmpty && !password.isEmpty
         default: !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
     }
@@ -141,35 +141,12 @@ struct ResourceFormSheet: View {
     }
 
     private func makeRequest() throws -> CommandRequest {
-        var args: [String]
-        switch section {
-        case .images:
-            args = ["image", "pull"]
-            if !platform.isEmpty { args += ["--platform", platform] }
-            args.append(image)
-        case .volumes:
-            args = ["volume", "create"]
-            if !size.isEmpty { args += ["-s", size] }
-            for line in optionsText.lines { args += ["--opt", line] }
-            args.append(name)
-        case .networks:
-            args = ["network", "create"]
-            if internalNetwork { args.append("--internal") }
-            if !subnet.isEmpty { args += ["--subnet", subnet] }
-            if !subnetV6.isEmpty { args += ["--subnet-v6", subnetV6] }
-            for line in optionsText.lines { args += ["--option", line] }
-            args.append(name)
-        case .registries:
-            return try RegistryLoginRequestBuilder.request(server: name, scheme: registryScheme, username: username, password: password)
-        case .machines:
-            args = ["machine", "create"]
-            if !name.isEmpty { args += ["--name", name] }
-            if !cpuText.isEmpty { args += ["--cpus", cpuText] }
-            if !memoryText.isEmpty { args += ["--memory", memoryText] }
-            args.append(image)
-        default: throw FeatureCommandError(message: "This resource type does not support this form.")
-        }
-        return CommandRequest(arguments: args)
+        try ResourceCreationForm(
+            name: name, image: image, cpuText: cpuText, memoryText: memoryText,
+            platform: platform, subnet: subnet, subnetV6: subnetV6, size: size,
+            optionsText: optionsText, username: username, password: password,
+            registryScheme: registryScheme, internalNetwork: internalNetwork
+        ).request(for: section)
     }
 
 }
@@ -355,6 +332,7 @@ struct ResourceActionSheet: View {
             let result = try await store.execute(CommandRequest(arguments: args), title: actionTitle, reviewedRuntime: runtime)
             output = result.standardOutput + (result.standardError.isEmpty ? "" : "\n" + result.standardError)
             guard result.succeeded else { throw FeatureCommandError(result: result) }
+            if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { output = "\(actionTitle) completed successfully." }
             if ![.logs, .stats].contains(action.kind) { await store.refresh(section, force: true) }
         } catch { failure = error.localizedDescription }
         busy = false
@@ -394,30 +372,7 @@ struct FeatureCommandError: Error, LocalizedError {
 
 enum SafeArgumentTokenizer {
     static func tokenize(_ input: String) throws -> [String] {
-        var args: [String] = []
-        var token = ""
-        var quote: Character?
-        var escaped = false
-        var active = false
-        for character in input {
-            if escaped { token.append(character); escaped = false; active = true; continue }
-            if character == "\\" && quote != "'" { escaped = true; active = true; continue }
-            if let currentQuote = quote {
-                if character == currentQuote { quote = nil } else { token.append(character) }
-                active = true
-                continue
-            }
-            if character == "'" || character == "\"" { quote = character; active = true; continue }
-            if character.isWhitespace {
-                if active { args.append(token); token = ""; active = false }
-            } else { token.append(character); active = true }
-        }
-        guard quote == nil && !escaped else { throw FeatureCommandError(message: "Finish the open quote or escape before running the command.") }
-        if active { args.append(token) }
-        return args
+        do { return try ContainerCommandTokenizer.tokenize(input) }
+        catch { throw FeatureCommandError(message: "Finish the open quote or escape before running the command, and remove any null characters.") }
     }
-}
-
-private extension String {
-    var lines: [String] { split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
 }

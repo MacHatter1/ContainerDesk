@@ -19,7 +19,7 @@ struct BuildFeatureView: View {
     @State private var noCache = false
     @State private var contextImporter = false
     @State private var dockerfileImporter = false
-    @State private var operation = BuildOperationStore()
+    private var operation: BuildOperationStore { store.buildOperations }
     @State private var formError: String?
     private var running: Bool { operation.isRunning }
     private var progress: String { operation.output }
@@ -47,9 +47,8 @@ struct BuildFeatureView: View {
                 .font(.caption).foregroundStyle(.secondary).padding(10).background(.bar)
         }
         .task { await refreshBuilderStatus() }
-        .onDisappear { operation.cancel() }
         .fileImporter(isPresented: $contextImporter, allowedContentTypes: [.folder], allowsMultipleSelection: false) { result in switch result { case .success(let urls): if let url = urls.first { contextURL = url }; case .failure(let error): formError = error.localizedDescription } }
-        .fileImporter(isPresented: $dockerfileImporter, allowedContentTypes: [.plainText, .text], allowsMultipleSelection: false) { result in switch result { case .success(let urls): dockerfileURL = urls.first; case .failure(let error): formError = error.localizedDescription } }
+        .fileImporter(isPresented: $dockerfileImporter, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in switch result { case .success(let urls): dockerfileURL = urls.first; case .failure(let error): formError = error.localizedDescription } }
         .sheet(isPresented: $showAdvanced) { AdvancedCommandSheet(section: .builds, store: store) { _ in } }
         .confirmationDialog("Delete the image builder?", isPresented: $showBuilderDelete, titleVisibility: .visible) {
             Button("Delete Builder", role: .destructive) { Task { await builderAction(["builder", "delete"], title: "Delete Image Builder") } }
@@ -80,7 +79,7 @@ struct BuildFeatureView: View {
                     LabeledContent("Dockerfile") {
                         HStack { Text(dockerfileURL?.lastPathComponent ?? "Dockerfile or Containerfile").font(.caption).foregroundStyle(.secondary); Spacer(); Button("Choose…") { dockerfileImporter = true } }
                     }
-                    TextField("Image tag", text: $tags, prompt: Text("app:latest, one tag per line"))
+                    TextField("Image tag", text: $tags, prompt: Text("app:latest, one tag per line"), axis: .vertical).lineLimit(2...4)
                         .font(.system(.body, design: .monospaced))
                 }
             }
@@ -165,19 +164,19 @@ struct BuildFeatureView: View {
         var args = ["build"]
         if let dockerfileURL { args += ["--file", dockerfileURL.path] }
         for tag in tags.lines { args += ["--tag", tag] }
-        for line in buildArgs.lines { args += ["--build-arg", line] }
-        for line in secrets.lines { args += ["--secret", line] }
+        for line in FormInput.assignments(buildArgs) { args += ["--build-arg", line] }
+        for line in FormInput.assignments(secrets) { args += ["--secret", line] }
         if forwardSSH { args += ["--ssh", "default"] }
-        if !target.isEmpty { args += ["--target", target] }
-        if !platform.isEmpty { args += ["--platform", platform] }
-        if !cpus.isEmpty { args += ["--cpus", cpus] }
-        if !memory.isEmpty { args += ["--memory", memory] }
-        if !outputType.isEmpty { args += ["--output", outputType] }
+        if !target.trimmedFormValue.isEmpty { args += ["--target", target.trimmedFormValue] }
+        if !platform.trimmedFormValue.isEmpty { args += ["--platform", platform.trimmedFormValue] }
+        if !cpus.trimmedFormValue.isEmpty { args += ["--cpus", cpus.trimmedFormValue] }
+        if !memory.trimmedFormValue.isEmpty { args += ["--memory", memory.trimmedFormValue] }
+        if let output = FormInput.assignments(outputType).first { args += ["--output", output] }
         if pull { args.append("--pull") }
         if noCache { args.append("--no-cache") }
         args.append(contextURL.path)
-        let sensitive = buildArgs.lines.compactMap { $0.split(separator: "=", maxSplits: 1).dropFirst().first.map(String.init) }
-        let request = CommandRequest(arguments: args, workingDirectory: contextURL, redactions: sensitive + secrets.lines, captureLimit: 1_000_000)
+        let sensitive = FormInput.assignments(buildArgs).map(CommandRequest.assignmentRedaction)
+        let request = CommandRequest(arguments: args, workingDirectory: contextURL, redactions: sensitive + FormInput.assignments(secrets), captureLimit: 1_000_000)
         operation.start(request, title: "Build Image", store: store) { succeeded in
             if succeeded { await store.refresh(.images, force: true) }
         }

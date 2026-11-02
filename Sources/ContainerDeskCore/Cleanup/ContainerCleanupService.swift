@@ -303,7 +303,7 @@ public struct ContainerCleanupService: Sendable {
         case .networks: args = ["network", "delete", "--", candidate.resourceID]
         case .volumes: args = ["volume", "delete", "--", candidate.resourceID]
         }
-        return CommandRequest(arguments: args, suppressOutputEvents: true)
+        return CommandRequest(arguments: args, suppressOutputEvents: true, timeout: .seconds(30))
     }
 
     private func readJSON(_ args: [String], label: String) async -> ReadResult {

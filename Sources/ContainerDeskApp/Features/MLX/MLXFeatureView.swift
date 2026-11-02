@@ -250,7 +250,7 @@ struct MLXFeatureView: View {
                 .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 9))
             VStack(alignment: .leading, spacing: 3) {
                 Text(model.displayName).font(ContainerDeskTypography.detailTitle).lineLimit(1)
-                Text("\(sourceLabel(model.source)) · \(model.modelType ?? "MLX model") · \(byteCount(model.diskBytes))")
+                Text("\(model.isReady ? sourceLabel(model.source) : "Partial download · retry or remove") · \(model.modelType ?? "MLX model") · \(byteCount(model.diskBytes))")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: 8)
@@ -271,7 +271,7 @@ struct MLXFeatureView: View {
                     .disabled(store.isModelInUse(model.id))
                 } label: { Image(systemName: "ellipsis") }
                     .menuStyle(.borderlessButton)
-                    .help(model.source == .appManagedDownload ? "Model actions" : "Imported model actions")
+                    .help(model.source == .appManagedDownload ? "Model actions" : "Imported model actions").accessibilityLabel("Model actions")
             }
         }
         .padding(.horizontal, 18)

@@ -21,17 +21,20 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Validate release tag
         shell: bash
         run: |
+          set -euo pipefail
           if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "Release tags must use vMAJOR.MINOR.PATCH, optionally followed by a prerelease suffix (for example, v1.2.3 or v1.2.3-rc.1)." >&2
             exit 1
           fi
+          git merge-base --is-ancestor HEAD origin/main || { echo "Release commit must be on reviewed main." >&2; exit 1; }
 
       - name: Show toolchain versions
         id: toolchain
@@ -44,26 +47,16 @@ jobs:
           fingerprint="$( { uname -m; xcodebuild -version; swift --version; } | shasum -a 256 | cut -d ' ' -f 1)"
           echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
 
-      - name: Cache SwiftPM dependencies and build outputs
-        uses: actions/cache@v5
-        with:
-          path: |
-            .build
-            ~/Library/Caches/org.swift.swiftpm
-          key: swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.resolved', 'Package.swift') }}-${{ github.sha }}
-          restore-keys: |
-            swiftpm-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.resolved', 'Package.swift') }}-
-
       - name: Run release tests
         shell: bash
         run: |
           set -euo pipefail
-          swift test --configuration release --force-resolved-versions --xunit-output test-results.xml 2>&1 | tee test-results.log
+          swift test --configuration release --no-parallel --force-resolved-versions --xunit-output test-results.xml 2>&1 | tee test-results.log
           test -s test-results-swift-testing.xml || { echo "Swift Testing report is missing or empty." >&2; exit 1; }
 
       - name: Upload test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-test-results
           path: |
@@ -72,7 +65,12 @@ jobs:
           if-no-files-found: warn
 
       - name: Build release app bundle
-        run: ./script/build_and_run.sh --build-only
+        shell: bash
+        run: |
+          export CONTAINERDESK_VERSION="${GITHUB_REF_NAME#v}"
+          export CONTAINERDESK_VERSION="${CONTAINERDESK_VERSION%%-*}"
+          export CONTAINERDESK_BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+          ./script/build_and_run.sh --build-only
         env:
           CONTAINERDESK_BUILD_CONFIGURATION: release
 
@@ -96,7 +94,7 @@ jobs:
           )
 
       - name: Upload release assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-assets
           path: dist/release/*
@@ -112,7 +110,7 @@ jobs:
 
     steps:
       - name: Download release assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release-assets
           path: release-assets

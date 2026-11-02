@@ -52,12 +52,14 @@ struct AppStoreResourceRefreshTests {
 
     @MainActor
     @Test func concurrentRefreshCallersShareOneRead() async throws {
-        let (store, client, defaults, suiteName) = makeStore(readDelay: .milliseconds(120), payload: #"[{"id":"web","status":{"state":"running"}}]"#)
+        let (store, client, defaults, suiteName) = makeStore(payload: #"[{"id":"web","status":{"state":"running"}}]"#, holdFirstRead: true)
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let first = Task { @MainActor in await store.refresh(.containers, force: true) }
-        try await Task.sleep(for: .milliseconds(20))
+        try await waitForRefreshCondition { await client.listCallCount() == 1 }
         let second = Task { @MainActor in await store.refresh(.containers) }
+        try await waitForRefreshCondition { store.resourceRefreshWaiterCount == 1 }
+        await client.releaseFirstRead()
         await second.value
         #expect(store.snapshots[.containers]?.state == .loaded, "A joining Logs/navigation caller must await the first inventory.")
         #expect(store.snapshots[.containers]?.items.map(\.id) == ["web"])
@@ -69,14 +71,15 @@ struct AppStoreResourceRefreshTests {
 
     @MainActor
     @Test func cancellingAJoiningCallerDoesNotCancelTheOwningInventoryRead() async throws {
-        let (store, client, defaults, suiteName) = makeStore(readDelay: .milliseconds(150))
+        let (store, client, defaults, suiteName) = makeStore(holdFirstRead: true)
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let first = Task { await store.refresh(.containers, force: true) }
-        try await Task.sleep(for: .milliseconds(20))
+        try await waitForRefreshCondition { await client.listCallCount() == 1 }
         let joining = Task { await store.refresh(.containers) }
-        try await Task.sleep(for: .milliseconds(10))
+        try await waitForRefreshCondition { store.resourceRefreshWaiterCount == 1 }
         joining.cancel()
         await joining.value
+        await client.releaseFirstRead()
         await first.value
         #expect(store.snapshots[.containers]?.state == .loaded)
         #expect(await client.listCallCount() == 1)
@@ -84,14 +87,15 @@ struct AppStoreResourceRefreshTests {
 
     @MainActor
     @Test func changingCLIReleasesJoiningCallersAndRejectsTheOldInventory() async throws {
-        let (store, _, defaults, suiteName) = makeStore(readDelay: .milliseconds(120), payload: #"[{"id":"old-runtime"}]"#)
+        let (store, client, defaults, suiteName) = makeStore(payload: #"[{"id":"old-runtime"}]"#, holdFirstRead: true)
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let first = Task { await store.refresh(.containers, force: true) }
-        try await Task.sleep(for: .milliseconds(20))
+        try await waitForRefreshCondition { await client.listCallCount() == 1 }
         let joining = Task { await store.refresh(.containers) }
-        try await Task.sleep(for: .milliseconds(10))
+        try await waitForRefreshCondition { store.resourceRefreshWaiterCount == 1 }
         store.cliPath = "/missing/replacement-container-cli"
         await joining.value
+        await client.releaseFirstRead()
         await first.value
         #expect(store.snapshots[.containers]?.items.isEmpty == true)
         #expect(store.snapshots[.containers]?.state == .idle)
@@ -172,5 +176,15 @@ private actor ResourceRefreshTestClient: ContainerClient {
                 }
             }
         }
+    }
+}
+
+@MainActor private func waitForRefreshCondition(_ condition: () async -> Bool) async throws {
+    // Parallel native-view fixtures can occupy the main actor for several seconds.
+    // Bound a missing synchronization point without treating executor load as a failure.
+    let deadline = ContinuousClock.now + .seconds(10)
+    while !(await condition()) {
+        try #require(ContinuousClock.now < deadline, "Inventory test did not reach its synchronization point")
+        try await Task.sleep(for: .milliseconds(2))
     }
 }

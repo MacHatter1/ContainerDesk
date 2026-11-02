@@ -13,7 +13,7 @@ final class KubernetesOperationStore {
     @ObservationIgnored private weak var appStore: AppStore?
 
     func run(_ request: CommandRequest, title: String, store: AppStore, owner: UUID) async -> Bool {
-        guard !isRunning, !Task.isCancelled else { return false }
+        guard !isRunning, !Task.isCancelled, !store.isShuttingDown else { return false }
         isRunning = true
         output = ""
         error = nil
@@ -55,4 +55,10 @@ final class KubernetesOperationStore {
     }
 
     func clearOutput() { guard !isRunning else { return }; output = ""; error = nil }
+
+    func shutdown() async {
+        let worker = task
+        if let owner { cancel(owner: owner) }
+        _ = await worker?.value
+    }
 }

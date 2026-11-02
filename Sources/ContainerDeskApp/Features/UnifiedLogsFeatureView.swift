@@ -5,9 +5,12 @@ import UniformTypeIdentifiers
 
 struct UnifiedLogsFeatureView: View {
     let store: AppStore
+    @State private var initialized = false
+    @State private var runtimePath: String?
     @State private var logs = UnifiedLogsStore()
     @State private var projection = ContainerLogProjection()
-    @State private var sources = Set<String>()
+    @State private var sourceSelection = LogSourceSelection()
+    private var sources: Set<String> { sourceSelection.ids }
     @State private var selected = Set<Int>()
     @State private var query = ""
     @State private var containerFilter = ""
@@ -76,14 +79,23 @@ struct UnifiedLogsFeatureView: View {
             catch { exportError = "Log filtering could not finish." }
         }
         .task(id: store.cliPath) {
-            logs.stop()
-            logs = UnifiedLogsStore()
-            sources.removeAll()
-            selected.removeAll()
-            containerFilter = ""
+            if initialized, runtimePath != store.cliPath {
+                logs.stop()
+                logs = UnifiedLogsStore()
+                sourceSelection = LogSourceSelection()
+                selected.removeAll()
+                containerFilter = ""
+                initialized = false
+            }
+            runtimePath = store.cliPath
             await store.refresh(.containers)
             guard !Task.isCancelled else { return }
-            sources = Set(containers.map(\.id))
+            sourceSelection.observeInventory(containers.map(\.id), loaded: store.snapshots[.containers]?.state == .loaded)
+            initialized = true
+            configure()
+        }
+        .onChange(of: store.snapshots[.containers]) { _, snapshot in
+            sourceSelection.observeInventory(snapshot?.items.map(\.id) ?? [], loaded: snapshot?.state == .loaded)
             configure()
         }
         .onChange(of: sources) { _, _ in configure(); selected.removeAll() }
@@ -105,12 +117,12 @@ struct UnifiedLogsFeatureView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Menu("Sources (\(sources.count))") {
-                    Button("Select All") { sources = Set(containers.map(\.id)) }
-                    Button("Deselect All") { sources.removeAll() }
+                    Button("Select All") { sourceSelection.select(Set(containers.map(\.id))) }
+                    Button("Deselect All") { sourceSelection.select([]) }
                     Divider()
                     ForEach(containers) { item in
                         Toggle(item.title, isOn: Binding(get: { sources.contains(item.id) }, set: { enabled in
-                            if enabled { sources.insert(item.id) } else { sources.remove(item.id) }
+                            sourceSelection.set(item.id, enabled: enabled)
                         }))
                     }
                 }.fixedSize()

@@ -67,7 +67,7 @@ public struct EnvironmentProfile: Identifiable, Codable, Equatable, Sendable {
     public func validate() throws {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               name.count <= 120,
-              name.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }),
+              name.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) || $0 == "\u{200C}" || $0 == "\u{200D}" }),
               updatedAt.timeIntervalSince1970.isFinite else {
             throw EnvironmentProfileError.invalidProfile("Profile names must contain 1–120 characters without control characters, and dates must be valid.")
         }

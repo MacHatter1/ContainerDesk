@@ -43,7 +43,7 @@ public struct ManagedStackLibrary: Codable, Sendable, Equatable {
             for stack in collection.stacks {
                 let name = stack.name.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !name.isEmpty, name == stack.name, name.count <= 120,
-                      !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+                      !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) && $0 != "\u{200C}" && $0 != "\u{200D}" }) else {
                     throw ManagedStackError.invalidName
                 }
                 guard identifiers.insert(stack.id).inserted else { throw ManagedStackError.invalidDocument }

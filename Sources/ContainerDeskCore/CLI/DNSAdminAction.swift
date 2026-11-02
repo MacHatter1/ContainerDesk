@@ -5,6 +5,25 @@ public enum DNSAdminAction: Sendable, Equatable {
     case create(domainName: String, localhost: String?)
     case delete(domainName: String)
 
+    /// Every value crosses the shell boundary through AppleScript's quoted form.
+    public func administratorRequest(executableURL: URL) throws -> CommandRequest {
+        try validate()
+        guard executableURL.path.hasPrefix("/") else { throw DNSAdminError.launch("The CLI path must be absolute.") }
+        let script = #"""
+        on run argv
+            set shellCommand to quoted form of (item 1 of argv)
+            repeat with argIndex from 2 to count of argv
+                set shellCommand to shellCommand & " " & quoted form of (item argIndex of argv)
+            end repeat
+            return do shell script shellCommand with administrator privileges
+        end run
+        """#
+        return CommandRequest(
+            arguments: ["-e", script, "--", "/usr/bin/env", "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", executableURL.path] + arguments,
+            captureLimit: 64_000, suppressOutputEvents: true, timeout: .seconds(120)
+        )
+    }
+
     public var arguments: [String] {
         switch self {
         case .create(let domainName, let localhost):

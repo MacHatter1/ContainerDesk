@@ -51,7 +51,7 @@ public struct CommandRequest: Sendable {
         for index in safeArguments.indices {
             if let equals = safeArguments[index].firstIndex(of: "=") {
                 let key = safeArguments[index][..<equals].lowercased()
-                if ["password", "passwd", "token", "secret", "authorization", "access_key", "secret_key"].contains(where: { key.contains($0) }) {
+                if SensitiveMetadataKey.containsCredential(String(key)) {
                     safeArguments[index] = String(safeArguments[index][...equals]) + "••••"
                 }
             }
@@ -78,6 +78,15 @@ public struct CommandRequest: Sendable {
         if words.starts(with: ["system", "version"]) || words.starts(with: ["system", "df"]) { return true }
         if words.starts(with: ["system", "dns", "list"]) { return true }
         return false
+    }
+
+    /// Short non-credential build values are masked as assignments so VERSION=1
+    /// does not erase every digit 1 from a streamed build log.
+    public static func assignmentRedaction(_ assignment: String) -> String {
+        guard let equals = assignment.firstIndex(of: "=") else { return assignment }
+        let key = String(assignment[..<equals])
+        let value = String(assignment[assignment.index(after: equals)...])
+        return value.count >= 4 || SensitiveMetadataKey.containsCredential(key) ? value : assignment
     }
 
     public func redact(_ string: String) -> String {

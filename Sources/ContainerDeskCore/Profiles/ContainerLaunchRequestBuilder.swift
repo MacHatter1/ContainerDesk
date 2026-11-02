@@ -249,8 +249,13 @@ public enum ContainerCommandTokenizer {
         var escaped = false
         var active = false
         for character in input {
-            if escaped { token.append(character); escaped = false; active = true; continue }
-            if character == "\\" && quote != "'" { escaped = true; active = true; continue }
+            if escaped {
+                if character == "\n" { escaped = false; continue }
+                if quote == "\"", !["$", "`", "\"", "\\", "\n"].contains(character) { token.append("\\") }
+                token.append(character)
+                escaped = false; active = true; continue
+            }
+            if character == "\\" && quote != "'" { escaped = true; continue }
             if let currentQuote = quote {
                 if character == currentQuote { quote = nil } else { token.append(character) }
                 active = true

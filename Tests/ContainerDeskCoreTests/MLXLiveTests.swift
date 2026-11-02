@@ -36,10 +36,16 @@ struct MLXLiveTests {
                 )
                 let (firstChunks, firstChunkContinuation) = AsyncStream<String>.makeStream()
                 let consumer = Task {
+                    defer { firstChunkContinuation.finish() }
                     do { for try await chunk in response where !chunk.isEmpty { firstChunkContinuation.yield(chunk) } } catch {}
+                }
+                let timeout = Task {
+                    try? await Task.sleep(for: .seconds(30))
+                    firstChunkContinuation.finish()
                 }
                 var iterator = firstChunks.makeAsyncIterator()
                 let firstChunk = await iterator.next()
+                timeout.cancel()
                 consumer.cancel()
                 await consumer.value
                 firstChunkContinuation.finish()

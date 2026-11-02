@@ -27,6 +27,7 @@ public actor DefaultMLXModelService: MLXModelService {
     private let chatTransport: any MLXChatStreamingTransport
     private let catalogScanner: any MLXModelCatalogScanning
     private var catalogScan: CatalogScan?
+    private(set) var catalogWaiterCount = 0
     private var cachedCapability: MLXCapability?
     private var capabilityTask: (id: UUID, task: Task<MLXCapability, Never>)?
     private var servers: [UUID: ServerEntry] = [:]
@@ -37,13 +38,15 @@ public actor DefaultMLXModelService: MLXModelService {
     private var isShuttingDown = false
     private var shutdownOperation: Task<Void, Never>?
     private var nextServerTerminalOrder: UInt64 = 0
+    private var startupTimeout: Duration = .seconds(300)
 
     public init(
         configuration: MLXConfiguration = MLXConfiguration(),
         environment: [String: String] = ProcessInfo.processInfo.environment,
         capabilityProbe: any MLXCapabilityProbing = MLXToolchainDetector(),
         processFactory: any MLXExecutableProcessFactory = DefaultMLXExecutableProcessFactory(),
-        chatTransport: any MLXChatStreamingTransport = MLXOpenAIChatTransport()
+        chatTransport: any MLXChatStreamingTransport = MLXOpenAIChatTransport(),
+        startupTimeout: Duration = .seconds(300)
     ) {
         self.configuration = configuration
         self.environment = environment
@@ -51,6 +54,7 @@ public actor DefaultMLXModelService: MLXModelService {
         self.processFactory = processFactory
         self.chatTransport = chatTransport
         self.catalogScanner = DefaultMLXModelCatalogScanner()
+        self.startupTimeout = startupTimeout
     }
 
     init(
@@ -110,6 +114,8 @@ public actor DefaultMLXModelService: MLXModelService {
     }
 
     public func listLocalModels() async throws -> [MLXModelRecord] {
+        catalogWaiterCount += 1
+        defer { catalogWaiterCount -= 1 }
         while true {
             try Task.checkCancellation()
             guard !isShuttingDown else { throw MLXError.operationFailed("The MLX service is shutting down.") }
@@ -360,6 +366,11 @@ public actor DefaultMLXModelService: MLXModelService {
         }
         if var entry = servers[id] {
             entry.processTask = monitor
+            let timeout = startupTimeout
+            entry.readinessTask = Task { [weak self] in
+                do { try await Task.sleep(for: timeout) } catch { return }
+                await self?.serverStartupTimedOut(id)
+            }
             servers[id] = entry
         }
         return session
@@ -407,12 +418,13 @@ public actor DefaultMLXModelService: MLXModelService {
         guard let model = await catalog.listLocalModels().first(where: { $0.id == id && $0.source == .appManagedDownload }),
               let repositoryID = model.repositoryID,
               MLXModelCatalog.isDirectChild(model.path, of: configuration.managedModelsDirectory),
-              let manifest = MLXModelCatalog.managedManifest(at: model.path), manifest.complete, manifest.repositoryID == repositoryID,
+              let manifest = MLXModelCatalog.managedManifest(at: model.path), manifest.repositoryID == repositoryID,
               let canonicalRoot = try? configuration.managedModelsDirectory.resolvingSymlinksInPath().resourceValues(forKeys: [.isDirectoryKey]),
               canonicalRoot.isDirectory == true,
               model.path.deletingLastPathComponent().standardizedFileURL.path == configuration.managedModelsDirectory.standardizedFileURL.path else {
             throw MLXError.invalidModelDirectory
         }
+        guard !downloadingRepositories.contains(repositoryID) else { throw MLXError.operationFailed("Cancel this model's download before moving it to Trash.") }
         guard !servers.values.contains(where: { $0.session.modelID == id && [.starting, .running, .stopping].contains($0.session.state) }) else {
             throw MLXError.operationFailed("Stop this model's local server before moving it to Trash.")
         }
@@ -522,13 +534,16 @@ public actor DefaultMLXModelService: MLXModelService {
             if servers[id]?.session.state == .starting,
                compact.localizedCaseInsensitiveContains("Startinghttpdat127.0.0.1onport\(expectedPort)") {
                 updateState(id, state: .running, detail: "Listening on 127.0.0.1:\(expectedPort)")
+                servers[id]?.readinessTask?.cancel()
             }
         case .completed(let result):
             guard let initialState = servers[id]?.session.state, !Self.isTerminal(initialState) else { return }
             if initialState != .stopping { updateState(id, state: .stopping, detail: nil) }
             servers[id]?.readinessTask?.cancel()
             await drainChats(for: id)
-            if servers[id]?.stopRequested == true {
+            if servers[id]?.startupTimedOut == true {
+                finalizeServer(id, state: .failed, detail: "Server startup timed out.")
+            } else if servers[id]?.stopRequested == true {
                 finalizeServer(id, state: .stopped, detail: "Stopped by ContainerDesk.")
             } else if result.succeeded {
                 finalizeServer(id, state: .stopped, detail: "Server exited.")
@@ -545,7 +560,16 @@ public actor DefaultMLXModelService: MLXModelService {
         await execution?.terminateAndWait()
         await drainChats(for: id)
         let state: MLXServerState = servers[id]?.stopRequested == true ? .stopped : .failed
-        finalizeServer(id, state: state, detail: state == .stopped ? "Stopped by ContainerDesk." : "Could not start the local model server.")
+        finalizeServer(id, state: state, detail: servers[id]?.startupTimedOut == true ? "Server startup timed out." : state == .stopped ? "Stopped by ContainerDesk." : "Could not start the local model server.")
+    }
+
+    private func serverStartupTimedOut(_ id: UUID) async {
+        guard let entry = servers[id], entry.session.state == .starting else { return }
+        servers[id]?.startupTimedOut = true
+        updateState(id, state: .stopping, detail: "Server startup timed out.")
+        await entry.execution?.terminateAndWait()
+        await entry.processTask?.value
+        finalizeServer(id, state: .failed, detail: "Server startup timed out.")
     }
 
     private func appendOutput(_ text: String, for id: UUID) {
@@ -574,6 +598,7 @@ public actor DefaultMLXModelService: MLXModelService {
         entry.subscribers.removeAll()
         entry.execution = nil
         entry.processTask = nil
+        entry.readinessTask?.cancel()
         entry.readinessTask = nil
         entry.activeChatTasks.removeAll()
         entry.stopRequested = false
@@ -643,6 +668,7 @@ public actor DefaultMLXModelService: MLXModelService {
         var execution: ManagedProcessExecution?
         var processTask: Task<Void, Never>?
         var readinessTask: Task<Void, Never>?
+        var startupTimedOut = false
         var output: [String] = []
         var subscribers: [UUID: AsyncStream<MLXServerEvent>.Continuation] = [:]
         var activeChatTasks: [UUID: Task<Void, Never>] = [:]

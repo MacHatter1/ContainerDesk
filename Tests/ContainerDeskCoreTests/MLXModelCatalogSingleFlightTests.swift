@@ -21,7 +21,7 @@ struct MLXModelCatalogSingleFlightTests {
         let second = Task { try await service.listLocalModels() }
 
         // Let the actor process the second request while the shared scan is held.
-        try await Task.sleep(for: .milliseconds(25))
+        try await waitForCatalogWaiters(service, count: 2)
         let sameConfigScanCount = scanner.invocationCount()
         #expect(sameConfigScanCount == 1)
         // Release before awaiting either caller so RED failures cannot strand the fake.
@@ -51,9 +51,8 @@ struct MLXModelCatalogSingleFlightTests {
         let cancelledWaiter = Task { try await service.listLocalModels() }
 
         // Give the service actor time to attach the second caller to the held shared scan.
-        try await Task.sleep(for: .milliseconds(25))
+        try await waitForCatalogWaiters(service, count: 2)
         cancelledWaiter.cancel()
-        try await Task.sleep(for: .milliseconds(10))
         scanner.release(configuration)
 
         let survivingModels = try await survivingWaiter.value
@@ -89,7 +88,7 @@ struct MLXModelCatalogSingleFlightTests {
 
         let oldScanWasCancelled = await scanner.waitForCancellation(of: firstConfiguration)
         #expect(oldScanWasCancelled)
-        try await Task.sleep(for: .milliseconds(25))
+        try await waitForCatalogWaiters(service, count: 2)
         #expect(scanner.invocationCount() == 1)
         #expect(scanner.maximumConcurrentScans() == 1)
 
@@ -136,7 +135,7 @@ struct MLXModelCatalogSingleFlightTests {
         let freshCaller = Task { try await service.listLocalModels() }
         let oldScanWasCancelled = await scanner.waitForCancellation(of: configurationA)
         #expect(oldScanWasCancelled)
-        try await Task.sleep(for: .milliseconds(25))
+        try await waitForCatalogWaiters(service, count: 2)
         #expect(scanner.invocationCount() == 1)
         #expect(scanner.maximumConcurrentScans() == 1)
 
@@ -274,4 +273,12 @@ private final class HeldCatalogScanner: MLXModelCatalogScanning, @unchecked Send
 
 private func temporaryDirectory() -> URL {
     FileManager.default.temporaryDirectory.appendingPathComponent("MLXCatalogSingleFlight-\(UUID().uuidString)", isDirectory: true)
+}
+
+private func waitForCatalogWaiters(_ service: DefaultMLXModelService, count: Int) async throws {
+    let deadline = ContinuousClock.now + .seconds(3)
+    while await service.catalogWaiterCount < count {
+        try #require(ContinuousClock.now < deadline, "Catalog callers did not enter the service")
+        try await Task.sleep(for: .milliseconds(2))
+    }
 }

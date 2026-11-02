@@ -15,6 +15,10 @@ MIN_SYSTEM_VERSION="26.0"
 BUILD_CONFIGURATION="${CONTAINERDESK_BUILD_CONFIGURATION:-debug}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+APP_VERSION="${CONTAINERDESK_VERSION:-0.1.0}"
+BUILD_NUMBER="${CONTAINERDESK_BUILD_NUMBER:-$(git rev-list --count HEAD 2>/dev/null || echo 0)}"
+[[ "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "CONTAINERDESK_VERSION must be MAJOR.MINOR.PATCH" >&2; exit 2; }
+[[ "$BUILD_NUMBER" =~ ^[0-9]+$ ]] || { echo "CONTAINERDESK_BUILD_NUMBER must be numeric" >&2; exit 2; }
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
@@ -66,6 +70,8 @@ cat >"$APP_CONTENTS/Info.plist" <<PLIST
 <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
 <key>CFBundleName</key><string>$APP_NAME</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
+<key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
 <key>CFBundleIconFile</key><string>ContainerDesk</string>
 <key>LSMinimumSystemVersion</key><string>$MIN_SYSTEM_VERSION</string>
 <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -82,6 +88,7 @@ for RESOURCE_BUNDLE in "$BUILD_BIN_PATH"/*.bundle; do
   printf '%s\n' "${RESOURCE_BUNDLE##*/}" >> "$RESOURCE_INVENTORY"
 done
 
+/usr/bin/codesign --force --sign - "$APP_BUNDLE"
 "$ROOT_DIR/script/validate_app_bundle.sh" "$APP_BUNDLE"
 
 case "$MODE" in

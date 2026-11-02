@@ -76,6 +76,23 @@ struct TerminalSessionRetentionTests {
         try await wait(host) { releasedSession == nil && !process.running }
     }
 
+    @MainActor @Test func shutdownWaitsForAndKillsAnOwnedTerminalIgnoringTERM() async throws {
+        _ = NativeTestApplication.shared
+        let fixture = try TerminalProcessFixture(ignoresTermination: true)
+        defer { fixture.remove() }
+        let session = ContainerTerminalSession()
+        let host = NSHostingView(rootView: TerminalRetentionHost(visible: true, policy: RuntimeOperationPolicy(), executable: fixture.executable.path, session: session))
+        let window = makeWindow(host)
+        defer { window.contentView = nil; window.close(); session.terminate() }
+        try await wait(host) { fixture.launchCount == 1 }
+        let process = try #require(session.terminalView?.process)
+        let start = ContinuousClock.now
+        await session.shutdown()
+        #expect(!process.running)
+        #expect(session.terminalView == nil)
+        #expect(start.duration(to: .now) < .seconds(3))
+    }
+
     @MainActor private func makeWindow(_ host: NSView) -> NSWindow {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 200), styleMask: .borderless, backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -111,12 +128,14 @@ private struct TerminalProcessFixture {
     let executable: URL
     let marker: URL
 
-    init() throws {
+    init(ignoresTermination: Bool = false) throws {
         folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         executable = folder.appendingPathComponent("container")
         marker = folder.appendingPathComponent("launches")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        try "#!/bin/sh\nprintf x >> '\(marker.path)'\nexec /bin/cat\n".write(to: executable, atomically: true, encoding: .utf8)
+        let setup = ignoresTermination ? "trap '' TERM\n" : ""
+        let command = ignoresTermination ? "exec /bin/sleep 30" : "exec /bin/cat"
+        try "#!/bin/sh\n\(setup)printf x >> '\(marker.path)'\n\(command)\n".write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
     }
 

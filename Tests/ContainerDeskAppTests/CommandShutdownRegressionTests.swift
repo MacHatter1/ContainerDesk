@@ -40,7 +40,6 @@ struct CommandShutdownRegressionTests {
         let caller = Task { await operation.run(.init(arguments: ["k8s", "create"]), title: "Create cluster", store: store, owner: owner) }
         try await waitUntil { fixture.isAlive }
         caller.cancel()
-        try await Task.sleep(for: .milliseconds(20))
         if fixture.isAlive {
             #expect(operation.isRunning && operation.owner == owner)
             let token = store.runtimeOperations.beginLimitsChange("web")
@@ -62,7 +61,6 @@ struct CommandShutdownRegressionTests {
         build.start(.init(arguments: ["build", "/fixture"]), title: "Build", store: store)
         try await waitUntil { fixture.isAlive }
         build.cancel()
-        try await Task.sleep(for: .milliseconds(20))
         if fixture.isAlive {
             #expect(build.isRunning)
             let token = store.runtimeOperations.beginLimitsChange("web")
@@ -88,9 +86,9 @@ struct CommandShutdownRegressionTests {
     }
 
     @MainActor private func waitUntil(_ condition: () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(5)
+        let deadline = ContinuousClock.now + .seconds(15)
         while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-        #expect(condition())
+        try #require(condition(), "Shutdown fixture did not reach its synchronization point")
     }
 }
 

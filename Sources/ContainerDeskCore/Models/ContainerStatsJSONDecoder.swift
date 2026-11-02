@@ -27,13 +27,14 @@ public enum ContainerStatsJSONDecoder {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [Any] else {
             throw DecodeError.unexpectedShape
         }
-        return try root.map { value in
+        return try root.compactMap { value in
             guard let item = value as? [String: Any],
-                  let id = item["id"] as? String,
-                  let cpu = integer(item["cpuUsageUsec"]),
-                  let memory = integer(item["memoryUsageBytes"]) else {
+                  let id = item["id"] as? String else {
                 throw DecodeError.unexpectedShape
             }
+            // Stopped or starting containers may have no counters yet.
+            if item["cpuUsageUsec"] == nil || item["cpuUsageUsec"] is NSNull || item["memoryUsageBytes"] == nil || item["memoryUsageBytes"] is NSNull { return nil }
+            guard let cpu = integer(item["cpuUsageUsec"]), let memory = integer(item["memoryUsageBytes"]) else { throw DecodeError.unexpectedShape }
             return ContainerStatsSample(id: id, cpuUsageUsec: cpu, memoryUsageBytes: memory)
         }
     }

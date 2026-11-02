@@ -4,6 +4,24 @@ import Testing
 @testable import ContainerDeskApp
 
 struct CleanupStoreTests {
+    @MainActor @Test(arguments: [true, false])
+    func aTimedOutDeleteChecksTheInventoryAndStopsTheQueue(removed: Bool) async throws {
+        let first = candidate("sha256:timeout")
+        let next = candidate("sha256:next")
+        let service = StubCleanupService(candidates: [first, next], validation: [:])
+        service.verification[first.id] = [removed ? .removed : .stillPresent("Still present")]
+        let client = RecordingCleanupClient(timedOut: true)
+        let app = AppStore(client: client)
+        let store = CleanupStore(serviceFactory: { _ in service })
+        await store.scan(using: app)
+        await store.remove(selection: [first, next], using: app)
+        let report = try #require(store.removalReport)
+        #expect(report.stopped)
+        #expect(await client.recordedArguments().count == 1)
+        if removed { #expect(report.items.first?.state == .removed) }
+        else if case .unverified = report.items.first?.state {} else { Issue.record("A timed-out delete is uncertain until reconciled.") }
+        #expect(report.items.last?.state == .notAttempted)
+    }
     @MainActor
     @Test func removesOnlyTheReviewedExactCandidateAndRequiresPostCheck() async throws {
         let first = candidate("sha256:exact-one")
@@ -20,7 +38,7 @@ struct CleanupStoreTests {
         #expect(store.removalReport?.items == [CleanupItemResult(candidate: first, state: .removed)])
         #expect(store.scanResult?.candidates.map(\.id) == [first.id, second.id])
         #expect(appStore.operations.first?.canRetry == false)
-        #expect(appStore.operations.first?.canCancel == false)
+        #expect(appStore.operations.first?.canCancel == true)
     }
 
     @MainActor
@@ -52,7 +70,7 @@ struct CleanupStoreTests {
         await store.scan(using: appStore)
 
         let removal = Task { await store.remove(selection: [first, second], using: appStore) }
-        try await Task.sleep(for: .milliseconds(25))
+        try await waitForCleanupCommand(client)
         store.stopAfterCurrent()
         await removal.value
 
@@ -71,7 +89,7 @@ struct CleanupStoreTests {
         await store.scan(using: appStore)
 
         let firstQueue = Task { await store.remove(selection: [first], using: appStore) }
-        try await Task.sleep(for: .milliseconds(15))
+        try await waitForCleanupCommand(client)
         await store.remove(selection: [first], using: appStore)
         await firstQueue.value
 
@@ -90,7 +108,7 @@ struct CleanupStoreTests {
         await store.scan(using: appStore)
 
         let removal = Task { await store.remove(selection: [first, second], using: appStore) }
-        try await Task.sleep(for: .milliseconds(20))
+        try await waitForCleanupCommand(client)
         store.invalidate()
         await removal.value
 
@@ -177,6 +195,24 @@ struct CleanupStoreTests {
         #expect(store.removalReport?.items == [CleanupItemResult(candidate: reviewed, state: .skipped("The reviewed resource changed after this scan."))])
     }
 
+    @MainActor @Test func cancellingTheActiveDeleteStopsTheQueueAndReportsUncertainty() async throws {
+        let first = candidate("sha256:cancelled")
+        let second = candidate("sha256:not-started")
+        let client = RecordingCleanupClient(runDelay: .seconds(30))
+        let app = AppStore(client: client)
+        let service = StubCleanupService(candidates: [first, second], validation: [:])
+        let cleanup = CleanupStore(serviceFactory: { _ in service })
+        await cleanup.scan(using: app)
+        let removal = Task { await cleanup.remove(selection: [first, second], using: app) }
+        try await waitForCleanupCommand(client)
+        app.cancelOperation(try #require(app.operations.first?.id))
+        await removal.value
+        #expect(cleanup.removalReport?.stopped == true)
+        #expect(await client.recordedArguments().count == 1)
+        if case .unverified = cleanup.removalReport?.items.first?.state {} else { Issue.record("Cancelled deletion must report an uncertain result") }
+        #expect(cleanup.removalReport?.items.last?.state == .notAttempted)
+    }
+
     private func candidate(_ id: String) -> CleanupCandidate {
         CleanupCandidate(
             category: .images,
@@ -244,10 +280,12 @@ private actor RecordingCleanupClient: ContainerClient {
     private var arguments: [[String]] = []
     private let failingOperands: Set<String>
     private let runDelay: Duration
+    private let timedOut: Bool
 
-    init(failingOperands: Set<String> = [], runDelay: Duration = .zero) {
+    init(failingOperands: Set<String> = [], runDelay: Duration = .zero, timedOut: Bool = false) {
         self.failingOperands = failingOperands
         self.runDelay = runDelay
+        self.timedOut = timedOut
     }
 
     func recordedArguments() -> [[String]] { arguments }
@@ -262,11 +300,20 @@ private actor RecordingCleanupClient: ContainerClient {
             standardError: failed ? "failed" : "",
             exitCode: failed ? 1 : 0,
             terminationReason: .exit,
-            duration: .zero
+            duration: .zero,
+            timedOut: timedOut
         )
     }
 
     nonisolated func stream(_ request: CommandRequest) -> AsyncThrowingStream<CommandEvent, Error> {
         AsyncThrowingStream { $0.finish() }
+    }
+}
+
+private func waitForCleanupCommand(_ client: RecordingCleanupClient) async throws {
+    let deadline = ContinuousClock.now + .seconds(3)
+    while await client.recordedArguments().isEmpty {
+        try #require(ContinuousClock.now < deadline, "Cleanup did not start its command")
+        try await Task.sleep(for: .milliseconds(2))
     }
 }

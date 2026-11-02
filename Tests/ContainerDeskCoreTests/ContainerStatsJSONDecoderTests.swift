@@ -10,10 +10,8 @@ struct ContainerStatsJSONDecoderTests {
         ])
     }
 
-    @Test func rejectsIncompleteStatsInsteadOfShowingZero() {
-        #expect(throws: ContainerStatsJSONDecoder.DecodeError.self) {
-            try ContainerStatsJSONDecoder.samples(from: Data(#"[{"id":"fixture-container","memoryUsageBytes":4096}]"#.utf8))
-        }
+    @Test func omitsIncompleteStatsInsteadOfShowingZero() throws {
+        #expect(try ContainerStatsJSONDecoder.samples(from: Data(#"[{"id":"fixture-container","memoryUsageBytes":4096}]"#.utf8)).isEmpty)
         #expect(throws: ContainerStatsJSONDecoder.DecodeError.self) {
             try ContainerStatsJSONDecoder.samples(from: Data(#"{"notStats":[]}"#.utf8))
         }
