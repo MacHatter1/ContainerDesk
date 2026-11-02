@@ -85,7 +85,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          swift test --configuration release --force-resolved-versions --xunit-output test-results.xml 2>&1 | tee test-results.log
+          # AppKit fixtures share one application/main actor in this toolchain.
+          # Keep test cases serial; concurrency within each test is still exercised.
+          swift test --configuration release --no-parallel --force-resolved-versions --xunit-output test-results.xml 2>&1 | tee test-results.log
           test -s test-results-swift-testing.xml || { echo "Swift Testing report is missing or empty." >&2; exit 1; }
 
       - name: Upload test results

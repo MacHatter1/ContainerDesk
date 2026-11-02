@@ -4,6 +4,8 @@ The `CI / Lint workflows and scripts` job checks workflows with actionlint and s
 
 Test artifacts include the console log and XML reports. SwiftPM adds `-swift-testing` to the report filename when both testing libraries are enabled; the upload includes that report, and a successful test command must produce it. The build records its actual SwiftPM resource bundle inventory so validation also works after extracting a release archive.
 
+CI and release validation pass `--no-parallel` to run test cases serially. The Xcode 26.6 test runner combines the app and core suites in one process, where AppKit fixtures share application state and the main actor. Serial scheduling prevents unrelated UI work from consuming another test's setup deadline. Tests still exercise their own concurrent callers, tasks and subprocesses.
+
 Required status checks are configured in the repository’s branch protection, not by workflow files. `main` requires **Test and build** and **Lint workflows and scripts** from GitHub Actions, including for administrators. The live integration workflow is not required. Pull requests exercise both required checks; pushes to `main` also run CI after merging.
 
 ## Dedicated live runner

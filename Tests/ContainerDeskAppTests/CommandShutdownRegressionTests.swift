@@ -86,9 +86,9 @@ struct CommandShutdownRegressionTests {
     }
 
     @MainActor private func waitUntil(_ condition: () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(5)
+        let deadline = ContinuousClock.now + .seconds(15)
         while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-        #expect(condition())
+        try #require(condition(), "Shutdown fixture did not reach its synchronization point")
     }
 }
 
