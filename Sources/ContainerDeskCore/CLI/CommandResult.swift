@@ -36,12 +36,14 @@ public enum ContainerClientError: Error, LocalizedError, Sendable {
     case executableNotFound
     case launchFailed(String)
     case outputBufferExceeded
+    case shuttingDown
 
     public var errorDescription: String? {
         switch self {
         case .executableNotFound: "The container CLI could not be found. Set its path in Settings."
         case .launchFailed(let message): message
         case .outputBufferExceeded: "Command output exceeded the streaming buffer. The command was stopped to avoid losing output."
+        case .shuttingDown: "ContainerDesk is shutting down. New commands cannot start."
         }
     }
 }

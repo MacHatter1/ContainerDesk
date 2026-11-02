@@ -26,9 +26,29 @@ public struct ProcessContainerClient: ContainerClient {
 /// Unlike `ProcessContainerClient`, this client never searches for or invokes the Apple container CLI.
 public struct ProcessExecutableClient: ContainerClient {
     public let executableURL: URL
+    private let registry: ProcessRegistry
 
     public init(executableURL: URL) {
         self.executableURL = executableURL.standardizedFileURL
+        registry = .shared
+    }
+
+    init(executableURL: URL, registry: ProcessRegistry) {
+        self.executableURL = executableURL.standardizedFileURL
+        self.registry = registry
+    }
+
+    /// Permanently closes process admission for this app instance before Quit
+    /// cancels owners and drains helpers. Does not interrupt an active limits wait.
+    public static func beginApplicationShutdown() { ProcessRegistry.shared.beginShutdown() }
+
+    /// Drains existing helpers. Application Quit closes admission first so no
+    /// asynchronous completion callback can add a helper after this snapshot.
+    public static func shutdownAll() async {
+        let jobs = ProcessRegistry.shared.snapshot()
+        await withTaskGroup(of: Void.self) { group in
+            for job in jobs { group.addTask { await job.terminateAndWait() } }
+        }
     }
 
     public func run(_ request: CommandRequest) async throws -> CommandResult {
@@ -45,7 +65,7 @@ public struct ProcessExecutableClient: ContainerClient {
     public func launch(_ request: CommandRequest) throws -> ManagedProcessExecution {
         guard FileManager.default.isExecutableFile(atPath: executableURL.path) else { throw ContainerClientError.executableNotFound }
         let (stream, continuation) = AsyncThrowingStream<CommandEvent, Error>.makeStream(bufferingPolicy: .bufferingOldest(256))
-        let job = ProcessJob(executable: executableURL, request: request, continuation: continuation)
+        let job = ProcessJob(executable: executableURL, request: request, continuation: continuation, registry: registry)
         continuation.onTermination = { @Sendable _ in job.cancel() }
         do { try job.launch() }
         catch { continuation.finish(throwing: ContainerClientError.launchFailed(request.redact(error.localizedDescription))); throw error }
@@ -87,10 +107,30 @@ private extension ManagedProcessExecution {
     }
 }
 
-private final class ProcessJob: @unchecked Sendable {
+final class ProcessRegistry: @unchecked Sendable {
+    static let shared = ProcessRegistry()
+    private let lock = NSLock()
+    private var jobs: [ObjectIdentifier: ProcessJob] = [:]
+    private var acceptingJobs = true
+
+    func beginShutdown() {
+        // A launch holds the same lock through admission, spawn and registration.
+        // Closing admission therefore also waits for an already-starting job.
+        ProcessDescriptorLock.withLock { lock.withLock { acceptingJobs = false } }
+    }
+    fileprivate func checkAdmission() throws {
+        guard lock.withLock({ acceptingJobs }) else { throw ContainerClientError.shuttingDown }
+    }
+    fileprivate func add(_ job: ProcessJob) { lock.withLock { jobs[ObjectIdentifier(job)] = job } }
+    fileprivate func remove(_ job: ProcessJob) { _ = lock.withLock { jobs.removeValue(forKey: ObjectIdentifier(job)) } }
+    fileprivate func snapshot() -> [ProcessJob] { lock.withLock { Array(jobs.values) } }
+}
+
+fileprivate final class ProcessJob: @unchecked Sendable {
     private let lock = NSLock()
     private let request: CommandRequest
     private let continuation: AsyncThrowingStream<CommandEvent, Error>.Continuation
+    private let registry: ProcessRegistry
     private let start = ContinuousClock.now
     private var pid: pid_t = 0
     private var stdoutFD: Int32 = -1
@@ -104,14 +144,17 @@ private final class ProcessJob: @unchecked Sendable {
     private var streamBufferExceeded = false
     private var leaderExited = false
     private var timedOut = false
+    private var drainDeadline: ContinuousClock.Instant?
     private var timeoutTask: Task<Void, Never>?
+    private var outputReaders: [ProcessOutputReader] = []
     private let completionGroup = DispatchGroup()
     private let finishedGroup = DispatchGroup()
 
-    init(executable: URL, request: CommandRequest, continuation: AsyncThrowingStream<CommandEvent, Error>.Continuation) {
+    init(executable: URL, request: CommandRequest, continuation: AsyncThrowingStream<CommandEvent, Error>.Continuation, registry: ProcessRegistry) {
         self.executable = executable
         self.request = request
         self.continuation = continuation
+        self.registry = registry
         finishedGroup.enter()
     }
 
@@ -122,6 +165,7 @@ private final class ProcessJob: @unchecked Sendable {
     }
 
     private func launchWhileProtectingDescriptors() throws {
+        try registry.checkAdmission()
         var outPipe: [Int32] = [-1, -1]
         var errPipe: [Int32] = [-1, -1]
         var inputPipe: [Int32] = [-1, -1]
@@ -130,14 +174,14 @@ private final class ProcessJob: @unchecked Sendable {
             closeIfOpen(outPipe[0]); closeIfOpen(outPipe[1])
             throw POSIXLaunchError(errno: errno)
         }
-        do { try setCloseOnExec(outPipe) }
+        do { try setCloseOnExec(outPipe); try setNonBlocking(outPipe[0]) }
         catch { closeAll(outPipe); throw error }
         let errPipeError = pipe(&errPipe)
         guard errPipeError == 0 else {
             closeIfOpen(outPipe[0]); closeIfOpen(outPipe[1]); closeIfOpen(errPipe[0]); closeIfOpen(errPipe[1])
             throw POSIXLaunchError(errno: errno)
         }
-        do { try setCloseOnExec(errPipe) }
+        do { try setCloseOnExec(errPipe); try setNonBlocking(errPipe[0]) }
         catch { closeAll(outPipe + errPipe); throw error }
         if request.stdin != nil, socketpair(AF_UNIX, SOCK_STREAM, 0, &inputPipe) != 0 {
             closeIfOpen(outPipe[0]); closeIfOpen(outPipe[1]); closeIfOpen(errPipe[0]); closeIfOpen(errPipe[1])
@@ -148,6 +192,12 @@ private final class ProcessJob: @unchecked Sendable {
             catch { closeAll(outPipe + errPipe + inputPipe); throw error }
             var noSigPipe: Int32 = 1
             guard setsockopt(inputPipe[1], SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+                let issue = errno
+                closeAll(outPipe + errPipe + inputPipe)
+                throw POSIXLaunchError(errno: issue)
+            }
+            let flags = fcntl(inputPipe[1], F_GETFL)
+            guard flags >= 0, fcntl(inputPipe[1], F_SETFL, flags | O_NONBLOCK) == 0 else {
                 let issue = errno
                 closeAll(outPipe + errPipe + inputPipe)
                 throw POSIXLaunchError(errno: issue)
@@ -261,52 +311,49 @@ private final class ProcessJob: @unchecked Sendable {
         lock.lock()
         pid = childPID; stdoutFD = outPipe[0]; stderrFD = errPipe[0]; stdinFD = inputPipe[1]
         lock.unlock()
+        registry.add(self)
 
         let readOutFD = outPipe[0]
         let readErrFD = errPipe[0]
         let spawnedPID = childPID
-        // Pipe reads and waitpid intentionally block until this child progresses. Give
-        // each one a dedicated thread so quiet commands cannot occupy the shared GCD pool.
-        completionGroup.enter()
-        Thread.detachNewThread { [self] in drain(fd: readOutFD, isError: false); completionGroup.leave() }
-        completionGroup.enter()
-        Thread.detachNewThread { [self] in drain(fd: readErrFD, isError: true); completionGroup.leave() }
+        // Readiness sources sleep while pipes are quiet. Only waitpid needs a thread.
+        let readers = [(readOutFD, false), (readErrFD, true)].map { fd, isError in
+            completionGroup.enter()
+            return ProcessOutputReader(fd: fd, redactions: request.redactions, receive: { [weak self] in
+                self?.receive($0, isError: isError)
+            }, completed: { [weak self] truncated in
+                guard let self else { return }
+                lock.withLock {
+                    if isError { stderrTruncated = stderrTruncated || truncated }
+                    else { stdoutTruncated = stdoutTruncated || truncated }
+                }
+                completionGroup.leave()
+            })
+        }
+        lock.withLock { outputReaders = readers }
+        readers.forEach { $0.start() }
         completionGroup.enter()
         Thread.detachNewThread { [self] in reap(spawnedPID); completionGroup.leave() }
-        completionGroup.notify(queue: .global(qos: .utility)) { [self] in complete() }
-
         if let input = request.stdin {
             let fd = inputPipe[1]
-            Thread.detachNewThread { [weak self] in
-                writeAll(input, to: fd)
+            completionGroup.enter()
+            Thread.detachNewThread { [self] in
+                writeAll(input, to: fd, cancelled: { self.lock.withLock { self.drainDeadline != nil } })
                 closeIfOpen(fd)
-                self?.lock.lock(); self?.stdinFD = -1; self?.lock.unlock()
+                lock.withLock { stdinFD = -1 }
+                completionGroup.leave()
             }
         }
         if let timeout = request.timeout {
-            timeoutTask = Task { [weak self] in
+            let timer = Task { [weak self] in
                 try? await Task.sleep(for: timeout)
                 guard !Task.isCancelled else { return }
                 self?.cancel(isTimeout: true)
             }
+            lock.withLock { timeoutTask = timer }
         }
-    }
-
-    private func drain(fd: Int32, isError: Bool) {
-        var redactor = StreamRedactor(secrets: request.redactions)
-        var buffer = [UInt8](repeating: 0, count: 4_096)
-        while true {
-            let count = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
-            if count == 0 { break }
-            if count < 0 {
-                if errno == EINTR { continue }
-                break
-            }
-            let data = Data(buffer.prefix(count))
-            if let safeText = redactor.feed(data), !safeText.isEmpty { receive(safeText, isError: isError) }
-        }
-        if let safeText = redactor.finish(), !safeText.isEmpty { receive(safeText, isError: isError) }
-        closeIfOpen(fd)
+        // Publish the timer before completion can run, even for an immediate exit.
+        completionGroup.notify(queue: .global(qos: .utility)) { [self] in complete() }
     }
 
     private func receive(_ text: String, isError: Bool) {
@@ -331,12 +378,17 @@ private final class ProcessJob: @unchecked Sendable {
     private func reap(_ childPID: pid_t) {
         var status: Int32 = 0
         while waitpid(childPID, &status, 0) < 0 && errno == EINTR {}
-        lock.lock(); waitStatus = status; leaderExited = true; lock.unlock()
+        lock.withLock {
+            waitStatus = status; leaderExited = true
+            if drainDeadline == nil { drainDeadline = .now.advanced(by: .seconds(1)) }
+        }
+        finishOutputAfterGracePeriod()
     }
 
     private var waitStatus: Int32 = 0
 
     private func complete() {
+        defer { registry.remove(self) }
         lock.lock()
         guard !finished else { lock.unlock(); return }
         finished = true
@@ -346,8 +398,10 @@ private final class ProcessJob: @unchecked Sendable {
         let status = waitStatus
         let didTimeout = timedOut
         let didOverflow = streamBufferExceeded
+        let timer = timeoutTask
+        timeoutTask = nil
         lock.unlock()
-        timeoutTask?.cancel()
+        timer?.cancel()
         if didOverflow {
             continuation.finish(throwing: ContainerClientError.outputBufferExceeded)
             finishedGroup.leave()
@@ -366,17 +420,24 @@ private final class ProcessJob: @unchecked Sendable {
 
     func cancel(isTimeout: Bool = false) {
         lock.lock()
-        let shouldTerminate = !finished && pid > 0
+        guard !finished, pid > 0 else { lock.unlock(); return }
+        if isTimeout && leaderExited { lock.unlock(); return }
         let ownedGroup = pid
         timedOut = timedOut || isTimeout
+        if drainDeadline == nil { drainDeadline = .now.advanced(by: .seconds(1)) }
         lock.unlock()
-        guard shouldTerminate else { return }
+        finishOutputAfterGracePeriod()
         _ = kill(-ownedGroup, SIGTERM)
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             self.lock.lock(); let shouldKill = !self.finished && self.pid == ownedGroup; self.lock.unlock()
             if shouldKill { _ = kill(-ownedGroup, SIGKILL) }
         }
+    }
+
+    private func finishOutputAfterGracePeriod() {
+        let readers = lock.withLock { outputReaders }
+        readers.forEach { $0.finishAfterGracePeriod() }
     }
 
     func terminateAndWait() async {
@@ -392,6 +453,66 @@ private final class ProcessJob: @unchecked Sendable {
     }
 
     private func closeAll(_ descriptors: [Int32]) { descriptors.forEach(closeIfOpen) }
+}
+
+/// All mutable reader state belongs to its serial queue. A single delayed close bounds
+/// inherited pipes after leader exit/cancellation; there are no periodic read wakeups.
+private final class ProcessOutputReader: @unchecked Sendable {
+    private let fd: Int32
+    private let queue = DispatchQueue(label: "ContainerDesk.process-output", qos: .utility)
+    private let source: DispatchSourceRead
+    private let receive: @Sendable (String) -> Void
+    private let completed: @Sendable (Bool) -> Void
+    private var redactor: StreamRedactor
+    private var finished = false
+    private var deadlineScheduled = false
+
+    init(fd: Int32, redactions: [String], receive: @escaping @Sendable (String) -> Void, completed: @escaping @Sendable (Bool) -> Void) {
+        self.fd = fd; self.receive = receive; self.completed = completed
+        redactor = StreamRedactor(secrets: redactions)
+        source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+    }
+
+    func start() {
+        source.setEventHandler { [self] in drainAvailable() }
+        source.resume()
+    }
+
+    func finishAfterGracePeriod() {
+        queue.async { [self] in
+            guard !finished, !deadlineScheduled else { return }
+            deadlineScheduled = true
+            queue.asyncAfter(deadline: .now() + 1) { [self] in
+                drainAvailable()
+                finish(truncated: true)
+            }
+        }
+    }
+
+    private func drainAvailable() {
+        guard !finished else { return }
+        var buffer = [UInt8](repeating: 0, count: 4_096)
+        // Yield after a bounded burst so a continuous writer cannot starve the deadline.
+        for _ in 0..<64 {
+            let count = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+            if count == 0 { finish(truncated: false); return }
+            if count < 0 {
+                if errno == EINTR { continue }
+                if errno != EAGAIN && errno != EWOULDBLOCK { finish(truncated: true) }
+                return
+            }
+            if let text = redactor.feed(Data(buffer.prefix(count))), !text.isEmpty { receive(text) }
+        }
+    }
+
+    private func finish(truncated: Bool) {
+        guard !finished else { return }
+        finished = true
+        if let text = redactor.finish(), !text.isEmpty { receive(text) }
+        source.setEventHandler {}
+        source.setCancelHandler { [fd, completed] in closeIfOpen(fd); completed(truncated) }
+        source.cancel()
+    }
 }
 
 private struct POSIXLaunchError: Error, LocalizedError {
@@ -412,7 +533,12 @@ private func setCloseOnExec(_ descriptors: [Int32]) throws {
     }
 }
 
-private func writeAll(_ data: Data, to fd: Int32) {
+private func setNonBlocking(_ fd: Int32) throws {
+    let flags = fcntl(fd, F_GETFL)
+    guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else { throw POSIXLaunchError(errno: errno) }
+}
+
+private func writeAll(_ data: Data, to fd: Int32, cancelled: () -> Bool) {
     // Block SIGPIPE only on this writer thread so an early-closing child cannot terminate the app.
     var pipeSignal = sigset_t()
     sigemptyset(&pipeSignal)
@@ -433,9 +559,14 @@ private func writeAll(_ data: Data, to fd: Int32) {
         guard let base = raw.baseAddress else { return }
         var offset = 0
         while offset < raw.count {
+            if cancelled() { break }
             let written = write(fd, base.advanced(by: offset), raw.count - offset)
             if written > 0 { offset += written }
             else if written < 0 && errno == EINTR { continue }
+            else if written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                _ = poll(&descriptor, 1, 50)
+            }
             else { break }
         }
     }

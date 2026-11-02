@@ -63,7 +63,7 @@ Measure sidebar navigation in the debug app with:
 The benchmark drives the sidebar's selection binding through Images, Containers,
 Activity, Cleanup, and System. It warms the destinations, measures three further
 cycles without accessibility inspection or screenshots, and fails if any warm
-switch takes 500 ms or longer. Results are saved to the ignored
+switch takes 200 ms or longer. Results are saved to the ignored
 `output/navigation-benchmark.json`; set `CONTAINERDESK_NAVIGATION_REPORT` to use
 another absolute output path. The metric ends when the main run loop settles
 after the destination updates; it does not measure physical display presentation
@@ -81,7 +81,7 @@ ContainerDesk is a SwiftPM package with two modules:
 | [`ContainerDeskApp`](../Sources/ContainerDeskApp) | The SwiftUI app: stores, feature screens, and the [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)-based container terminal |
 
 - **Reads are hybrid.** When the installed CLI and API server are verified as matching 1.5.x, container, volume and network lists, plus container inspect and live stats, use Apple’s native API through [`apple/container`](https://github.com/apple/container) and [`apple/containerization`](https://github.com/apple/containerization). Images, registries and machines are read through the CLI, and any failed native read falls back to the CLI. Selecting a CLI path in Settings disables native reads.
-- **Changes go through the CLI.** Actions, builds, plugins and terminals run the `container` executable directly, as argv arrays with no shell expansion. The one exception is **Edit Limits**, a separate native stop/backup/delete/create/start transaction gated to exactly 1.5.0.
+- **Changes go through the CLI.** Actions, builds, plugins and terminals run the `container` executable directly, as argv arrays with no shell expansion. Privileged DNS uses a validated, quoted administrator script. **Edit Limits** uses a separate native stop/backup/delete/create/start transaction gated to exactly 1.5.0.
 - **The app never starts or stops the runtime on its own.** Service start and stop are explicit controls on the System screen.
 
 For the exact installed CLI map, important plugin limits, sensitive-data handling and verification status, see [docs/CAPABILITIES.md](CAPABILITIES.md).

@@ -12,7 +12,7 @@ final class BuildOperationStore {
     @ObservationIgnored private weak var appStore: AppStore?
 
     func start(_ request: CommandRequest, title: String, store: AppStore, onCompletion: @escaping @MainActor (Bool) async -> Void = { _ in }) {
-        guard !isRunning else { return }
+        guard !isRunning, !store.isShuttingDown else { return }
         isRunning = true
         output = ""
         error = nil
@@ -21,6 +21,7 @@ final class BuildOperationStore {
         operationID = operation.operationID
         task = Task { [weak self] in
             guard let self else { return }
+            defer { isRunning = false; operationID = nil; task = nil }
             var succeeded = false
             var sawCompletion = false
             do {
@@ -41,9 +42,6 @@ final class BuildOperationStore {
             let cancelled = Task.isCancelled || store.operations.first(where: { $0.id == operation.operationID })?.state == .cancelled
             if cancelled { succeeded = false; error = nil }
             else if !sawCompletion, error == nil { error = "The command stream ended before completion." }
-            isRunning = false
-            operationID = nil
-            task = nil
             await onCompletion(succeeded)
         }
     }
@@ -52,6 +50,12 @@ final class BuildOperationStore {
         guard let operationID else { return }
         appStore?.cancelOperation(operationID)
         task?.cancel()
+    }
+
+    func shutdown() async {
+        let worker = task
+        cancel()
+        await worker?.value
     }
 
     private func append(_ chunk: String) {

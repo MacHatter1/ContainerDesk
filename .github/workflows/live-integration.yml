@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: Check out reviewed main
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
@@ -78,10 +78,16 @@ jobs:
         run: |
           set -euo pipefail
           CONTAINERDESK_LIVE_READ_CHECK=1 swift test --configuration release --force-resolved-versions --filter HybridLiveReadTests --xunit-output live-hybrid.xml
+          python3 script/require_test_results.py live-hybrid-swift-testing.xml
           CONTAINERDESK_CLEANUP_LIVE_READ_CHECK=1 swift test --configuration release --force-resolved-versions --filter CleanupLiveReadTests --xunit-output live-cleanup.xml
+          python3 script/require_test_results.py live-cleanup-swift-testing.xml
 
       - name: Run live profile check
-        run: CONTAINERDESK_PROFILES_LIVE_CHECK=1 swift test --configuration release --force-resolved-versions --filter EnvironmentProfilesLiveTests --xunit-output live-profiles.xml
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONTAINERDESK_PROFILES_LIVE_CHECK=1 swift test --configuration release --force-resolved-versions --filter EnvironmentProfilesLiveTests --xunit-output live-profiles.xml
+          python3 script/require_test_results.py live-profiles-swift-testing.xml
 
       - name: Run runtime smoke checks
         timeout-minutes: 20
@@ -95,11 +101,15 @@ jobs:
       - name: Run live MLX check
         if: inputs.mlx
         timeout-minutes: 20
-        run: CONTAINERDESK_MLX_LIVE_CHECK=1 swift test --configuration release --force-resolved-versions --filter MLXLiveTests --xunit-output live-mlx.xml
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONTAINERDESK_MLX_LIVE_CHECK=1 swift test --configuration release --force-resolved-versions --filter MLXLiveTests --xunit-output live-mlx.xml
+          python3 script/require_test_results.py live-mlx-swift-testing.xml
 
       - name: Upload live test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: live-test-results
           path: live-*.xml

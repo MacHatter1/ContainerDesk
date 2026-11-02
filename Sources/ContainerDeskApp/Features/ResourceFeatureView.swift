@@ -133,7 +133,7 @@ struct ResourceFeatureView: View {
     private var detailPaneContainer: some View {
         VStack(spacing: 0) {
             if let selected {
-                ResourceDetailPane(resource: selected, section: section, tab: $state.detailTab, transientText: $state.transientText, store: store, limitsOperationInProgress: store.limitsOperationContainerID == selected.id, activation: activation, operationState: operationState(for: selected.id), actionsUnavailable: mutationsUnavailable, detailState: state.detailState, terminalSession: state.terminalSession) { presentNotice($0) } action: { kind in
+                ResourceDetailPane(resource: selected, section: section, tab: $state.detailTab, transientText: $state.transientText, store: store, limitsOperationInProgress: store.limitsOperationContainerID == selected.id, activation: activation, operationState: operationState(for: selected.id), actionsUnavailable: mutationsUnavailable, detailState: state.detailState, terminalSession: state.terminalSession, currentResourceID: { self.selected?.id }) { presentNotice($0) } action: { kind in
                     requestAction(kind, for: selected)
                 } onRun: { image in
                     state.initialImage = image
@@ -386,7 +386,7 @@ struct ResourceFeatureView: View {
     private func resourceActionControls(searchWidth: CGFloat, compact: Bool) -> some View {
         HStack(spacing: 8) {
             Button { Task { await store.refresh(section, force: true) } } label: { Image(systemName: "arrow.clockwise") }
-                .help("Refresh \(section.title)")
+                .help("Refresh \(section.title)").accessibilityLabel("Refresh \(section.title)")
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                 TextField("Search", text: $state.query).textFieldStyle(.plain).frame(width: searchWidth)
@@ -398,7 +398,7 @@ struct ResourceFeatureView: View {
                     if compact { Image(systemName: "square.stack") }
                     else { Label("Profiles", systemImage: "square.stack") }
                 }
-                .help("Manage reusable environment profiles")
+                .help("Manage reusable environment profiles").accessibilityLabel("Manage environment profiles")
             }
             Menu {
                 ForEach(secondaryActions, id: \.title) { action in
@@ -434,13 +434,13 @@ struct ResourceFeatureView: View {
                 }
                 if supportsAdvanced { Button("Advanced CLI Command…", systemImage: "terminal") { state.showingAdvanced = true } }
             } label: { Image(systemName: "ellipsis.circle") }
-                .help("More actions")
+                .help("More actions").accessibilityLabel("More resource actions")
             Button { state.showingCreate = true } label: {
                 Label(compact ? "Create" : primaryActionTitle, systemImage: primaryActionSymbol)
                     .fontWeight(.semibold)
             }
             .buttonStyle(.borderedProminent)
-            .keyboardShortcut("n", modifiers: .command)
+            .keyboardShortcut("n", modifiers: [.command, .shift])
             .help(primaryActionTitle)
         }
     }
@@ -483,7 +483,7 @@ struct ResourceFeatureView: View {
                     .help(store.resourceReadFallbackReasons[section] ?? "\(section.title) list source")
             }
             Spacer()
-            if let fetchedAt = snapshot.fetchedAt { Text("Updated \(fetchedAt, style: .time)").foregroundStyle(.tertiary) }
+            ResourceUpdatedLabel(store: store, section: section, fallback: snapshot.fetchedAt)
         }
         .font(.caption).padding(.horizontal, 16).padding(.vertical, 8).background(.bar)
     }
@@ -687,6 +687,19 @@ struct ResourceFeatureView: View {
         case .registries: [.init("Log Out…", "rectangle.portrait.and.arrow.right", .logout)]
         case .machines: [.init("Set Default…", "star", .setDefault)]
         default: []
+        }
+    }
+}
+
+/// Only this leaf observes the timestamp that changes on otherwise identical polls.
+struct ResourceUpdatedLabel: View {
+    let store: AppStore
+    let section: ContainerSection
+    let fallback: Date?
+
+    var body: some View {
+        if let fetchedAt = store.resourceUpdatedAt[section] ?? fallback {
+            Text("Updated \(fetchedAt, style: .time)").foregroundStyle(.tertiary)
         }
     }
 }

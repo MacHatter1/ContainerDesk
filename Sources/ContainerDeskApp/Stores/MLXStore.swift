@@ -251,10 +251,13 @@ final class MLXStore {
                             await refresh()
                         }
                     }
+                    try Task.checkCancellation()
                 } catch is CancellationError {
                     Self.appendBounded("Download cancelled.\n", to: &downloadOutput, limit: Self.outputLimit)
+                    if !isShuttingDown { await refresh() }
                 } catch {
                     downloadError = error.localizedDescription
+                    if !isShuttingDown { await refresh() }
                 }
             }
         } catch {

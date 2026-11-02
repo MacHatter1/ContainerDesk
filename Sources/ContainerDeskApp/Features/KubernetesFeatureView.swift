@@ -24,7 +24,7 @@ struct KubernetesFeatureView: View {
     @State private var showLoadImage = false
     @State private var showWriteConfig = false
     @State private var confirmWriteConfig = false
-    @State private var selectedNames = Set<String>()
+    @State private var selectedName: String?
     @State private var clusterName = "k8s-dev"
     @State private var image = ""
     @State private var nodeImage = "docker.io/kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95"
@@ -44,6 +44,7 @@ struct KubernetesFeatureView: View {
             WorkspaceHeader(title: "Local Kubernetes", subtitle: "Experimental Kubernetes plugin · single-node clusters", symbol: "shippingbox.and.arrow.backward.fill", tint: .cyan) {
                 Button("Refresh", systemImage: "arrow.clockwise") { Task { await refreshList() } }.disabled(busy)
             }
+            PluginLibraryRecoveryNotice(library: store.pluginLibrary, kind: .kubernetes)
             HStack {
                 TextField("Cluster name for actions", text: $clusterName, prompt: Text("k8s-dev"))
                     .frame(maxWidth: 300)
@@ -86,7 +87,7 @@ struct KubernetesFeatureView: View {
                         FeatureEmptyState(title: "No remembered names", message: "Create a cluster in this app or enter a name for an action.", symbol: "list.bullet.rectangle")
                             .frame(height: 130)
                     } else {
-                        Table(rememberedNames.map(RememberedCluster.init), selection: $selectedNames) {
+                        Table(rememberedNames.map(RememberedCluster.init), selection: $selectedName) {
                             TableColumn("Cluster name") { cluster in Text(cluster.name).font(.body.weight(.medium)) }
                             TableColumn("Record") { _ in Text("Remembered reference").foregroundStyle(.secondary) }
                         }
@@ -102,7 +103,7 @@ struct KubernetesFeatureView: View {
                 }
                 .padding(.horizontal, 16)
             }
-            HStack { Label(busy ? "Working…" : "App quit leaves clusters running", systemImage: busy ? "hourglass" : "power") ; Spacer(); if busy, operation.owner == owner { Button("Cancel", role: .destructive) { cancelOperation() } }; if !output.isEmpty { Button("Clear Output") { operation.clearOutput(); inputError = nil }.disabled(busy) } }
+            HStack { Label(busy ? "Working…" : "App quit leaves clusters running", systemImage: busy ? "hourglass" : "power") ; Spacer(); if busy { Button("Cancel", role: .destructive) { cancelOperation() } }; if !output.isEmpty { Button("Clear Output") { operation.clearOutput(); inputError = nil }.disabled(busy) } }
                 .font(.caption).foregroundStyle(.secondary).padding(10).background(.bar)
                 .animation(ContainerDeskMotion.animation(reduceMotion: reduceMotion), value: busy)
         }
@@ -121,8 +122,10 @@ struct KubernetesFeatureView: View {
             Button("Cancel", role: .cancel) { }
         } message: { Text("This stops and removes the cluster container and removes its context from ~/.kube/config.") }
         .task { await refreshList() }
-        .onDisappear { actionTask?.cancel(); actionTask = nil; actionID = nil; operation.cancel(owner: owner) }
-        .onChange(of: selectedNames) { _, newValue in if let name = newValue.first { clusterName = name } }
+        .onChange(of: selectedName) { _, name in if let name { clusterName = name } }
+        .onChange(of: clusterName) { _, name in
+            if name != selectedName { selectedName = nil }
+        }
     }
 
     @State private var showCreateConfirmation = false
@@ -145,7 +148,7 @@ struct KubernetesFeatureView: View {
             .formStyle(.grouped).navigationTitle("Create Kubernetes Cluster")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showCreate = false } }
-                ToolbarItem(placement: .confirmationAction) { Button("Create") { showCreate = false; showCreateConfirmation = true }.buttonStyle(.borderedProminent).disabled(busy || clusterName.isEmpty) }
+                ToolbarItem(placement: .confirmationAction) { Button("Create") { showCreate = false; showCreateConfirmation = true }.buttonStyle(.borderedProminent).disabled(busy || clusterName.trimmedFormValue.isEmpty) }
             }
         }.frame(minWidth: 480, minHeight: 360)
     }
@@ -158,11 +161,12 @@ struct KubernetesFeatureView: View {
                     TextField("Local image reference", text: $image, prompt: Text("my-app:latest"))
                     TextField("Platform (optional)", text: $platform, prompt: Text("linux/arm64"))
                 }
+                if let error { Section { InlineNotice(message: error, kind: .error) } }
                 Section { Text("The image is imported into the selected cluster’s containerd store in the `k8s.io` namespace.").font(.caption).foregroundStyle(.secondary) }
             }.formStyle(.grouped).navigationTitle("Load Local Image")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showLoadImage = false } }
-                ToolbarItem(placement: .confirmationAction) { Button("Load Image") { launch { await loadImage() } }.buttonStyle(.borderedProminent).disabled(busy || image.isEmpty || clusterName.isEmpty) }
+                ToolbarItem(placement: .confirmationAction) { Button("Load Image") { launch { await loadImage() } }.buttonStyle(.borderedProminent).disabled(busy || image.trimmedFormValue.isEmpty || clusterName.trimmedFormValue.isEmpty) }
             }
         }.frame(minWidth: 460, minHeight: 280)
     }
@@ -174,11 +178,12 @@ struct KubernetesFeatureView: View {
                     TextField("Cluster name", text: $clusterName, prompt: Text("k8s-dev"))
                     HStack { TextField("Kubeconfig file", text: $kubeconfig, prompt: Text("~/.kube/config")); Button("Choose…") { chooseKubeconfig() } }
                 }
+                if let error { Section { InlineNotice(message: error, kind: .error) } }
                 Section { Text("This writes or appends cluster credentials to the selected file. Choose an alternate path to avoid changing your default kubeconfig.").font(.caption).foregroundStyle(.secondary) }
             }.formStyle(.grouped).navigationTitle("Write Kubeconfig")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showWriteConfig = false } }
-                ToolbarItem(placement: .confirmationAction) { Button("Write…") { confirmWriteConfig = true }.buttonStyle(.borderedProminent).disabled(busy || clusterName.isEmpty || kubeconfig.isEmpty) }
+                ToolbarItem(placement: .confirmationAction) { Button("Write…") { confirmWriteConfig = true }.buttonStyle(.borderedProminent).disabled(busy || clusterName.trimmedFormValue.isEmpty || kubeconfig.isEmpty) }
             }
             .confirmationDialog("Write kubeconfig for \(clusterName)?", isPresented: $confirmWriteConfig, titleVisibility: .visible) {
                 Button("Write Configuration") { launch { await writeConfig() } }
@@ -193,28 +198,28 @@ struct KubernetesFeatureView: View {
         _ = await execute(["k8s", "list"], title: "List Kubernetes Clusters")
     }
     private func createCluster() async {
-        let name = clusterName
-        var args = ["k8s", "create", "--name", name, "--node-image", nodeImage]
-        if !cpus.isEmpty { args += ["--cpus", cpus] }; if !memory.isEmpty { args += ["--memory", memory] }
-        if !registryScheme.isEmpty { args += ["--scheme", registryScheme] }
-        if !maxDownloads.isEmpty { args += ["--max-concurrent-downloads", maxDownloads] }
+        let name = clusterName.trimmedFormValue
+        var args = ["k8s", "create", "--name", name, "--node-image", nodeImage.trimmedFormValue]
+        if !cpus.trimmedFormValue.isEmpty { args += ["--cpus", cpus.trimmedFormValue] }; if !memory.trimmedFormValue.isEmpty { args += ["--memory", memory.trimmedFormValue] }
+        if !registryScheme.trimmedFormValue.isEmpty { args += ["--scheme", registryScheme.trimmedFormValue] }
+        if !maxDownloads.trimmedFormValue.isEmpty { args += ["--max-concurrent-downloads", maxDownloads.trimmedFormValue] }
         if !cni.isEmpty { args += ["--cni", cni] }; if removeOnStop { args.append("--rm") }
         guard await execute(args, title: "Create Kubernetes Cluster") else { return }
         store.pluginLibrary.rememberCluster(name); showCreate = false; await refreshList()
     }
     private func deleteCluster() async {
-        let name = clusterName
+        let name = clusterName.trimmedFormValue
         guard !name.isEmpty else { return }
         guard await execute(["k8s", "delete", "--name", name], title: "Delete Kubernetes Cluster") else { return }
-        store.pluginLibrary.forgetCluster(name); selectedNames.remove(name); await refreshList()
+        store.pluginLibrary.forgetCluster(name); if selectedName == name { selectedName = nil }; await refreshList()
     }
     private func loadImage() async {
-        var args = ["k8s", "load-image", "--name", clusterName, image]
-        if !platform.isEmpty { args += ["--platform", platform] }
+        var args = ["k8s", "load-image", "--name", clusterName.trimmedFormValue, image.trimmedFormValue]
+        if !platform.trimmedFormValue.isEmpty { args += ["--platform", platform.trimmedFormValue] }
         if await execute(args, title: "Load Image into Kubernetes") { showLoadImage = false }
     }
     private func writeConfig() async {
-        if await execute(["k8s", "write-config", "--name", clusterName, "--kubeconfig", (kubeconfig as NSString).expandingTildeInPath], title: "Write Kubernetes Config") { showWriteConfig = false }
+        if await execute(["k8s", "write-config", "--name", clusterName.trimmedFormValue, "--kubeconfig", (kubeconfig as NSString).expandingTildeInPath], title: "Write Kubernetes Config") { showWriteConfig = false }
     }
     @discardableResult private func execute(_ arguments: [String], title: String) async -> Bool {
         inputError = nil
@@ -230,7 +235,7 @@ struct KubernetesFeatureView: View {
             if actionID == id { actionTask = nil; actionID = nil }
         }
     }
-    private func cancelOperation() { operation.cancel(owner: owner) }
+    private func cancelOperation() { if let activeOwner = operation.owner { operation.cancel(owner: activeOwner) } }
     private func chooseKubeconfig() {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "config"

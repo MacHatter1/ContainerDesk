@@ -149,6 +149,7 @@ struct EditContainerLimitsSheet: View {
             }
         }
         .onChange(of: store.cliPath) { _, newPath in
+            guard !isApplying, result == nil else { return }
             guard newPath != nil else { return }
             if let id = plan?.id {
                 Task { await store.discardContainerLimitsPlan(id: id) }
@@ -218,8 +219,9 @@ struct EditContainerLimitsSheet: View {
                     systemImage: plan.wasRunning ? "clock.badge.exclamationmark" : "pause.circle"
                 )
                 Label("Running processes and ephemeral network state reset during recreation.", systemImage: "arrow.counterclockwise")
+                Label("Existing container and VM logs are deleted during recreation. Export any logs you need before continuing.", systemImage: "doc.badge.exclamationmark")
                 Label("The writable layer is backed up. Named volumes and bind mounts remain attached to the replacement, so their data stays at its existing source.", systemImage: "externaldrive.badge.checkmark")
-                Toggle("I understand this replaces the container and resets its processes and ephemeral network state.", isOn: $acknowledgeReplacement)
+                Toggle("I understand this replaces the container, deletes its logs, and resets its processes and ephemeral network state.", isOn: $acknowledgeReplacement)
                     .disabled(isApplying || result != nil)
             }
 

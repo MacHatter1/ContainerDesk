@@ -5,10 +5,14 @@ struct SystemFeatureView: View {
     let store: AppStore
     @Environment(\.openCleanup) private var openCleanup
 
-    @State private var output = ""
-    @State private var error: String?
-    @State private var diskUsage: SystemDiskUsage?
-    @State private var busy = false
+    @State private var panel = SystemPanelStore()
+    private var output: String { panel.output }
+    private var diskUsage: SystemDiskUsage? { panel.diskUsage }
+    private var displayError: String? { error ?? panel.error }
+    private var isBusy: Bool { busy || panel.isLoading }
+    @State private var actions = SystemActionStore()
+    private var error: String? { actions.error }
+    private var busy: Bool { actions.isRunning }
     @State private var showStopConfirmation = false
     @State private var showDNSCreate = false
     @State private var showDNSDelete = false
@@ -50,7 +54,7 @@ struct SystemFeatureView: View {
             selectedPanel
             footer
         }
-        .task { await refreshCurrentScreen() }
+        .task(id: selectedSystemTab) { await refreshCurrentScreen() }
         .sheet(isPresented: $showDNSCreate) { dnsCreateSheet }
         .sheet(isPresented: $showDNSDelete) { dnsDeleteSheet }
         .sheet(isPresented: $showKernelSheet) { kernelSheet }
@@ -91,7 +95,7 @@ struct SystemFeatureView: View {
         DetailTabStrip(selection: $selectedSystemTab, tabs: ["Disk Usage", "System Logs", "DNS Domains", "Properties", "Kernel"])
             .padding(.horizontal, 18)
             .padding(.top, 14)
-            .onChange(of: selectedSystemTab) { _, _ in loadSelectedTab() }
+            .onChange(of: selectedSystemTab) { _, tab in if tab == "Kernel" { showKernelSheet = true } }
     }
 
     private var runtimeIsRunning: Bool {
@@ -136,36 +140,14 @@ struct SystemFeatureView: View {
         return formatter.string(fromByteCount: bytes)
     }
 
-    private func loadSelectedTab() {
-        switch selectedSystemTab {
-        case "System Logs": Task { await run(["system", "logs", "--last", "5m"], title: "Read Service Logs") }
-        case "DNS Domains": Task { await run(["system", "dns", "list", "--format", "json"], title: "List DNS Domains") }
-        case "Properties": Task { await run(["system", "property", "list", "--format", "json"], title: "List System Properties") }
-        case "Kernel": showKernelSheet = true
-        default: Task { await loadDiskUsage() }
-        }
-    }
-
     private func refreshCurrentScreen() async {
-        await store.refreshSystemVersion()
-        if selectedSystemTab == "Disk Usage" { await loadDiskUsage() }
-        else if selectedSystemTab != "Kernel" { loadSelectedTab() }
-    }
-
-    private func loadDiskUsage() async {
-        busy = true
-        error = nil
-        do {
-            let result = try await store.execute(CommandRequest(arguments: ["system", "df", "--format", "json"], captureLimit: 128_000, suppressOutputEvents: true, timeout: .seconds(20)), title: "Read Disk Usage")
-            guard result.succeeded else { throw FeatureCommandError(result: result) }
-            guard !result.outputTruncated else { throw SystemFeatureError.responseTooLarge }
-            diskUsage = try JSONDecoder().decode(SystemDiskUsage.self, from: Data(result.standardOutput.utf8))
-            output = ""
-        } catch {
-            diskUsage = nil
-            self.error = error.localizedDescription
+        let tab = selectedSystemTab
+        actions.clearError()
+        await panel.load(tab: tab) { request, title in
+            try await store.execute(request, title: title)
         }
-        busy = false
+        guard !Task.isCancelled, selectedSystemTab == tab else { return }
+        await store.refreshSystemVersion()
     }
 
     @ViewBuilder private var selectedPanel: some View {
@@ -178,9 +160,9 @@ struct SystemFeatureView: View {
 
     private var diskUsagePanel: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if busy && diskUsage == nil {
+            if panel.isLoading && diskUsage == nil {
                 ProgressView("Reading disk usage…").frame(maxWidth: .infinity, minHeight: 180, alignment: .center)
-            } else if let error {
+            } else if let error = displayError {
                 ContentUnavailableView("Disk usage unavailable", systemImage: "externaldrive.badge.exclamationmark", description: Text(error))
                     .frame(maxWidth: .infinity, minHeight: 180)
             } else if let diskUsage {
@@ -232,7 +214,7 @@ struct SystemFeatureView: View {
                 Spacer()
                 Button("Review Cleanup", systemImage: "sparkles") { openCleanup(nil) }
                     .buttonStyle(.bordered)
-                if busy { ProgressView().controlSize(.small) }
+                if isBusy { ProgressView().controlSize(.small) }
             }
         }
         .padding(.top, 2)
@@ -270,9 +252,9 @@ struct SystemFeatureView: View {
 
     private var outputPanel: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack { Text(error == nil ? selectedSystemTab : "\(selectedSystemTab) unavailable").font(.headline); Spacer(); if busy { ProgressView().controlSize(.small) } }
-            if error != nil || !output.isEmpty {
-                Text(error ?? output).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+            HStack { Text(displayError == nil ? selectedSystemTab : "\(selectedSystemTab) unavailable").font(.headline); Spacer(); if isBusy { ProgressView().controlSize(.small) } }
+            if displayError != nil || !output.isEmpty {
+                Text(displayError ?? output).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                     .frame(maxWidth: .infinity, minHeight: 80, alignment: .leading)
                     .padding(10).background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 8))
             } else {
@@ -287,7 +269,7 @@ struct SystemFeatureView: View {
             Label(runtimeIsRunning ? "Runtime connected" : runtimeStatusLabel, systemImage: runtimeIsRunning ? "checkmark.circle.fill" : "exclamationmark.circle")
                 .foregroundStyle(runtimeIsRunning ? .green : .secondary)
             Spacer()
-            if busy { ProgressView().controlSize(.small) }
+            if isBusy { ProgressView().controlSize(.small) }
             Text("System state is queried live").foregroundStyle(.secondary)
         }
         .font(.caption)
@@ -304,10 +286,11 @@ struct SystemFeatureView: View {
                     TextField("Redirect to localhost (optional)", text: $localhost, prompt: Text("127.0.0.1 or ::1"))
                 }
                 Section { Text("The app validates the domain and optional IP address, then requests administrator approval for this DNS action only.").font(.caption).foregroundStyle(.secondary) }
+                if let error { Section { InlineNotice(message: error, kind: .error) } }
             }.formStyle(.grouped).navigationTitle("Add Local DNS Domain")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showDNSCreate = false } }
-                ToolbarItem(placement: .confirmationAction) { Button("Add Domain") { Task { await createDNS() } }.buttonStyle(.borderedProminent).disabled(domain.isEmpty) }
+                ToolbarItem(placement: .confirmationAction) { Button("Add Domain") { Task { await createDNS() } }.buttonStyle(.borderedProminent).disabled(busy || domain.trimmedFormValue.isEmpty) }
             }
         }.frame(minWidth: 430, minHeight: 250)
     }
@@ -317,10 +300,11 @@ struct SystemFeatureView: View {
             Form {
                 Section("Domain") { TextField("Domain name", text: $domain, prompt: Text("app.test")) }
                 Section { Text("This removes the local DNS configuration and requires administrator approval.").font(.caption).foregroundStyle(.secondary) }
+                if let error { Section { InlineNotice(message: error, kind: .error) } }
             }.formStyle(.grouped).navigationTitle("Remove Local DNS Domain")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showDNSDelete = false } }
-                ToolbarItem(placement: .confirmationAction) { Button("Remove…", role: .destructive) { showDNSDeleteConfirmation = true }.disabled(domain.isEmpty) }
+                ToolbarItem(placement: .confirmationAction) { Button("Remove…", role: .destructive) { showDNSDeleteConfirmation = true }.disabled(busy || domain.trimmedFormValue.isEmpty) }
             }
             .confirmationDialog("Remove \(domain) from local DNS?", isPresented: $showDNSDeleteConfirmation, titleVisibility: .visible) {
                 Button("Remove Domain", role: .destructive) { Task { await deleteDNS() } }
@@ -345,56 +329,52 @@ struct SystemFeatureView: View {
                     }
                 }
                 Section { Text("Installing the recommended kernel uses the CLI’s built-in download. Remote archives require an explicit digest.").font(.caption).foregroundStyle(.secondary) }
+                if let error { Section { InlineNotice(message: error, kind: .error) } }
             }.formStyle(.grouped).navigationTitle("Set Default Kernel")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showKernelSheet = false } }
-                ToolbarItem(placement: .confirmationAction) { Button("Install Kernel…") { Task { await setKernel() } }.buttonStyle(.borderedProminent).disabled(!installRecommended && kernelPath.isEmpty && archivePath.isEmpty) }
+                ToolbarItem(placement: .confirmationAction) { Button("Install Kernel…") { Task { await setKernel() } }.buttonStyle(.borderedProminent).disabled(busy || (!installRecommended && kernelPath.isEmpty && archivePath.isEmpty)) }
             }
         }.frame(minWidth: 480, minHeight: 340)
     }
 
-    private func refreshStatus() async { await store.refreshSystemVersion() }
-    private func run(_ arguments: [String], title: String) async {
-        busy = true; error = nil; output = ""
-        do {
+    @discardableResult private func run(_ arguments: [String], title: String) async -> Bool {
+        let tab = selectedSystemTab
+        return await actions.perform {
+            panel.showActionOutput("")
             let request = CommandRequest(arguments: arguments, captureLimit: 500_000, suppressOutputEvents: true)
             let result = try await store.execute(request, title: title)
-            output = request.sanitizeOutput(result.standardOutput + (result.standardError.isEmpty ? "" : "\n" + result.standardError))
+            if selectedSystemTab == tab { panel.showActionOutput(request.sanitizeOutput(result.standardOutput + (result.standardError.isEmpty ? "" : "\n" + result.standardError))) }
             guard result.succeeded else { throw FeatureCommandError(result: result) }
             if arguments.contains("start") || arguments.contains("stop") { await store.refreshSystemVersion() }
-        } catch { self.error = error.localizedDescription }
-        busy = false
+        }
     }
     private func createDNS() async {
-        busy = true; error = nil
-        do {
-            let value = try await store.executePrivilegedDNS(.create(domainName: domain, localhost: localhost.isEmpty ? nil : localhost))
-            output = value.isEmpty ? "DNS domain added." : value; showDNSCreate = false
-            await run(["system", "dns", "list", "--format", "json"], title: "List DNS Domains")
-        } catch { self.error = error.localizedDescription }
-        busy = false
+        await actions.perform {
+            let value = try await store.executePrivilegedDNS(.create(domainName: domain.trimmedFormValue, localhost: localhost.trimmedFormValue.isEmpty ? nil : localhost.trimmedFormValue))
+            panel.output = value.isEmpty ? "DNS domain added." : value; showDNSCreate = false
+            await refreshCurrentScreen()
+        }
     }
     private func deleteDNS() async {
-        busy = true; error = nil
-        do {
-            let value = try await store.executePrivilegedDNS(.delete(domainName: domain))
-            output = value.isEmpty ? "DNS domain removed." : value; showDNSDelete = false
-            await run(["system", "dns", "list", "--format", "json"], title: "List DNS Domains")
-        } catch { self.error = error.localizedDescription }
-        busy = false
+        await actions.perform {
+            let value = try await store.executePrivilegedDNS(.delete(domainName: domain.trimmedFormValue))
+            panel.output = value.isEmpty ? "DNS domain removed." : value; showDNSDelete = false
+            await refreshCurrentScreen()
+        }
     }
     private func setKernel() async {
+        guard !busy else { return }
         var args = ["system", "kernel", "set"]
         if installRecommended { args.append("--recommended") }
         else {
             args += ["--arch", kernelArch]
             if !kernelPath.isEmpty { args += ["--binary", kernelPath] }
             if !archivePath.isEmpty { args += ["--tar", archivePath] }
-            if !archiveDigest.isEmpty { args += ["--digest", archiveDigest] }
+            if !archiveDigest.trimmedFormValue.isEmpty { args += ["--digest", archiveDigest.trimmedFormValue] }
             if forceKernel { args.append("--force") }
         }
-        await run(args, title: "Set Default Kernel")
-        if error == nil { showKernelSheet = false }
+        if await run(args, title: "Set Default Kernel") { showKernelSheet = false }
     }
 }
 
@@ -416,9 +396,3 @@ private struct SystemDiskUsageRow: Identifiable {
         self.color = color
     }
 }
-
-private enum SystemFeatureError: LocalizedError {
-    case responseTooLarge
-    var errorDescription: String? { "The system disk-usage response exceeded the safe decode limit." }
-}
-

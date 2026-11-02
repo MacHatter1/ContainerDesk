@@ -97,7 +97,7 @@ Saved membership is local to ContainerDesk and separated by the configured CLI r
 ### Builds and local projects
 
 - Build images with BuildKit and inspect builder controls.
-- Create local Compose projects and manage them with the installed plugin’s `up` and `down` commands.
+- Create local Compose projects and manage them with the installed plugin’s `up` and `down` commands. If a saved Compose or Kubernetes library cannot be read, **Library Recovery…** lets you retry, export the damaged data, import repaired JSON or reset after saving a private backup. Recovery changes remembered references only.
 - Create, list, load images into, configure and delete local Kubernetes clusters with the installed experimental plugin.
 
 ### Runtime
@@ -131,7 +131,7 @@ Saved membership is local to ContainerDesk and separated by the configured CLI r
    ```sh
    git clone https://github.com/MacHatter1/ContainerDesk.git
    cd ContainerDesk
-   ./script/build_and_run.sh
+   CONTAINERDESK_BUILD_CONFIGURATION=release ./script/build_and_run.sh
    ```
 
 The script builds `dist/ContainerDesk.app` and opens it. You can then move the app to Applications.
@@ -140,7 +140,7 @@ The app discovers the Homebrew CLI from standard install paths and inherited `PA
 
 ### macOS Gatekeeper
 
-The app bundle produced by the build script is not signed with a Developer ID or notarized by Apple. If you download a build, macOS may warn or block the first launch. If you trust the source and have verified the download, try opening the app once, then use **System Settings → Privacy & Security → Open Anyway** if macOS offers that option. Managed Macs may restrict this override. See [Apple’s instructions for opening an unidentified or unnotarized app](https://support.apple.com/en-gb/102445).
+The build script signs the app ad hoc and verifies the signature strictly. Ad hoc signing protects bundle integrity but does not provide Developer ID trust or Apple notarization. Quarantined downloads can still be blocked by Gatekeeper; this project does not claim a tested notarized download flow. If you download a build, macOS may warn or block the first launch. If you trust the source and have verified the download, try opening the app once, then use **System Settings → Privacy & Security → Open Anyway** if macOS offers that option. Managed Macs may restrict this override. See [Apple’s instructions for opening an unidentified or unnotarized app](https://support.apple.com/en-gb/102445).
 
 ## Safety and data handling
 
@@ -149,7 +149,7 @@ The app bundle produced by the build script is not signed with a Developer ID or
 
 <br>
 
-Quitting ContainerDesk leaves Apple container services and workloads running. It stops only MLX servers and downloads owned by ContainerDesk before exiting. Service start and stop are available explicitly from System.
+Quitting ContainerDesk leaves Apple container services and workloads running. During limits replacement or recovery, Quit shows progress and offers Keep App Open. If recovery has not finished after 30 seconds, the app stays open and explains why; it does not interrupt the disk transaction. Once recovery finishes, Quit stops app-owned commands, log followers, terminal sessions, MLX servers and downloads before exiting. Service start and stop are available explicitly from System.
 
 </details>
 
@@ -169,7 +169,10 @@ Activity records command previews, timing, status and exit codes. Command output
 
 Limits recreation requires copy-on-write cloning between the container disk and recovery directory, normally on the same APFS volume. It retains private recovery files in `~/Library/Application Support/ContainerDesk/LimitsRecovery`. These contain the original disk and configuration, including environment values, and may remain boot dependencies of the recreated container. **Do not remove them while that container exists.**
 
-Mounted volume and bind data stays in its original location; the recovery copy does not snapshot those external files. The guest TTY setting is preserved. Process memory, attached terminal sessions, open connections, runtime log history, and automatically assigned network addresses do not survive recreation. Normal Quit and conflicting runtime actions are blocked while replacement is active. If the app is force-quit or interrupted, retain the recovery directory and inspect the container before attempting another change; recovery after interruption is manual.
+Mounted volume and bind data stays in its original location; the recovery copy does not snapshot those external files. The guest TTY setting is preserved. Process memory, attached terminal sessions, open connections, runtime log history, and automatically assigned network addresses do not survive recreation. Quit waits up to 30 seconds for replacement or recovery, with visible progress, then stays open if the transaction is still active. Conflicting runtime actions are blocked while replacement is active. If the app is force-quit or interrupted, retain the recovery directory and inspect the container before attempting another change; recovery after interruption is manual.
+
+Use **Settings → Review Limits Recovery Files…** to inspect completed rollback copies and their allocated disk size. Removal requires explicit selection and confirmation, a complete inventory of all containers (including stopped containers), and no references to the session's files. Active limits changes block removal. Sessions with missing, unknown, interrupted or manual-recovery outcomes are retained; this includes sessions created before outcome tracking was added. APFS clone sharing means the space actually reclaimed can differ from the displayed allocation.
+
 
 </details>
 

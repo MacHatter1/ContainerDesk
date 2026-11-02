@@ -168,7 +168,7 @@ public final class CleanupStore {
                     title: "Remove \(candidate.category.title): \(candidate.title)",
                     using: client,
                     allowRetry: false,
-                    allowCancellation: false
+                    allowCancellation: true
                 )
                 switch await service.verifyRemoval(candidate) {
                 case .removed:
@@ -178,6 +178,19 @@ public final class CleanupStore {
                 case .unverified(let reason):
                     items.append(CleanupItemResult(candidate: candidate, state: .unverified(reason)))
                 }
+            } catch let failure as CommandFailure where failure.timedOut {
+                // Killing the CLI does not undo a delete already accepted by the runtime.
+                // Reconcile the exact target and stop before attempting another resource.
+                stopRequested = true
+                switch await service.verifyRemoval(candidate) {
+                case .removed:
+                    items.append(CleanupItemResult(candidate: candidate, state: .removed))
+                case .stillPresent(let reason), .unverified(let reason):
+                    items.append(CleanupItemResult(candidate: candidate, state: .unverified("The delete timed out. \(reason) Refresh before retrying; it may still complete in the runtime.")))
+                }
+            } catch is CancellationError {
+                stopRequested = true
+                items.append(CleanupItemResult(candidate: candidate, state: .unverified("Removal was cancelled. Refresh the inventory to check whether it completed.")))
             } catch {
                 items.append(CleanupItemResult(candidate: candidate, state: .failed(error.localizedDescription)))
             }

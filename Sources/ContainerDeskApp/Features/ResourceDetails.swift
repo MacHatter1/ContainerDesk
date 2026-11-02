@@ -35,6 +35,7 @@ struct ResourceDetailPane: View {
     var actionsUnavailable = false
     @Bindable var detailState: ResourceDetailState = .init()
     var terminalSession: ContainerTerminalSession? = nil
+    let currentResourceID: () -> String?
 
     private var isActive: Bool { activation.isActive }
     let onNotice: (FeatureNotice) -> Void
@@ -43,6 +44,7 @@ struct ResourceDetailPane: View {
     let onEditLimits: () -> Void
 
     @State private var detailHeaderWidth: CGFloat = 0
+    @State private var refreshTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -63,12 +65,15 @@ struct ResourceDetailPane: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .onChange(of: tab) { oldValue, _ in
+            cancelLoad()
+            transientText = ""
             if oldValue == .logs { cancelFollowLogs() }
         }
+        .onChange(of: resource.id) { _, _ in cancelLoad(); transientText = "" }
         .onChange(of: isActive) { _, active in
-            if !active { cancelFollowLogs() }
+            if !active { cancelLoad(); cancelFollowLogs() }
         }
-        .onDisappear { cancelFollowLogs() }
+        .onDisappear { cancelLoad(); cancelFollowLogs() }
         .task(id: "\(resource.id)-\(tab.rawValue)-\(detailState.followLogs)-\(isActive)") {
             guard isActive else { return }
             if tab == .logs || tab == .inspect || tab == .files { await load() }
@@ -126,11 +131,11 @@ struct ResourceDetailPane: View {
                 Menu {
                 Button("Save Archive…", systemImage: "square.and.arrow.down") { action(.save) }.disabled(actionsUnavailable)
                     Button("Add Tag…", systemImage: "tag") { action(.tag) }.disabled(actionsUnavailable)
-                } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton)
+                } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).accessibilityLabel("More image actions")
             } else if section == .machines {
                 Button("Stop", systemImage: "stop.fill", role: .destructive) { action(.stop) }.disabled(actionsUnavailable)
             }
-            Button { Task { await load() } } label: { Image(systemName: "arrow.clockwise") }.help("Refresh details").disabled(detailState.isLoading || tab == .terminal)
+            Button { refreshTask?.cancel(); refreshTask = Task { await load() } } label: { Image(systemName: "arrow.clockwise") }.help("Refresh details").accessibilityLabel("Refresh details").disabled(detailState.isLoading || tab == .terminal)
         }
         .fixedSize(horizontal: true, vertical: false)
     }
@@ -433,13 +438,29 @@ struct ResourceDetailPane: View {
     }
 
     private func load() async {
+        let requestedTab = tab
+        let requestedResourceID = resource.id
+        let token = UUID()
+        detailState.loadToken = token
+        func isCurrentLoad() -> Bool {
+            !Task.isCancelled && detailState.loadToken == token && tab == requestedTab && currentResourceID() == requestedResourceID
+        }
+        defer {
+            if detailState.loadToken == token { detailState.isLoading = false; detailState.loadToken = nil }
+        }
         var loadOperationID: UUID?
+        defer {
+            if let loadOperationID {
+                store.cancelOperation(loadOperationID)
+                if detailState.operationID == loadOperationID { detailState.operationID = nil }
+            }
+        }
         detailState.isLoading = true
         detailState.error = nil
         transientText = ""
-        if tab == .inspect { detailState.inspectBackend = nil; detailState.inspectFallbackReason = nil }
+        if requestedTab == .inspect { detailState.inspectBackend = nil; detailState.inspectFallbackReason = nil }
         let args: [String]
-        switch tab {
+        switch requestedTab {
         case .logs: args = logsCommand
         case .stats: detailState.isLoading = false; return
         case .inspect:
@@ -453,39 +474,36 @@ struct ResourceDetailPane: View {
         default: detailState.isLoading = false; return
         }
         do {
-            if tab == .logs && detailState.followLogs {
+            if requestedTab == .logs && detailState.followLogs {
                 transientText = ""
                 let ownedStream = store.streamWithID(CommandRequest(arguments: args + ["--follow"], captureLimit: 500_000), title: "Follow Container Logs")
                 loadOperationID = ownedStream.operationID
                 detailState.operationID = loadOperationID
                 for try await event in ownedStream.events {
                     try Task.checkCancellation()
+                    guard isCurrentLoad() else { break }
                     switch event {
                     case .standardOutput(let chunk): appendTransient(chunk)
                     case .standardError(let chunk): appendTransient(chunk)
                     case .completed(let result): if !result.succeeded { throw FeatureCommandError(result: result) }
                     }
                 }
-            } else if tab == .stats {
-                repeat {
-                    let result = try await store.client.run(CommandRequest(arguments: args, captureLimit: 200_000, suppressOutputEvents: true))
-                    guard result.succeeded else { throw FeatureCommandError(result: result) }
-                    transientText = String(result.standardOutput.suffix(150_000))
-                    try await Task.sleep(for: .seconds(1))
-                } while !Task.isCancelled
             } else {
-                if tab == .inspect, section == .containers {
+                if requestedTab == .inspect, section == .containers {
                     let result = try await store.inspectContainer(id: resource.id)
                     try Task.checkCancellation()
+                    guard isCurrentLoad() else { return }
                     detailState.inspectBackend = result.backend
                     detailState.inspectFallbackReason = result.fallbackReason
                     transientText = result.value.json
                 } else {
                     let result = try await store.client.run(CommandRequest(arguments: args, captureLimit: 500_000, suppressOutputEvents: true))
+                    try Task.checkCancellation()
+                    guard isCurrentLoad() else { return }
                     guard result.succeeded else { throw FeatureCommandError(result: result) }
                     // Raw inspect bytes are never kept in view state; persist only the sanitized rendering.
-                    transientText = tab == .inspect ? InspectRedactor.redact(result.standardOutput) : result.standardOutput
-                    if tab == .inspect { detailState.inspectBackend = .cli; detailState.inspectFallbackReason = nil }
+                    transientText = requestedTab == .inspect ? InspectRedactor.redact(result.standardOutput) : result.standardOutput
+                    if requestedTab == .inspect { detailState.inspectBackend = .cli; detailState.inspectFallbackReason = nil }
                 }
             }
         } catch is CancellationError {
@@ -493,8 +511,16 @@ struct ResourceDetailPane: View {
                 store.cancelOperation(loadOperationID)
                 if detailState.operationID == loadOperationID { detailState.operationID = nil }
             }
-        } catch let issue { detailState.error = issue.localizedDescription }
+        } catch let issue {
+            if isCurrentLoad() { detailState.error = issue.localizedDescription }
+        }
         if detailState.operationID == loadOperationID { detailState.operationID = nil }
+    }
+
+    private func cancelLoad() {
+        refreshTask?.cancel()
+        refreshTask = nil
+        detailState.loadToken = nil
         detailState.isLoading = false
     }
 

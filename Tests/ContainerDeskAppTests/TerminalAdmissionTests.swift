@@ -27,7 +27,7 @@ struct TerminalAdmissionTests {
         let host = NSHostingView(rootView: ResourceDetailPane(
             resource: .init(id: "fixture", title: "Fixture", state: "running"), section: section,
             tab: .constant(.terminal), transientText: .constant(""), store: store,
-            limitsOperationInProgress: false, activation: activation,
+            limitsOperationInProgress: false, activation: activation, currentResourceID: { "fixture" },
             onNotice: { _ in }, action: { _ in }, onRun: { _ in }, onEditLimits: {}))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 500), styleMask: .borderless, backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false

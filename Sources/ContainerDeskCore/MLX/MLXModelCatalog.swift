@@ -107,12 +107,11 @@ public struct MLXModelCatalog: Sendable {
             try cancellation?.throwIfCancelled()
             guard Self.isDirectChild(directory, of: configuration.managedModelsDirectory),
                   let manifest = Self.managedManifest(at: directory),
-                  manifest.complete,
                   let expectedPath = try? Self.managedPath(for: manifest.repositoryID, root: configuration.managedModelsDirectory),
                   expectedPath.standardizedFileURL.path == directory.standardizedFileURL.path else { continue }
             let repositoryID = manifest.repositoryID
             let id = "managed:\(repositoryID)"
-            if let model = try Self.record(at: directory, source: .appManagedDownload, repositoryID: repositoryID, revision: nil, id: id, cancellation: cancellation) {
+            if let model = try Self.record(at: directory, source: .appManagedDownload, repositoryID: repositoryID, revision: nil, id: id, cancellation: cancellation, allowPartial: !manifest.complete) {
                 modelsByPath[directory.standardizedFileURL.path] = model
             }
         }
@@ -152,12 +151,12 @@ public struct MLXModelCatalog: Sendable {
         return directories
     }
 
-    private static func record(at directory: URL, source: MLXModelSource, repositoryID: String?, revision: String?, id: String, cancellation: MLXCatalogScanCancellation?) throws -> MLXModelRecord? {
+    private static func record(at directory: URL, source: MLXModelSource, repositoryID: String?, revision: String?, id: String, cancellation: MLXCatalogScanCancellation?, allowPartial: Bool = false) throws -> MLXModelRecord? {
         try cancellation?.throwIfCancelled()
         let root = directory.standardizedFileURL
-        guard let configData = try? Data(contentsOf: root.appendingPathComponent("config.json"), options: [.mappedIfSafe]),
-              configData.count <= 512 * 1024,
-              let config = try? JSONSerialization.jsonObject(with: configData) as? [String: Any] else { return nil }
+        let configData = try? Data(contentsOf: root.appendingPathComponent("config.json"), options: [.mappedIfSafe])
+        let config = configData.flatMap { $0.count <= 512 * 1024 ? (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] : nil }
+        guard config != nil || allowPartial else { return nil }
 
         var validRelativeFiles = Set<String>()
         var bytes: Int64 = 0
@@ -206,10 +205,10 @@ public struct MLXModelCatalog: Sendable {
             hasWeights = validRelativeFiles.contains { URL(fileURLWithPath: $0).lastPathComponent.lowercased().hasSuffix(".safetensors") }
         }
         try cancellation?.throwIfCancelled()
-        guard hasWeights, hasTokenizer else { return nil }
-        let modelType = config["model_type"] as? String
-        let quantizationConfiguration = config["quantization_config"] as? [String: Any]
-        let quantization = config["quantization"] as? [String: Any]
+        guard allowPartial || (hasWeights && hasTokenizer) else { return nil }
+        let modelType = config?["model_type"] as? String
+        let quantizationConfiguration = config?["quantization_config"] as? [String: Any]
+        let quantization = config?["quantization"] as? [String: Any]
         let quantizationBits = (quantizationConfiguration?["bits"] as? NSNumber)?.intValue ?? (quantization?["bits"] as? NSNumber)?.intValue
         let displayName = repositoryID ?? root.lastPathComponent
         return MLXModelRecord(
@@ -222,7 +221,8 @@ public struct MLXModelCatalog: Sendable {
             modelType: modelType,
             quantizationBits: quantizationBits,
             diskBytes: bytes,
-            fileCount: fileCount
+            fileCount: fileCount,
+            isReady: !allowPartial
         )
     }
 

@@ -17,6 +17,7 @@ struct StackWorkspaceFeatureView: View {
     @State private var actionError: String?
     @State private var logBuffer = ContainerLogBuffer(maxEntries: 2_000, maxBytes: 120_000)
     @State private var logSearch = ""
+    @State private var visibleLogText = ""
     @State private var logTasks: [Task<Void, Never>] = []
     @State private var logOperationIDs: [UUID] = []
     @State private var activeLogStreamIDs: Set<UUID> = []
@@ -173,6 +174,8 @@ struct StackWorkspaceFeatureView: View {
         } message: {
             Text(confirmationMessage)
         }
+        .onChange(of: logBuffer.revision) { _, _ in updateVisibleLogText() }
+        .onChange(of: logSearch) { _, _ in updateVisibleLogText() }
         .onDisappear { stopFollowingLogs() }
     }
 
@@ -455,11 +458,10 @@ struct StackWorkspaceFeatureView: View {
         }
     }
 
-    private var visibleLogText: String {
-        let logText = logBuffer.entries.map { "[\($0.containerID)] \($0.message)\n" }.joined()
-        guard !logSearch.isEmpty else { return logText }
-        return logText.split(separator: "\n", omittingEmptySubsequences: false)
-            .filter { $0.localizedCaseInsensitiveContains(logSearch) }
+    private func updateVisibleLogText() {
+        visibleLogText = logBuffer.entries
+            .map { "[\($0.containerID)] \($0.message)" }
+            .filter { logSearch.isEmpty || $0.localizedCaseInsensitiveContains(logSearch) }
             .joined(separator: "\n")
     }
 
@@ -468,9 +470,7 @@ struct StackWorkspaceFeatureView: View {
             Text("\(workspaces.count) stack\(workspaces.count == 1 ? "" : "s")")
                 .monospacedDigit()
             Spacer()
-            if let fetchedAt = store.snapshots[.containers]?.fetchedAt {
-                Text("Updated \(fetchedAt, style: .time)").foregroundStyle(.tertiary)
-            }
+            ResourceUpdatedLabel(store: store, section: .containers, fallback: store.snapshots[.containers]?.fetchedAt)
             if isRunningAction { ProgressView().controlSize(.small); Text("Running stack action…") }
             else if followingLogs { ProgressView().controlSize(.small); Text("Following logs") }
         }

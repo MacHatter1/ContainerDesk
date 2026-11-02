@@ -164,7 +164,17 @@ public actor ContainerLimitsService {
         }
         applyingContainerIDs.insert(plan.containerID)
         defer { applyingContainerIDs.remove(plan.containerID) }
+        let result = await applyPrepared(change, limits: limits, onProgress: onProgress)
+        LimitsRecoveryState.record(result)
+        return result
+    }
 
+    private func applyPrepared(
+        _ change: PreparedLimitsChange,
+        limits: ContainerResourceLimits,
+        onProgress: @escaping @Sendable (ContainerLimitsProgress) async -> Void
+    ) async -> ContainerLimitsApplyResult {
+        let plan = change.plan
         await onProgress(.validating)
         guard Self.valid(limits, plan: plan) else { return .unchanged(reason: .invalidLimits) }
         guard limits != plan.currentLimits else { return .unchanged(reason: .noChange) }
@@ -188,7 +198,7 @@ public actor ContainerLimitsService {
 
         let sessionURL: URL
         do {
-            sessionURL = try Self.createRecoverySession(root: recoveryRoot)
+            sessionURL = try Self.createRecoverySession(root: recoveryRoot, containerID: plan.containerID)
         } catch {
             return .unchanged(reason: .backupFailed)
         }
@@ -371,7 +381,7 @@ public actor ContainerLimitsService {
         let plan = change.plan
         let sessionURL: URL
         do {
-            sessionURL = try Self.createRecoverySession(root: recoveryRoot)
+            sessionURL = try Self.createRecoverySession(root: recoveryRoot, containerID: plan.containerID)
         } catch {
             return .unchanged(reason: .backupFailed)
         }
@@ -761,7 +771,7 @@ public actor ContainerLimitsService {
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func createRecoverySession(root: URL) throws -> URL {
+    private static func createRecoverySession(root: URL, containerID: String) throws -> URL {
         let fm = FileManager.default
         guard root.isFileURL, !hasSymbolicLinkComponent(root) else { throw ContainerLimitsIssue.backupFailed }
         try fm.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -771,6 +781,7 @@ public actor ContainerLimitsService {
         try fm.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         guard !hasSymbolicLinkComponent(directory) else { throw ContainerLimitsIssue.backupFailed }
         try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        try LimitsRecoveryState(sessionID: directory.lastPathComponent, containerID: containerID, createdAt: .now, outcome: .inProgress).write(to: directory)
         try syncDirectory(root)
         return directory
     }
@@ -856,7 +867,7 @@ public actor ContainerLimitsService {
     private static var minimumMemoryBytes: UInt64 { 200 * mebibyte }
     private static var mebibyte: UInt64 { 1_048_576 }
 
-    private static func defaultRecoveryDirectory() -> URL {
+    static func defaultRecoveryDirectory() -> URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
         return appSupport.appendingPathComponent("ContainerDesk/LimitsRecovery", isDirectory: true)
@@ -923,6 +934,12 @@ private struct AppleContainerLimitsRuntime: ContainerLimitsRuntime {
     private let api = ContainerAPIClient.ContainerClient()
 
     init(cli: any ContainerClient) { self.cli = cli }
+
+    func verifyRuntimeForRecovery() async throws {
+        let health = try await ClientHealthCheck.ping(timeout: .seconds(10))
+        guard health.apiServerVersion == "1.5.0", let client = cli as? ProcessContainerClient,
+              client.resolver.overridePath == nil, try await cliVersion() == "1.5.0" else { throw ContainerLimitsIssue.unsupportedCLI }
+    }
 
     func inspect(id: String) async throws -> ContainerLimitsRuntimeState? {
         guard !id.isEmpty, id != ".", id != "..", !id.contains("/"), !id.contains("\\") else {
@@ -1068,7 +1085,7 @@ private struct AppleContainerLimitsRuntime: ContainerLimitsRuntime {
 
     private func cliVersion() async throws -> String? {
         let result = try await cli.run(CommandRequest(arguments: ["system", "version", "--format", "json"], captureLimit: 128_000, suppressOutputEvents: true, timeout: .seconds(10)))
-        guard result.succeeded,
+        guard result.succeeded, !result.outputTruncated,
               let data = result.standardOutput.data(using: .utf8),
               let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
               let row = rows.first(where: { ($0["appName"] as? String)?.localizedCaseInsensitiveContains("container") == true }),
@@ -1099,5 +1116,60 @@ private struct AppleContainerLimitsRuntime: ContainerLimitsRuntime {
     private static func isWithin(_ url: URL, root: URL) -> Bool {
         let root = root.standardizedFileURL.path.hasSuffix("/") ? root.standardizedFileURL.path : root.standardizedFileURL.path + "/"
         return url.standardizedFileURL.path.hasPrefix(root)
+    }
+}
+
+/// The native list has no display/capture limit and includes stopped containers.
+/// Failure to decode a complete XPC response or inspect any listed container aborts cleanup.
+struct AppleLimitsRecoveryInventory: LimitsRecoveryInventoryReading {
+    let cli: any ContainerClient
+
+    func inventory() async throws -> LimitsRecoveryInventory {
+        do {
+            return try await BoundedNativeRequest.run(timeout: .seconds(30), operation: {
+                try await completeInventory()
+            }, cancel: {})
+        } catch is CancellationError { throw CancellationError() }
+        catch { throw LimitsRecoveryError.incompleteInventory }
+    }
+
+    static func referencedFiles(in state: ContainerLimitsRuntimeState) throws -> [URL] {
+        var paths: [URL] = []
+        paths += [state.kernel.path, state.runtimeConfiguration.kernel.path]
+        let sources = [state.initialFilesystem.source, state.rootFilesystem.source,
+            state.runtimeConfiguration.initialFilesystem.source,
+            state.runtimeConfiguration.containerRootFilesystem?.source,
+            state.runtimeConfiguration.options?.rootFsOverride?.source,
+            state.options?.rootFsOverride?.source].compactMap { $0 }.filter { !$0.isEmpty }
+        guard sources.allSatisfy({ $0.hasPrefix("/") }) else { throw LimitsRecoveryError.incompleteInventory }
+        paths += sources.map { URL(fileURLWithPath: $0) }
+        paths += state.snapshot.configuration.mounts.filter { $0.source.hasPrefix("/") }.map { URL(fileURLWithPath: $0.source) }
+        return paths
+    }
+
+    private func completeInventory() async throws -> LimitsRecoveryInventory {
+        let runtime = AppleContainerLimitsRuntime(cli: cli)
+        try await runtime.verifyRuntimeForRecovery()
+        let api = ContainerAPIClient.ContainerClient()
+        let before = try await api.list(filters: .all)
+        guard Set(before.map(\.id)).count == before.count else { throw LimitsRecoveryError.incompleteInventory }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        var configurations: [String: Data] = [:]
+        var paths: [URL] = []
+        for snapshot in before {
+            try Task.checkCancellation()
+            let configuration = try encoder.encode(snapshot.configuration)
+            configurations[snapshot.id] = configuration
+            guard let state = try await runtime.inspect(id: snapshot.id),
+                  try encoder.encode(state.snapshot.configuration) == configuration else { throw LimitsRecoveryError.incompleteInventory }
+            paths += try Self.referencedFiles(in: state)
+        }
+        let after = try await api.list(filters: .all)
+        guard after.count == before.count, Set(after.map(\.id)).count == after.count else { throw LimitsRecoveryError.incompleteInventory }
+        for snapshot in after {
+            guard configurations[snapshot.id] == (try encoder.encode(snapshot.configuration)) else { throw LimitsRecoveryError.incompleteInventory }
+        }
+        return LimitsRecoveryInventory(referencedFiles: paths, complete: true)
     }
 }

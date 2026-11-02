@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import ContainerDeskCore
 import SwiftTerm
 import SwiftUI
@@ -33,6 +34,7 @@ struct ContainerTerminalView: NSViewRepresentable {
             return retained
         }
         let view = LocalProcessTerminalView(frame: .zero)
+        ContainerTerminalSession.track(view)
         view.processDelegate = context.coordinator
         applyTerminalAppearance(view, colorScheme: context.environment.colorScheme)
         // Admission and synchronous PTY creation run on the main actor. Release
@@ -84,7 +86,20 @@ struct ContainerTerminalView: NSViewRepresentable {
         func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
         func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
         func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
+        func processFailedToStart(source: TerminalView, error: LocalProcessError) {
+            session?.didExit()
+            let message: String
+            switch error {
+            case .forkFailed(let code), .writeChannelFailed(let code), .writeFailed(let code, _): message = String(cString: strerror(code))
+            case .alreadyRunning: message = "A terminal session is already running."
+            case .notRunning: message = "The terminal process is not running."
+            @unknown default: message = String(describing: error)
+            }
+            source.feed(text: "\r\nSession could not start: \(message)\r\n")
+            onExit?(nil)
+        }
         func processTerminated(source: TerminalView, exitCode: Int32?) {
+            session?.didExit()
             let status = exitCode.map { String($0) } ?? "unknown"
             source.feed(text: "\r\nSession ended (exit status \(status)).\r\n")
             onExit?(exitCode)

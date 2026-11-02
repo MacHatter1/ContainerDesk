@@ -5,8 +5,22 @@ enum MLXServerProcessIdentity {
     static func isServer(arguments: [String]) -> Bool {
         guard let executable = arguments.first.map({ URL(fileURLWithPath: $0).lastPathComponent }) else { return false }
         var command = Array(arguments.dropFirst())
-        if executable.hasPrefix("python") {
-            while let flag = command.first, ["-u", "-I", "-E", "-s", "-S", "-B", "-O", "-OO"].contains(flag) { command.removeFirst() }
+        if executable.lowercased().hasPrefix("python") {
+            while let flag = command.first {
+                if ["-u", "-I", "-E", "-s", "-S", "-B", "-O", "-OO"].contains(flag) {
+                    command.removeFirst()
+                } else if flag == "-X" || flag == "-W" {
+                    guard command.count >= 2 else { return false }
+                    command.removeFirst(2)
+                } else if flag.hasPrefix("-X") || flag.hasPrefix("-W") {
+                    command.removeFirst()
+                } else { break }
+            }
+            if command.first == "--" {
+                command.removeFirst()
+                guard let script = command.first else { return false }
+                return isServer(arguments: [script] + command.dropFirst())
+            }
             if command.first == "-m" {
                 command.removeFirst()
                 return command.first == "mlx_lm.server" || command.starts(with: ["mlx_lm", "server"])

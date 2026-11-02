@@ -14,6 +14,7 @@ struct ComposeFeatureView: View {
     @State private var output = ""
     @State private var error: String?
     @State private var showDownConfirmation = false
+    @State private var downReview: ComposeDownReview?
     @State private var keepNetworks = false
     @State private var keepOrphans = false
     @State private var forceRecreate = false
@@ -30,6 +31,7 @@ struct ComposeFeatureView: View {
                 Button("Add File…", systemImage: "plus") { showingImporter = true }
             }
 
+            PluginLibraryRecoveryNotice(library: store.pluginLibrary, kind: .compose)
             if projects.isEmpty {
                 VStack(spacing: 12) {
                     FeatureEmptyState(title: "No Compose files", message: "Choose a compose.yaml file to save its path and project name for future up/down actions.", symbol: "square.stack.3d.up")
@@ -66,12 +68,19 @@ struct ComposeFeatureView: View {
             case .failure(let failure): error = failure.localizedDescription
             }
         }
-        .confirmationDialog("Stop and remove this project's containers?", isPresented: $showDownConfirmation, titleVisibility: .visible) {
-            Button("Compose Down", role: .destructive) { launch { await runDown(dryRun: false) } }
+        .confirmationDialog("Stop and remove project \(downReview?.displayName ?? "")?", isPresented: $showDownConfirmation, titleVisibility: .visible) {
+            Button("Compose Down", role: .destructive) {
+                guard let review = downReview else { return }
+                launch { await execute(review.request.arguments, title: "Compose Down", file: review.project.fileURL) }
+            }
             Button("Cancel", role: .cancel) { }
-        } message: { Text("Compose down removes project containers and, by default, networks created by this project.") }
+        } message: { Text("File: \(downReview?.project.fileURL.path ?? "")\nRemoves this saved project's containers\(downReview?.keepNetworks == true ? ". Networks will be kept." : " and networks.")") }
         .onAppear { if selectedID == nil { selectedID = projects.first?.id } }
         .onChange(of: selectedID) { _, newID in
+            forceRecreate = false
+            keepOrphans = false
+            keepNetworks = false
+            pullPolicy = "missing"
             if let project = projects.first(where: { $0.id == newID }) { projectName = project.name }
         }
     }
@@ -108,7 +117,7 @@ struct ComposeFeatureView: View {
                         Spacer(minLength: 8)
                         Button("Plan Down", systemImage: "list.bullet.rectangle") { launch { await runDown(dryRun: true) } }
                             .disabled(busy)
-                        Button("Compose Down…", systemImage: "stop.fill", role: .destructive) { showDownConfirmation = true }
+                        Button("Compose Down…", systemImage: "stop.fill", role: .destructive) { reviewDown() }
                             .disabled(busy)
                     }
                     VStack(alignment: .leading, spacing: 8) {
@@ -121,7 +130,7 @@ struct ComposeFeatureView: View {
                         HStack(spacing: 10) {
                             Button("Plan Down", systemImage: "list.bullet.rectangle") { launch { await runDown(dryRun: true) } }
                                 .disabled(busy)
-                            Button("Compose Down…", systemImage: "stop.fill", role: .destructive) { showDownConfirmation = true }
+                            Button("Compose Down…", systemImage: "stop.fill", role: .destructive) { reviewDown() }
                                 .disabled(busy)
                         }
                     }
@@ -162,7 +171,8 @@ struct ComposeFeatureView: View {
     }
     private func updateSelectedName() {
         guard let id = selectedID else { return }
-        store.pluginLibrary.renameProject(id: id, name: projectName.trimmingCharacters(in: .whitespacesAndNewlines))
+        projectName = projectName.trimmedFormValue
+        store.pluginLibrary.renameProject(id: id, name: projectName)
     }
     private func forget(_ project: SavedComposeProject) {
         store.pluginLibrary.forgetProject(id: project.id)
@@ -182,12 +192,14 @@ struct ComposeFeatureView: View {
     }
     private func runDown(dryRun: Bool) async {
         guard let project = selectedProject else { return }
-        var args = ["compose", "down", "--file", project.fileURL.path]
-        let name = projectName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !name.isEmpty { args += ["--project-name", name] }
+        var args = ComposeDownReview(project: project, keepNetworks: keepNetworks).request.arguments
         if dryRun { args.append("--dry-run") }
-        if keepNetworks { args.append("--keep-networks") }
         await execute(args, title: dryRun ? "Plan Compose Down" : "Compose Down", file: project.fileURL)
+    }
+    private func reviewDown() {
+        guard let project = selectedProject else { return }
+        downReview = ComposeDownReview(project: project, keepNetworks: keepNetworks)
+        showDownConfirmation = true
     }
     private func execute(_ args: [String], title: String, file: URL) async {
         busy = true; error = nil; output = ""

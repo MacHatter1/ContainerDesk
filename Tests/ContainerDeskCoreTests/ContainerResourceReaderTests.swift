@@ -100,7 +100,7 @@ struct ContainerResourceReaderTests {
         let delayedCLI = StubContainerClient(versionDelay: .seconds(30))
         let api = StubAppleContainerAPI()
         let cliTask = Task { await cliGate.availability(using: delayedCLI, api: api, enabled: true) }
-        while await cliGate.activeVersionProbeWaiterCount == 0 { try await Task.sleep(for: .milliseconds(5)) }
+        try await waitForReaderCondition { !(await cliGate.activeVersionProbeWaiterCount == 0) }
         let cliCancelStarted = ContinuousClock.now
         cliTask.cancel()
         let cliDecision = await cliTask.value
@@ -112,7 +112,7 @@ struct ContainerResourceReaderTests {
         let normalCLI = StubContainerClient()
         let delayedAPI = StubAppleContainerAPI(serverIdentityDelay: .seconds(30))
         let serverTask = Task { await serverGate.availability(using: normalCLI, api: delayedAPI, enabled: true) }
-        while await delayedAPI.serverIdentityCallCount == 0 { try await Task.sleep(for: .milliseconds(5)) }
+        try await waitForReaderCondition { !(await delayedAPI.serverIdentityCallCount == 0) }
         let serverCancelStarted = ContinuousClock.now
         serverTask.cancel()
         let serverDecision = await serverTask.value
@@ -126,12 +126,12 @@ struct ContainerResourceReaderTests {
         let api = StubAppleContainerAPI()
         let first = Task { await gate.availability(using: cli, api: api, enabled: true) }
         let second = Task { await gate.availability(using: cli, api: api, enabled: true) }
-        while await gate.activeVersionProbeWaiterCount < 2 { try await Task.sleep(for: .milliseconds(5)) }
+        try await waitForReaderCondition { !(await gate.activeVersionProbeWaiterCount < 2) }
 
         first.cancel()
         let firstDecision = await first.value
         #expect(!firstDecision.allowed)
-        while await gate.activeVersionProbeWaiterCount > 1 { try await Task.sleep(for: .milliseconds(5)) }
+        try await waitForReaderCondition { !(await gate.activeVersionProbeWaiterCount > 1) }
         let secondDecision = await second.value
         #expect(secondDecision.allowed)
         #expect(cli.requests.filter { $0.arguments == ["system", "version", "--format", "json"] }.count == 1)
@@ -205,7 +205,7 @@ struct ContainerResourceReaderTests {
         let api = StubAppleContainerAPI(delayList: true)
         let reader = ContainerResourceReader(cli: cli, nativeAPI: api)
         let readTask = Task { try await reader.list(.containers) }
-        while await api.listCallCount == 0 { try await Task.sleep(for: .milliseconds(5)) }
+        try await waitForReaderCondition { !(await api.listCallCount == 0) }
         readTask.cancel()
 
         do {
@@ -221,20 +221,20 @@ struct ContainerResourceReaderTests {
             _ = try await BoundedNativeRequest.run(timeout: .milliseconds(40), operation: { try await timed.wait() }, cancel: { Task { await timed.close() } })
             Issue.record("Expected the native request timeout.")
         } catch is NativeAPITimeout { }
-        while await timed.closeCount == 0 { try await Task.sleep(for: .milliseconds(5)) }
+        try await waitForReaderCondition { !(await timed.closeCount == 0) }
         #expect(await timed.closeCount == 1)
 
         let cancelled = NeverReplyRequest()
         let task = Task {
             try await BoundedNativeRequest.run(timeout: .seconds(20), operation: { try await cancelled.wait() }, cancel: { Task { await cancelled.close() } })
         }
-        while !(await cancelled.started) { try await Task.sleep(for: .milliseconds(5)) }
+        try await waitForReaderCondition { !(!(await cancelled.started)) }
         task.cancel()
         do {
             _ = try await task.value
             Issue.record("Expected native request cancellation.")
         } catch is CancellationError { }
-        while await cancelled.closeCount == 0 { try await Task.sleep(for: .milliseconds(5)) }
+        try await waitForReaderCondition { !(await cancelled.closeCount == 0) }
         #expect(await cancelled.closeCount == 1)
     }
 }
@@ -369,5 +369,13 @@ private actor StubAppleContainerAPI: AppleContainerResourceAPI {
         if statsFailures.contains(id) { throw StubError.failed }
         guard let sample = statsByID[id] else { throw StubError.failed }
         return sample
+    }
+}
+
+private func waitForReaderCondition(_ condition: @Sendable () async -> Bool) async throws {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+    while !(await condition()) {
+        try #require(ContinuousClock.now < deadline, "Timed out waiting for reader test synchronization")
+        try await Task.sleep(for: .milliseconds(5))
     }
 }

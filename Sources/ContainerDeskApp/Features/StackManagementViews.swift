@@ -172,7 +172,7 @@ struct StackMemberMenu: View {
         } label: { Image(systemName: "ellipsis.circle") }
         .menuStyle(.borderlessButton)
         .fixedSize()
-        .help("Manage \(containerTitle)")
+        .help("Manage \(containerTitle)").accessibilityLabel("Manage \(containerTitle)")
         .accessibilityLabel("Manage \(containerTitle)")
         .disabled(library.loadError != nil)
     }

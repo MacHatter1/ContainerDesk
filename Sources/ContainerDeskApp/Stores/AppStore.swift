@@ -8,13 +8,17 @@ public final class AppStore {
     let cleanupStore = CleanupStore()
     let pluginLibrary: PluginLibraryStore
     let kubernetesOperations = KubernetesOperationStore()
+    let buildOperations = BuildOperationStore()
     let environmentProfiles: EnvironmentProfilesStore
     let managedStacks: ManagedStacksStore
     let monitoring: ContainerMonitoringStore
     let runtimeOperations = RuntimeOperationPolicy()
     public var limitsOperationContainerID: String? { runtimeOperations.limitsContainerID }
+    var isRecoveryCleanupInProgress: Bool { runtimeOperations.isRecoveryCleanupInProgress }
+    var isShuttingDown: Bool { runtimeOperations.isShuttingDown }
     public private(set) var operations: [OperationRecord] = []
     public private(set) var snapshots: [ContainerSection: ResourceSnapshot] = [:]
+    public private(set) var resourceUpdatedAt: [ContainerSection: Date] = [:]
     public private(set) var resourceReadBackends: [ContainerSection: ResourceReadBackend] = [:]
     public private(set) var resourceReadFallbackReasons: [ContainerSection: String] = [:]
     public private(set) var containerMetrics: [String: ContainerMetric] = [:]
@@ -72,11 +76,13 @@ public final class AppStore {
     public private(set) var cliCapabilities: [ContainerSection: CLIFeatureAvailability] = [:]
     public var cliPath: String? {
         didSet {
+            if cliPath?.isEmpty == true { cliPath = nil }
+            guard cliPath != oldValue else { return }
             defaults.set(cliPath, forKey: Self.cliPathKey)
-            if let cliPath, cliPath.isEmpty { self.cliPath = nil; return }
             client = ProcessContainerClient(resolver: ExecutableResolver(overridePath: cliPath))
             resourceReader = ContainerResourceReader(cli: client, nativeAllowed: cliPath == nil)
             clientEpoch += 1
+            limitsRecoveryService = nil
             monitoring.reset()
             managedStacks.setRuntime(cliPath: cliPath)
             cleanupStore.invalidate()
@@ -85,6 +91,7 @@ public final class AppStore {
             for waiters in resourceRefreshWaiters.values { for waiter in waiters.values { waiter.resume() } }
             resourceRefreshWaiters.removeAll()
             lastResourceRefreshAt.removeAll()
+            resourceUpdatedAt.removeAll()
             for section in ContainerSection.allCases {
                 cliCapabilities[section] = .unknown
                 snapshots[section] = ResourceSnapshot()
@@ -129,6 +136,7 @@ public final class AppStore {
 
     @ObservationIgnored private var resourceReader: ContainerResourceReader?
     @ObservationIgnored private var limitsService: ContainerLimitsService?
+    @ObservationIgnored private var limitsRecoveryService: ContainerLimitsRecoveryService?
     @ObservationIgnored private var limitsPlanEpochs: [UUID: Int] = [:]
     @ObservationIgnored private var pollingTask: Task<Void, Never>?
     @ObservationIgnored private var healthTask: Task<Void, Never>?
@@ -138,6 +146,7 @@ public final class AppStore {
     @ObservationIgnored private var resourcePollingTokens: [ContainerSection: UUID] = [:]
     @ObservationIgnored private var refreshingSections = Set<ContainerSection>()
     @ObservationIgnored private var resourceRefreshWaiters: [ContainerSection: [UUID: CheckedContinuation<Void, Never>]] = [:]
+    var resourceRefreshWaiterCount: Int { resourceRefreshWaiters.values.reduce(0) { $0 + $1.count } }
     @ObservationIgnored private var lastResourceRefreshAt: [ContainerSection: Date] = [:]
     @ObservationIgnored private var refreshGenerations: [ContainerSection: Int] = [:]
     @ObservationIgnored private var completedRefreshGenerations: [ContainerSection: Int] = [:]
@@ -153,6 +162,12 @@ public final class AppStore {
     @ObservationIgnored private var previousStatsBackend: ResourceReadBackend?
     @ObservationIgnored private var containerMetricsShouldUseCLICadence = false
     @ObservationIgnored private var operationCancellers: [UUID: @Sendable () -> Void] = [:]
+    private struct OwnedCommandTask {
+        let cancel: @Sendable () -> Void
+        let wait: @Sendable () async -> Void
+    }
+    @ObservationIgnored private var ownedCommandTasks: [UUID: OwnedCommandTask] = [:]
+    @ObservationIgnored private var shutdownTask: Task<Void, Never>?
     @ObservationIgnored private var retryRequests: [UUID: CommandRequest] = [:]
     @ObservationIgnored private var lastCapabilitiesRefresh: Date?
     private let defaults: UserDefaults
@@ -197,6 +212,8 @@ public final class AppStore {
 
     /// Retains full recreation inputs inside Core; the sheet receives only non-secret review fields.
     public func prepareContainerLimits(id: String) async throws -> ContainerLimitsPlan {
+        guard !isShuttingDown else { throw RuntimeOperationError.shuttingDown }
+        guard !isRecoveryCleanupInProgress else { throw RuntimeOperationError.recoveryCleanupInProgress }
         guard cliPath == nil, limitsOperationContainerID == nil else {
             throw ContainerLimitsIssue.unsupportedCLI
         }
@@ -219,6 +236,31 @@ public final class AppStore {
     public func discardContainerLimitsPlan(id: UUID) async {
         limitsPlanEpochs[id] = nil
         await limitsService?.discard(planID: id)
+    }
+
+    func scanLimitsRecovery() async throws -> [LimitsRecoverySession] {
+        guard !isShuttingDown else { throw RuntimeOperationError.shuttingDown }
+        guard cliPath == nil else { throw ContainerLimitsIssue.unsupportedCLI }
+        guard limitsOperationContainerID == nil, !isRecoveryCleanupInProgress else { throw LimitsRecoveryError.busy }
+        let epoch = clientEpoch
+        let service = recoveryService()
+        let sessions = try await service.scan()
+        guard epoch == clientEpoch, limitsOperationContainerID == nil else { throw RuntimeOperationError.runtimeChanged }
+        return sessions
+    }
+
+    func removeLimitsRecovery(_ sessions: [LimitsRecoverySession]) async throws -> [LimitsRecoveryRemoval] {
+        guard cliPath == nil else { throw ContainerLimitsIssue.unsupportedCLI }
+        guard let token = runtimeOperations.beginRecoveryCleanup() else { throw LimitsRecoveryError.busy }
+        defer { runtimeOperations.endRecoveryCleanup(token) }
+        return try await recoveryService().remove(sessions)
+    }
+
+    private func recoveryService() -> ContainerLimitsRecoveryService {
+        if let limitsRecoveryService { return limitsRecoveryService }
+        let service = ContainerLimitsRecoveryService(client: client)
+        limitsRecoveryService = service
+        return service
     }
 
     /// Recreation is one non-retryable, non-cancellable transaction; Core owns its recovery path.
@@ -267,18 +309,20 @@ public final class AppStore {
         let affected = monitoring.beginCommand(request, containers: snapshots[.containers]?.items ?? [])
         let canRetry = allowRetry && request.isSafeToRetry
         var record = OperationRecord(title: title, commandPreview: request.preview, canRetry: canRetry, canCancel: allowCancellation)
+        defer { ownedCommandTasks[record.id] = nil }
         operations.insert(record, at: 0)
         if canRetry { retryRequests[record.id] = request }
         trimHistory()
         do {
             let task = Task { try await requestClient.run(request) }
+            ownedCommandTasks[record.id] = .init(cancel: { task.cancel() }, wait: { _ = try? await task.value })
             if allowCancellation { operationCancellers[record.id] = { task.cancel() } }
             let result = try await withTaskCancellationHandler { try await task.value } onCancel: {
                 if allowCancellation { task.cancel() }
             }
-            if clientEpoch == commandEpoch { monitoring.finishCommand(request, affected: affected, succeeded: result.succeeded) }
             operationCancellers[record.id] = nil
             let wasCancelled = (allowCancellation && Task.isCancelled) || operations.first(where: { $0.id == record.id })?.state == .cancelled
+            if clientEpoch == commandEpoch { monitoring.finishCommand(request, affected: affected, succeeded: result.succeeded && !wasCancelled) }
             record.finishedAt = .now
             record.exitCode = result.exitCode
             if wasCancelled {
@@ -289,6 +333,7 @@ public final class AppStore {
                 if !result.succeeded { record.error = result.failureDescription }
             }
             updateOperation(record)
+            if wasCancelled { throw CancellationError() }
             if allowCancellation { try Task.checkCancellation() }
             guard result.succeeded else { throw CommandFailure(result: result, request: request) }
             retryRequests[record.id] = nil
@@ -348,6 +393,7 @@ public final class AppStore {
         let task = Task { @MainActor [weak self] in
             defer { operationPolicy.endCommand(lease) }
             guard let self else { continuation.finish(); return }
+            defer { ownedCommandTasks[submittedRecord.id] = nil }
             let record = submittedRecord
             var execution: ManagedProcessExecution?
             var terminalError: (any Error)?
@@ -429,6 +475,7 @@ public final class AppStore {
             else { continuation.finish() }
         }
         operationCancellers[record.id] = { task.cancel() }
+        ownedCommandTasks[record.id] = .init(cancel: { task.cancel() }, wait: { await task.value })
         continuation.onTermination = { @Sendable _ in task.cancel() }
         return TrackedCommandStream(operationID: record.id, events: events, completion: task)
     }
@@ -441,6 +488,27 @@ public final class AppStore {
         record.finishedAt = .now
         record.error = "Cancelled by user."
         updateOperation(record)
+    }
+
+    func shutdown() async {
+        if let shutdownTask { await shutdownTask.value; return }
+        runtimeOperations.beginShutdown()
+        let readers = [pollingTask, healthTask, capabilitiesTask, containerMetricsTask].compactMap { $0 }
+            + Array(resourcePollingTasks.values)
+        stopPolling()
+        cleanupStore.invalidate()
+        let commands = Array(ownedCommandTasks.values)
+        for command in commands { command.cancel() }
+        let task = Task {
+            await buildOperations.shutdown()
+            await kubernetesOperations.shutdown()
+            await withTaskGroup(of: Void.self) { group in
+                for reader in readers { group.addTask { await reader.value } }
+                for command in commands { group.addTask { await command.wait() } }
+            }
+        }
+        shutdownTask = task
+        await task.value
     }
 
     @discardableResult
@@ -458,7 +526,7 @@ public final class AppStore {
     }
 
     private func refresh(_ section: ContainerSection, minimumGeneration: Int?, epoch requestedEpoch: Int) async {
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, !isShuttingDown else { return }
         guard clientEpoch == requestedEpoch else { return }
         guard listArguments(for: section) != nil else { return }
         if let minimumGeneration, (completedRefreshGenerations[section] ?? 0) >= minimumGeneration { return }
@@ -493,9 +561,10 @@ public final class AppStore {
         refreshGenerations[section] = generation
         let epoch = clientEpoch
         let reader = resourceReader ?? ContainerResourceReader(cli: client, nativeAllowed: cliPath == nil)
+        var completed = false
         defer {
             if refreshGenerations[section] == generation {
-                completedRefreshGenerations[section] = generation
+                if completed { completedRefreshGenerations[section] = generation }
                 refreshingSections.remove(section)
                 let waiters = resourceRefreshWaiters.removeValue(forKey: section) ?? [:]
                 for waiter in waiters.values { waiter.resume() }
@@ -510,12 +579,12 @@ public final class AppStore {
         do {
             let result = try await reader.list(section)
             guard !Task.isCancelled, clientEpoch == epoch, refreshGenerations[section] == generation else { return }
+            completed = true
             let refreshedAt = Date.now
             if section == .containers { monitoring.observe(result.value, at: refreshedAt) }
             lastResourceRefreshAt[section] = refreshedAt
+            resourceUpdatedAt[section] = refreshedAt
             let currentSnapshot = snapshots[section] ?? ResourceSnapshot()
-            // Keep the observation graph quiet when a successful poll returns identical data.
-            // The private refresh clock still advances, so later polls remain cadence based.
             if currentSnapshot.items != result.value || currentSnapshot.state != .loaded {
                 snapshots[section] = ResourceSnapshot(items: result.value, fetchedAt: refreshedAt, state: .loaded)
             }
@@ -528,6 +597,7 @@ public final class AppStore {
             if section == .containers { updateContainerMetricsPolling() }
         } catch {
             if !Task.isCancelled, clientEpoch == epoch, refreshGenerations[section] == generation {
+                completed = true
                 lastResourceRefreshAt[section] = nil
                 resourceReadFallbackReasons[section] = nil
                 setFailure(for: section, message: error.localizedDescription)
@@ -545,11 +615,12 @@ public final class AppStore {
 
     /// Reads a curated, redacted container inspection through the native API when verified, with CLI fallback.
     public func inspectContainer(id: String) async throws -> ResourceReadResult<SanitizedContainerInspection> {
+        guard !isShuttingDown else { throw RuntimeOperationError.shuttingDown }
         let epoch = clientEpoch
         let reader = resourceReader ?? ContainerResourceReader(cli: client, nativeAllowed: cliPath == nil)
         let result = try await reader.inspectContainer(id: id)
         try Task.checkCancellation()
-        guard clientEpoch == epoch else { throw CancellationError() }
+        guard clientEpoch == epoch, !isShuttingDown else { throw CancellationError() }
         return result
     }
 
@@ -593,7 +664,7 @@ public final class AppStore {
     public func refreshCapabilities() async {
         let epoch = clientEpoch
         let requestClient = client
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, !isShuttingDown else { return }
         do {
             let root = try await requestClient.run(CommandRequest(arguments: ["--help"], captureLimit: 256_000, suppressOutputEvents: true, timeout: .seconds(15)))
             guard !Task.isCancelled, clientEpoch == epoch else { return }
@@ -636,6 +707,7 @@ public final class AppStore {
     }
 
     private func checkPlugin(section: ContainerSection, arguments: [String], client requestClient: any ContainerClient, epoch: Int) async {
+        guard !isShuttingDown else { return }
         let subcommand = arguments.first ?? ""
         do {
             let result = try await requestClient.run(CommandRequest(arguments: arguments, captureLimit: 128_000, suppressOutputEvents: true, timeout: .seconds(15)))
@@ -648,7 +720,7 @@ public final class AppStore {
     public func refreshSystemVersion() async {
         let epoch = clientEpoch
         let requestClient = client
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, !isShuttingDown else { return }
         do {
             let result = try await requestClient.run(CommandRequest(arguments: ["system", "version", "--format", "json"], suppressOutputEvents: true, timeout: .seconds(20)))
             guard !Task.isCancelled, clientEpoch == epoch else { return }
@@ -671,7 +743,7 @@ public final class AppStore {
     }
 
     private func refreshRuntimeStatus(using requestClient: any ContainerClient, epoch: Int) async {
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, !isShuttingDown else { return }
         do {
             let result = try await requestClient.run(CommandRequest(arguments: ["system", "status"], suppressOutputEvents: true, timeout: .seconds(20)))
             guard !Task.isCancelled, clientEpoch == epoch else { return }
@@ -691,23 +763,17 @@ public final class AppStore {
 
     /// The only elevation path exposed by the app: fixed container DNS create/delete commands.
     public func executePrivilegedDNS(_ action: DNSAdminAction) async throws -> String {
+        guard !isShuttingDown else { throw RuntimeOperationError.shuttingDown }
         try action.validate()
         guard let executable = ExecutableResolver(overridePath: cliPath).resolve() else { throw ContainerClientError.executableNotFound }
-        let appleScript = #"""
-        on run argv
-            set shellCommand to quoted form of (item 1 of argv)
-            repeat with argIndex from 2 to count of argv
-                set shellCommand to shellCommand & " " & quoted form of (item argIndex of argv)
-            end repeat
-            return do shell script shellCommand with administrator privileges
-        end run
-        """#
-        let commandArguments = ["/usr/bin/env", "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", executable.path] + action.arguments
+        let adminRequest = try action.administratorRequest(executableURL: executable)
         var record = OperationRecord(title: action.activityTitle, commandPreview: "container \(action.arguments.joined(separator: " ")) (administrator)", canRetry: false, canCancel: false)
         operations.insert(record, at: 0)
         trimHistory()
         do {
-            let output = try await runAdminScript(script: appleScript, arguments: commandArguments)
+            let result = try await ProcessExecutableClient(executableURL: URL(fileURLWithPath: "/usr/bin/osascript")).run(adminRequest)
+            guard result.succeeded else { throw DNSAdminError.command(result.failureDescription ?? "The administrator command failed or was cancelled.") }
+            let output = result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
             record.finishedAt = .now
             record.state = .succeeded
             updateOperation(record)
@@ -738,7 +804,7 @@ public final class AppStore {
     }
 
     public func startPolling() {
-        guard pollingTask == nil else { return }
+        guard pollingTask == nil, !isShuttingDown else { return }
         pollingTask = Task { [weak self] in
             guard let self else { return }
             var iterationStart = ContinuousClock.now
@@ -756,7 +822,7 @@ public final class AppStore {
     }
 
     private func startHealthPollingIfNeeded() {
-        guard healthTask == nil else { return }
+        guard healthTask == nil, !isShuttingDown else { return }
         healthPollingGeneration += 1
         let generation = healthPollingGeneration
         healthTask = Task { [weak self] in
@@ -773,7 +839,7 @@ public final class AppStore {
     }
 
     private func startCapabilitiesPollingIfNeeded() {
-        guard capabilitiesTask == nil else { return }
+        guard capabilitiesTask == nil, !isShuttingDown else { return }
         capabilitiesPollingGeneration += 1
         let generation = capabilitiesPollingGeneration
         capabilitiesTask = Task { [weak self] in
@@ -997,58 +1063,11 @@ public final class AppStore {
     }
 }
 
-private func runAdminScript(script: String, arguments: [String]) async throws -> String {
-    try await withCheckedThrowingContinuation { continuation in
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script, "--"] + arguments
-        process.standardOutput = pipe
-        process.standardError = pipe
-        do { try process.run() }
-        catch { continuation.resume(throwing: DNSAdminError.launch(error.localizedDescription)); return }
-        let group = DispatchGroup()
-        let output = BoundedOutput(limit: 64_000)
-        group.enter()
-        DispatchQueue.global(qos: .utility).async {
-            while true {
-                guard let data = try? pipe.fileHandleForReading.read(upToCount: 4_096), !data.isEmpty else { break }
-                output.append(data)
-            }
-            group.leave()
-        }
-        group.enter()
-        DispatchQueue.global(qos: .utility).async { process.waitUntilExit(); group.leave() }
-        group.notify(queue: .global(qos: .utility)) {
-            let text = output.string.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard process.terminationReason == .exit, process.terminationStatus == 0 else {
-                continuation.resume(throwing: DNSAdminError.command(text.isEmpty ? "The administrator command failed or was cancelled." : text))
-                return
-            }
-            continuation.resume(returning: text)
-        }
-    }
-}
-
-private final class BoundedOutput: @unchecked Sendable {
-    private let lock = NSLock()
-    private let limit: Int
-    private var data = Data()
-    init(limit: Int) { self.limit = limit }
-    func append(_ incoming: Data) {
-        lock.lock(); defer { lock.unlock() }
-        guard data.count < limit else { return }
-        data.append(incoming.prefix(limit - data.count))
-    }
-    var string: String {
-        lock.lock(); defer { lock.unlock() }
-        return String(decoding: data, as: UTF8.self)
-    }
-}
-
-private struct CommandFailure: LocalizedError {
+struct CommandFailure: LocalizedError {
     let message: String
+    let timedOut: Bool
     init(result: CommandResult, request: CommandRequest) {
+        timedOut = result.timedOut
         if result.timedOut { message = "Command timed out."; return }
         let raw = result.standardError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? result.standardOutput : result.standardError
         let safe = request.sanitizeOutput(raw).trimmingCharacters(in: .whitespacesAndNewlines)
