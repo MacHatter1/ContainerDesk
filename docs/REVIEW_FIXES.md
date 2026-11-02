@@ -123,3 +123,11 @@ The final release app passed strict signature/resource validation and launch che
 Pre-PR verification exposed test-only scheduling assumptions and a loopback HTTP fixture race. Inventory synchronization now has a ten-second bound to accommodate parallel native-view work. Quit checks its timeout, ready and cancellation outcomes within a test time limit; the inherited-pipe test requires normal completion without hitting its command timeout, instead of measuring unrelated scheduler delays. The HTTP fixture consumes the complete size-bounded, length-delimited request before replying, with a socket read timeout, so closing it cannot discard the response because request data remains unread. These fixture changes were reviewed separately; the packaged application implementation is unchanged.
 
 The focused HTTP suite and final complete release rerun passed: 420 entries, 415 passed, five opt-in live entries skipped, no failures or errors. The 22 Python tests, Actionlint, ShellCheck and whitespace checks also passed before publishing the branch.
+
+## CI runner follow-up
+
+The first PR CI run used Swift 6.3, which runs the app and core tests together. Its two subprocess-fixture failures were a three-second timeout before the normal-exit fixture produced output, and a four-second elapsed-time assertion that included interpreter startup and unrelated scheduling.
+
+The normal-exit fixture now uses a native shell with a background pipe holder. Both fixtures use isolated process registries and a fifteen-second command safety timeout. Cancellation waits for the escaped descendant's readiness message. The tests require the expected timeout/cancellation outcome, reported output truncation and a still-live pipe holder when completion returns. These checks detect waiting for descendant EOF without measuring fixture startup against a short stopwatch limit. A one-minute test limit bounds each case, and fixture descendants are explicitly removed afterward.
+
+The focused subprocess tests passed, followed by the complete local release suite: 420 entries, 415 passed, five opt-in live entries skipped, no failures or errors. Only tests and this verification record changed; the installed application implementation is unchanged.

@@ -16,7 +16,7 @@ struct RemainingReviewCoreTests {
         #expect(try ContainerCommandTokenizer.tokenize(input) == expected)
     }
 
-    @Test func normalLeaderExitBoundsInheritedPipesWithoutCommandTimeout() async throws {
+    @Test(.timeLimit(.minutes(1))) func normalLeaderExitBoundsInheritedPipesWithoutCommandTimeout() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("NormalExitPipe-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let marker = root.appendingPathComponent("pid")
@@ -24,14 +24,16 @@ struct RemainingReviewCoreTests {
             if let text = try? String(contentsOf: marker, encoding: .utf8), let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)) { kill(pid, SIGKILL) }
             try? FileManager.default.removeItem(at: root)
         }
-        let script = "import os,sys,time; pid=os.fork();\nif pid == 0:\n os.setsid(); open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)\nelse:\n print('leader output', flush=True)\n"
-        // The timeout bounds a stuck pipe; normal leader exit must finish without
-        // timing out. Elapsed time also includes scheduling by parallel fixtures.
-        let result = try await ProcessExecutableClient(executableURL: URL(fileURLWithPath: "/usr/bin/python3"))
-            .run(.init(arguments: ["-c", script, marker.path], timeout: .seconds(3)))
+        // Normal exit does not kill the process group, so a native shell and
+        // background sleep can hold the pipes without a cold Python startup.
+        let script = "/bin/sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; printf 'leader output\\n'"
+        let result = try await ProcessExecutableClient(executableURL: URL(fileURLWithPath: "/bin/sh"), registry: ProcessRegistry())
+            .run(.init(arguments: ["-c", script, "pipe-fixture", marker.path], timeout: .seconds(15)))
         #expect(!result.timedOut)
         #expect(result.exitCode == 0)
         #expect(result.standardOutput.contains("leader output"))
         #expect(result.outputTruncated, "An inherited pipe cut off before EOF must be disclosed.")
+        let pid = try #require(Int32(String(contentsOf: marker, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
+        #expect(kill(pid, 0) == 0, "The pipe holder must still be alive when the command completes.")
     }
 }

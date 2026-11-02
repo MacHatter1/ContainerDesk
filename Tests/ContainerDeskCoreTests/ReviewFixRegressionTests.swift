@@ -67,7 +67,7 @@ struct ReviewFixRegressionTests {
         #expect(throws: DNSAdminError.self) { try DNSAdminAction.delete(domainName: "app.test; id").administratorRequest(executableURL: cli) }
     }
 
-    @Test(arguments: [false, true])
+    @Test(.timeLimit(.minutes(1)), arguments: [false, true])
     func escapedDescendantCannotKeepOutputPipesOpenPastShutdown(cancel: Bool) async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("EscapedPipe-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -77,18 +77,32 @@ struct ReviewFixRegressionTests {
             try? FileManager.default.removeItem(at: root)
         }
         let script = "import os,sys,time; pid=os.fork();\nif pid == 0:\n os.setsid(); open(sys.argv[1], 'w').write(str(os.getpid())); print('ready', flush=True); time.sleep(30)\nelse:\n os.waitpid(pid, 0)\n"
-        let client = ProcessExecutableClient(executableURL: URL(fileURLWithPath: "/usr/bin/python3"))
-        let start = ContinuousClock.now
-        if cancel {
-            let execution = try client.launch(.init(arguments: ["-c", script, marker.path], timeout: .seconds(5)))
-            for try await event in execution.events {
-                if case .standardOutput = event { break }
+        let client = ProcessExecutableClient(executableURL: URL(fileURLWithPath: "/usr/bin/python3"), registry: ProcessRegistry())
+        // Allow interpreter startup on a cold runner. Cancellation starts only
+        // after the escaped descendant confirms that it holds the output pipes.
+        let execution = try client.launch(.init(arguments: ["-c", script, marker.path], timeout: .seconds(15)))
+        var output = ""
+        var cancellationRequested = false
+        var completed: CommandResult?
+        for try await event in execution.events {
+            switch event {
+            case .standardOutput(let text):
+                output += text
+                if cancel, !cancellationRequested, output.contains("ready\n") {
+                    cancellationRequested = true
+                    await execution.terminateAndWait()
+                }
+            case .completed(let result): completed = result
+            default: break
             }
-            await execution.terminateAndWait()
-        } else {
-            let result = try await client.run(.init(arguments: ["-c", script, marker.path], timeout: .seconds(1)))
-            #expect(result.timedOut)
         }
-        #expect(start.duration(to: .now) < .seconds(4))
+        await execution.terminateAndWait()
+        let result = try #require(completed)
+        #expect(output.contains("ready\n"), "The escaped pipe holder must start before shutdown.")
+        #expect(cancellationRequested == cancel)
+        #expect(result.timedOut == !cancel)
+        #expect(result.outputTruncated, "Completion must cut off the escaped holder's pipes before EOF.")
+        let pid = try #require(Int32(String(contentsOf: marker, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
+        #expect(kill(pid, 0) == 0, "Completion must not wait for the escaped descendant to exit.")
     }
 }
