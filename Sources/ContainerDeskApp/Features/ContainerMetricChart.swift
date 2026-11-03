@@ -1,4 +1,3 @@
-import Charts
 import ContainerDeskCore
 import SwiftUI
 
@@ -27,7 +26,7 @@ struct ContainerMetricChart: View {
     let end: Date
     @Binding var selectedDate: Date?
     @Environment(\.colorSchemeContrast) private var contrast
-    @State private var projection = ContainerMetricSeriesProjection()
+    @State private var presentation = ContainerMetricChartPresentation()
     @State private var plotWidth = 600
 
     private var chartMetric: ContainerChartMetric {
@@ -35,18 +34,20 @@ struct ContainerMetricChart: View {
     }
 
     var body: some View {
+        let projection = presentation.series
         let series = projection.value(samples: samples, events: events, metric: chartMetric, maximumPoints: max(64, plotWidth * 2))
         let points = series.points
+        let _ = presentation.formatting.prepare(points: points, locale: .current)
         let peak = series.peak
         let average = series.average
         let unitSuffix = metric.unit == "%" ? "%" : " \(metric.unit)"
         let upper = max(1, peak * 1.12)
         VStack(alignment: .leading, spacing: 14) {
-            ContainerMetricReadout(metric: metric, samples: samples, latest: points.last, selectedDate: $selectedDate)
-            ContainerMetricPlot(metric: metric, points: points, events: events, start: start, end: end, upper: upper, sampleCount: series.sampleCount)
+            ContainerMetricReadout(metric: metric, samples: samples, latest: points.last, selectedDate: $selectedDate, formatting: presentation.formatting)
+            ContainerMetricPlot(metric: metric, points: points, events: events, start: start, end: end, upper: upper, sampleCount: series.sampleCount, cache: presentation.paths)
                 .equatable()
-                .chartOverlay { proxy in
-                    ContainerMetricCursor(metric: metric, samples: samples, latest: points.last, proxy: proxy, selectedDate: $selectedDate)
+                .overlay {
+                    ContainerMetricCursor(metric: metric, samples: samples, latest: points.last, start: start, end: end, upper: upper, selectedDate: $selectedDate)
                 }
                 .frame(height: 112)
                 .onGeometryChange(for: Int.self) { max(1, Int($0.size.width.rounded())) } action: { plotWidth = $0 }
@@ -64,57 +65,6 @@ struct ContainerMetricChart: View {
                 }
         }
         .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(contrast == .increased ? Color.primary.opacity(0.5) : metric.tint.opacity(0.16)) }
-    }
-
-}
-
-/// Cursor state stays outside the static Swift Charts content. Equality covers
-/// every plot input, so new samples, events, domains and CPU mode still redraw.
-private struct ContainerMetricPlot: View, Equatable {
-    let metric: ContainerMetricChart.Metric
-    let points: [ContainerChartPoint]
-    let events: [ContainerHistoryEvent]
-    let start: Date
-    let end: Date
-    let upper: Double
-    let sampleCount: Int
-
-    var body: some View {
-        Chart {
-            ForEach(points) { point in
-                AreaMark(x: .value("Time", point.date), y: .value(metric.title, point.value), series: .value("Segment", point.segment))
-                    .foregroundStyle(LinearGradient(colors: [metric.tint.opacity(0.24), metric.tint.opacity(0.025)], startPoint: .top, endPoint: .bottom))
-                    .interpolationMethod(.monotone)
-                LineMark(x: .value("Time", point.date), y: .value(metric.title, point.value), series: .value("Segment", point.segment))
-                    .foregroundStyle(metric.tint).lineStyle(StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
-                    .interpolationMethod(.monotone)
-            }
-            ForEach(events) { event in
-                RuleMark(x: .value("Event", event.date)).foregroundStyle(event.kind.chartColor.opacity(0.7))
-                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 4]))
-            }
-        }
-        .chartXScale(domain: start...end)
-        .chartYScale(domain: 0...upper)
-        .chartXAxis {
-            AxisMarks(values: [start, start.addingTimeInterval(end.timeIntervalSince(start) / 2), end]) { tick in
-                let date = tick.as(Date.self) ?? start
-                AxisValueLabel(centered: false, anchor: date == end ? .topTrailing : date == start ? .topLeading : .top) {
-                    Text(date, format: .dateTime.hour().minute())
-                }
-                    .font(.caption2.monospacedDigit())
-            }
-        }
-        .chartYAxis {
-            AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { _ in
-                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [2, 3])).foregroundStyle(.secondary.opacity(0.2))
-                AxisValueLabel().font(.caption2.monospacedDigit())
-            }
-        }
-        .overlay {
-            if points.isEmpty { Text("Collecting samples…").font(.caption).foregroundStyle(.secondary) }
-        }
-        .accessibilityLabel("\(metric.title) over the last \(Int(end.timeIntervalSince(start) / 60)) minutes, \(sampleCount) samples, \(events.count) events")
     }
 
 }
@@ -144,9 +94,28 @@ private struct ContainerMetricReadout: View {
     let latest: ContainerChartPoint?
     @Binding var selectedDate: Date?
 
+    let formatting: ContainerMetricReadoutFormatting
+
     var body: some View {
         let selection = ContainerMetricSelection(metric: metric, samples: samples, latest: latest, selectedDate: selectedDate)
-        let value = selection.value.map { $0.formatted(.number.precision(.fractionLength(1))) } ?? "—"
+        let value = formatting.string(selection.value, locale: .current)
+        ContainerMetricReadoutValue(metric: metric, value: value, isSelected: selection.isSelected)
+            .equatable()
+    }
+}
+
+/// A cursor can move between samples with the same displayed value. Only the
+/// formatted value, mode and metric affect this readout's layout/accessibility.
+private struct ContainerMetricReadoutValue: View, Equatable {
+    let metric: ContainerMetricChart.Metric
+    let value: String
+    let isSelected: Bool
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.metric == rhs.metric && lhs.value == rhs.value && lhs.isSelected == rhs.isSelected
+    }
+
+    var body: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 5) {
                 Label(metric.title, systemImage: metric.symbol).font(.subheadline.weight(.semibold)).foregroundStyle(metric.tint)
@@ -157,12 +126,12 @@ private struct ContainerMetricReadout: View {
                 Text(metric.subtitle).font(.caption).foregroundStyle(.secondary)
             }
             Spacer(minLength: 8)
-            Text(selection.isSelected ? "SELECTED" : "LATEST")
+            Text(isSelected ? "SELECTED" : "LATEST")
                 .font(.caption2.weight(.semibold)).tracking(0.7).foregroundStyle(metric.tint)
                 .padding(.horizontal, 7).padding(.vertical, 4).background(metric.tint.opacity(0.09), in: Capsule())
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(metric.title) \(selection.isSelected ? "selected" : "latest"), \(value) \(metric.unit), \(metric.subtitle)")
+        .accessibilityLabel("\(metric.title) \(isSelected ? "selected" : "latest"), \(value) \(metric.unit), \(metric.subtitle)")
     }
 }
 
@@ -170,24 +139,27 @@ private struct ContainerMetricCursor: View {
     let metric: ContainerMetricChart.Metric
     let samples: [ContainerHistorySample]
     let latest: ContainerChartPoint?
-    let proxy: ChartProxy
+    let start: Date
+    let end: Date
+    let upper: Double
     @Binding var selectedDate: Date?
 
     var body: some View {
         let selection = ContainerMetricSelection(metric: metric, samples: samples, latest: latest, selectedDate: selectedDate)
         GeometryReader { geometry in
-            if let anchor = proxy.plotFrame {
-                let frame = geometry[anchor]
+            let coordinates = ContainerMetricPlotCoordinates(start: start, end: end, upper: upper, size: geometry.size)
+            let frame = coordinates.frame
+            if frame.width > 0 && frame.height > 0 {
                 ZStack(alignment: .topLeading) {
-                    if let date = selection.date, let x = proxy.position(forX: date) {
+                    if let date = selection.date, let x = coordinates.x(for: date) {
                         if selection.isSelected {
                             Path { path in
-                                path.move(to: CGPoint(x: x, y: 0))
-                                path.addLine(to: CGPoint(x: x, y: frame.height))
+                                path.move(to: CGPoint(x: x, y: frame.minY))
+                                path.addLine(to: CGPoint(x: x, y: frame.maxY))
                             }
                             .stroke(.primary.opacity(0.5), style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
                         }
-                        if let value = selection.value, let y = proxy.position(forY: value) {
+                        if let value = selection.value, let y = coordinates.y(for: value) {
                             Circle().fill(metric.tint)
                                 .frame(width: selection.isSelected ? 6 : 5, height: selection.isSelected ? 6 : 5)
                                 .padding(selection.isSelected ? 2 : 0)
@@ -196,23 +168,21 @@ private struct ContainerMetricCursor: View {
                         }
                     }
                 }
-                .frame(width: frame.width, height: frame.height)
-                .position(x: frame.midX, y: frame.midY)
                 .allowsHitTesting(false).accessibilityHidden(true)
             }
             Rectangle().fill(.clear).contentShape(Rectangle())
                 .onContinuousHover { phase in
                     switch phase {
-                    case .active(let location): inspect(location, frame: proxy.plotFrame.map { geometry[$0] })
+                    case .active(let location): inspect(location, coordinates: coordinates)
                     case .ended: selectedDate = nil
                     }
                 }
-                .gesture(DragGesture(minimumDistance: 0).onChanged { inspect($0.location, frame: proxy.plotFrame.map { geometry[$0] }) })
+                .gesture(DragGesture(minimumDistance: 0).onChanged { inspect($0.location, coordinates: coordinates) })
         }
     }
 
-    private func inspect(_ location: CGPoint, frame: CGRect?) {
-        guard let frame, frame.contains(location), let date = proxy.value(atX: location.x - frame.minX, as: Date.self) else {
+    private func inspect(_ location: CGPoint, coordinates: ContainerMetricPlotCoordinates) {
+        guard let date = coordinates.date(at: location) else {
             selectedDate = nil
             return
         }
@@ -222,4 +192,58 @@ private struct ContainerMetricCursor: View {
 
 extension ContainerHistoryEvent.Kind {
     var chartColor: Color { switch self { case .restart: .blue; case .exit: .red; case .limits: .orange } }
+}
+
+/// Keep the formatter with the readout rather than resolving a format style on
+/// every cursor update. Creation is lazy because SwiftUI recreates view values.
+/// Snapshot changes prepare at most 128 recent plotted values. Full-resolution
+/// cursor misses format on demand, with at most 256 cached strings per card.
+@MainActor final class ContainerMetricReadoutFormatting {
+    private var formatter: NumberFormatter?
+    private var locale: Locale?
+    private var cached: [UInt64: String] = [:]
+    private var preparedPoints: [ContainerChartPoint] = []
+    private var preparedLocale: Locale?
+
+    func prepare(points: [ContainerChartPoint], locale: Locale) {
+        guard preparedPoints != points || preparedLocale != locale else { return }
+        preparedPoints = points; preparedLocale = locale
+        var recent: [UInt64: String] = [:]
+        for point in points.suffix(128) {
+            recent[point.value.bitPattern] = string(point.value, locale: locale)
+        }
+        cached = recent
+    }
+
+
+    func string(_ value: Double?, locale: Locale) -> String {
+        guard let value, value.isFinite else { return "—" }
+        if formatter == nil {
+            let number = NumberFormatter()
+            number.numberStyle = .decimal
+            number.minimumFractionDigits = 1
+            number.maximumFractionDigits = 1
+            number.maximumIntegerDigits = 309
+            number.roundingMode = .halfEven
+            formatter = number
+        }
+        if self.locale != locale {
+            formatter?.locale = locale
+            self.locale = locale
+            cached.removeAll(keepingCapacity: true)
+        }
+        if let text = cached[value.bitPattern] { return text }
+        let text = formatter?.string(from: NSNumber(value: value)) ?? "—"
+        if cached.count >= 256 { cached.removeAll(keepingCapacity: true) }
+        cached[value.bitPattern] = text
+        return text
+    }
+}
+
+/// One state owner per card. Leaf views receive stable caches without adding
+/// dynamic state/locale properties to every cursor-driven readout update.
+@MainActor private final class ContainerMetricChartPresentation {
+    lazy var series = ContainerMetricSeriesProjection()
+    lazy var paths = ContainerMetricPlotPathCache()
+    lazy var formatting = ContainerMetricReadoutFormatting()
 }

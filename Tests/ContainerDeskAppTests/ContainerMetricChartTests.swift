@@ -8,6 +8,34 @@ import Testing
 
 @Suite(.serialized)
 struct ContainerMetricChartTests {
+    @MainActor @Test func unchangedNumbersStillUpdateSelectionModeAndNormalizationLabels() async throws {
+        _ = NativeTestApplication.shared
+        let state = ChartSelectionFixture()
+        state.samples = [0.0, 1.0, 60.0].map { second in
+            .init(date: state.start.addingTimeInterval(second), metric: .init(cpuPercent: 0, memoryUsageBytes: second == 60 ? 8_388_608 : 6_291_456 + Int64(second) * 1_024), cpuLimit: 2, memoryLimit: 16_777_216)
+        }
+        let host = NSHostingView(rootView: ChartSelectionFixtureView(state: state))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1_200, height: 360), styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.contentView = nil; window.close() }
+        try await wait(host) { readout("CPU latest", in: host).contains("0.0 %") }
+        for second in [0.0, 1.0] {
+            state.selectedDate = state.start.addingTimeInterval(second)
+            try await wait(host) {
+                readout("CPU selected", in: host).contains("0.0 %, of one core") &&
+                readout("Memory selected", in: host).contains("6.0 MiB")
+            }
+        }
+        state.normalized = true
+        try await wait(host) { readout("CPU selected", in: host).contains("0.0 %, of configured limit") }
+        state.selectedDate = nil
+        try await wait(host) {
+            readout("CPU latest", in: host).contains("0.0 %, of configured limit") &&
+            readout("Memory latest", in: host).contains("8.0 MiB")
+        }
+    }
+
     @MainActor @Test func bothNativeChartReadoutsFollowSelectionGapsClearingAndNewSamples() async throws {
         _ = NativeTestApplication.shared
         let state = ChartSelectionFixture()

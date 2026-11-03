@@ -3,12 +3,16 @@ import AppKit
 import Observation
 import QuartzCore
 import SwiftUI
+import Synchronization
 
 @MainActor enum StatsBenchmarkClock {
     static let end = Date(timeIntervalSince1970: 1_000_000)
     static var revisions = 0
     static var eventRows = 0
+    nonisolated private static let drawing = Mutex<[String: Int]>([:])
+    static var renderedSampleCount: Int { drawing.withLock { min($0["CPU"] ?? -1, $0["Memory"] ?? -1) } }
     static func eventRow() { eventRows += 1 }
+    nonisolated static func rendered(_ date: Date?, count: Int, metric: String) { drawing.withLock { $0[metric] = count } }
     static var minutes: Int { Int(CommandLine.arguments[1])! > 900 ? 60 : 15 }
 }
 @MainActor @Observable final class ContainerMonitoringStore {
@@ -27,6 +31,7 @@ struct StatsBenchmarkRoot: View {
         }
         .onChange(of: selection.date) { StatsBenchmarkClock.revisions += 1 }
         .frame(width: 1_200, height: 700)
+        .environment(\.scenePhase, .active)
     }
 }
 @main @MainActor enum StatsPerformanceBench {
@@ -71,7 +76,7 @@ struct StatsBenchmarkRoot: View {
         window.isReleasedWhenClosed = false
         window.contentView = host
         host.frame = NSRect(x: 0, y: 0, width: 1_200, height: 700)
-        _ = pump(host) { true }
+        let loaded = pump(host) { StatsBenchmarkClock.renderedSampleCount == count }
         let initial = ms(begin)
         let initialRows = StatsBenchmarkClock.eventRows
         defer { window.contentView = nil; window.close() }
@@ -80,7 +85,7 @@ struct StatsBenchmarkRoot: View {
         for _ in 0..<5 { let t = ContinuousClock.now; _ = pump(host) { true }; idle.append(ms(t)) }
         var times: [Double] = []
         var hoverRows: [Int] = []
-        var success = true
+        var success = loaded
         for tick in 0..<7 {
             let revision = StatsBenchmarkClock.revisions
             let rows = StatsBenchmarkClock.eventRows
