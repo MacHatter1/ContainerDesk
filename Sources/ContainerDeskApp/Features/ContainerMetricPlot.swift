@@ -8,22 +8,20 @@ struct ContainerMetricPlot: View, Equatable {
     let metric: ContainerMetricChart.Metric
     let points: [ContainerChartPoint]
     let events: [ContainerHistoryEvent]
-    let start: Date
-    let end: Date
-    let upper: Double
+    let domain: ContainerMetricPlotDomain
     let sampleCount: Int
     let cache: ContainerMetricPlotPathCache
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.cache === rhs.cache && lhs.metric == rhs.metric && lhs.points == rhs.points && lhs.events == rhs.events &&
-        lhs.start == rhs.start && lhs.end == rhs.end && lhs.upper == rhs.upper && lhs.sampleCount == rhs.sampleCount
+        lhs.domain == rhs.domain && lhs.sampleCount == rhs.sampleCount
     }
 
     var body: some View {
-        let paths = cache.value(points: points, events: events, start: start, end: end, upper: upper)
-        let ticks = ContainerMetricPlotAxis.ticks(upper: upper)
+        let paths = cache.value(points: points, events: events, domain: domain)
+        let ticks = ContainerMetricPlotAxis.ticks(upper: domain.upper)
         Canvas { context, size in
-            let coordinates = ContainerMetricPlotCoordinates(start: start, end: end, upper: upper, size: size)
+            let coordinates = ContainerMetricPlotCoordinates(domain: domain, size: size)
             let frame = coordinates.frame
             var plot = context
             plot.clip(to: Path(frame))
@@ -49,20 +47,20 @@ struct ContainerMetricPlot: View, Equatable {
                         at: CGPoint(x: frame.minX - 6, y: y), anchor: .trailing)
                 }
             }
-            let middle = start.addingTimeInterval(end.timeIntervalSince(start) / 2)
-            context.draw(Text(start, format: .dateTime.hour().minute()).font(.caption2.monospacedDigit()).foregroundColor(.secondary),
+            let middle = domain.start.addingTimeInterval(domain.span / 2)
+            context.draw(Text(domain.start, format: .dateTime.hour().minute()).font(.caption2.monospacedDigit()).foregroundColor(.secondary),
                          at: CGPoint(x: frame.minX, y: frame.maxY + 4), anchor: .topLeading)
             context.draw(Text(middle, format: .dateTime.hour().minute()).font(.caption2.monospacedDigit()).foregroundColor(.secondary),
                          at: CGPoint(x: frame.midX, y: frame.maxY + 4), anchor: .top)
-            context.draw(Text(end, format: .dateTime.hour().minute()).font(.caption2.monospacedDigit()).foregroundColor(.secondary),
+            context.draw(Text(domain.end, format: .dateTime.hour().minute()).font(.caption2.monospacedDigit()).foregroundColor(.secondary),
                          at: CGPoint(x: frame.maxX, y: frame.maxY + 4), anchor: .topTrailing)
             if points.isEmpty {
                 context.draw(Text("Collecting samples…").font(.caption).foregroundColor(.secondary), at: CGPoint(x: frame.midX, y: frame.midY))
             }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(metric.title) over the last \(Int(end.timeIntervalSince(start) / 60)) minutes, \(sampleCount) samples, \(events.count) events")
-        .accessibilityChartDescriptor(ContainerMetricPlotDescriptor(title: metric.title, unit: metric.unit, points: points, events: events, start: start, end: end, upper: upper, sampleCount: sampleCount))
+        .accessibilityLabel("\(metric.title) over the last \(domain.minutes) minutes, \(sampleCount) samples, \(events.count) events")
+        .accessibilityChartDescriptor(ContainerMetricPlotDescriptor(title: metric.title, unit: metric.unit, points: points, events: events, domain: domain, sampleCount: sampleCount))
     }
 }
 
@@ -85,18 +83,16 @@ struct ContainerMetricPlotDescriptor: AXChartDescriptorRepresentable {
     let unit: String
     let points: [ContainerChartPoint]
     let events: [ContainerHistoryEvent]
-    let start: Date
-    let end: Date
-    let upper: Double
+    let domain: ContainerMetricPlotDomain
     let sampleCount: Int
 
     func makeChartDescriptor() -> AXChartDescriptor {
-        let start = start.timeIntervalSince1970, end = end.timeIntervalSince1970
+        let start = domain.start.timeIntervalSince1970, end = domain.end.timeIntervalSince1970
         let x = AXNumericDataAxisDescriptor(title: "Time", range: start...end, gridlinePositions: [start, (start + end) / 2, end]) {
             Date(timeIntervalSince1970: $0).formatted(.dateTime.month().day().hour().minute().second())
         }
         let unit = unit
-        let y = AXNumericDataAxisDescriptor(title: title, range: 0...upper, gridlinePositions: ContainerMetricPlotAxis.ticks(upper: upper)) {
+        let y = AXNumericDataAxisDescriptor(title: title, range: 0...domain.upper, gridlinePositions: ContainerMetricPlotAxis.ticks(upper: domain.upper)) {
             $0.formatted(.number.precision(.fractionLength(0...2))) + " " + unit
         }
         var series = ContainerMetricPlotPaths.segments(points).map { segment in
@@ -104,11 +100,12 @@ struct ContainerMetricPlotDescriptor: AXChartDescriptorRepresentable {
                 AXDataPoint(x: $0.date.timeIntervalSince1970, y: $0.value)
             })
         }
-        for kind in [ContainerHistoryEvent.Kind.restart, .exit, .limits] {
+        for kind in ContainerMetricPlotPaths.eventKinds {
             let matching = events.filter { $0.kind == kind }
             if !matching.isEmpty {
+                // Events sit on the plotted value at their time, so VoiceOver reads them in context.
                 series.append(AXDataSeriesDescriptor(name: kind.rawValue, isContinuous: false, dataPoints: matching.map {
-                    AXDataPoint(x: $0.date.timeIntervalSince1970, y: 0, label: $0.detail)
+                    AXDataPoint(x: $0.date.timeIntervalSince1970, y: Self.nearestPoint(to: $0.date, in: points)?.value ?? 0, label: $0.detail)
                 }))
             }
         }
@@ -119,5 +116,17 @@ struct ContainerMetricPlotDescriptor: AXChartDescriptorRepresentable {
         let updated = makeChartDescriptor()
         descriptor.title = updated.title; descriptor.summary = updated.summary
         descriptor.xAxis = updated.xAxis; descriptor.yAxis = updated.yAxis; descriptor.series = updated.series
+    }
+
+    /// Points are chronological; a binary search keeps event description cheap.
+    static func nearestPoint(to date: Date, in points: [ContainerChartPoint]) -> ContainerChartPoint? {
+        var lower = 0
+        var upper = points.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if points[middle].date < date { lower = middle + 1 } else { upper = middle }
+        }
+        return [lower - 1, lower].filter { points.indices.contains($0) }.map { points[$0] }
+            .min { abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date)) }
     }
 }

@@ -34,6 +34,11 @@ existing log projection and metrics-history models. The runner distinguishes tot
 log-filter completion time from main-actor delay. See [Performance verification](PERFORMANCE.md)
 for workloads, semantic checks and measurement limits.
 
+The native Stats benchmarks (`script/benchmark_chart_performance.py` for chart hover,
+`script/benchmark_stats_performance.py` for the whole history view and
+`script/benchmark_stats_soak.py` for long virtual sessions) are also documented there,
+including their reproduction commands and strict gates.
+
 The optional read-only cleanup integration check inspects the configured local runtime without deleting resources:
 
 ```sh

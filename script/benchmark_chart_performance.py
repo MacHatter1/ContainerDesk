@@ -10,6 +10,20 @@ import statistics
 import subprocess
 import tempfile
 
+CORE_MODEL_NAMES = ["ResourceSummary", "ContainerCPUUsage", "ContainerMetricsHistory", "ContainerMetricSeries"]
+CORE_MODELS = Path("Sources/ContainerDeskCore/Models")
+
+
+def chart_sources(root):
+    """The chart view plus whichever split-out helpers this source tree has."""
+    chart = root / "Sources/ContainerDeskApp/Features/ContainerMetricChart.swift"
+    helpers = [chart.with_name(name + ".swift") for name in ["ContainerMetricPlot", "ContainerMetricPlotGeometry"]]
+    return [chart, *[path for path in helpers if path.exists()]]
+
+
+def core_models(root):
+    return [root / CORE_MODELS / (name + ".swift") for name in CORE_MODEL_NAMES]
+
 
 def instrument_chart(source):
     source = source.replace("import ContainerDeskCore\n", "")
@@ -45,34 +59,27 @@ def instrument_chart(source):
 
 
 def compile_benchmark(project, root, folder, name):
-    chart = root / "Sources/ContainerDeskApp/Features/ContainerMetricChart.swift"
-    helpers = [chart.with_name(name + ".swift") for name in ["ContainerMetricPlot", "ContainerMetricPlotGeometry"] if chart.with_name(name + ".swift").exists()]
+    sources = chart_sources(root)
     generated = folder / (name + ".swift")
-    generated.write_text(instrument_chart("\n".join(path.read_text() for path in [chart, *helpers])))
-    models = root / "Sources/ContainerDeskCore/Models"
-    names = ["ResourceSummary", "ContainerCPUUsage", "ContainerMetricsHistory", "ContainerMetricSeries"]
-    paths = [models / (name + ".swift") for name in names]
+    generated.write_text(instrument_chart("\n".join(path.read_text() for path in sources)))
+    paths = core_models(root)
     cache = (project / ".build/chart-benchmark-module-cache").resolve()
     cache.mkdir(parents=True, exist_ok=True)
     binary = folder / name
     subprocess.run(["swiftc", "-O", "-swift-version", "6", "-module-cache-path", str(cache),
                     *map(str, paths), str(generated), str(project / "script/benchmarks/ChartPerformanceBench.swift"), "-o", str(binary)], check=True)
-    return binary, {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in [chart, *helpers, *paths]}
+    return binary, {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in [*sources, *paths]}
 
 
 def compile_pair(project, baseline, folder):
     hashes = {}
-    model_names = ["ResourceSummary", "ContainerCPUUsage", "ContainerMetricsHistory", "ContainerMetricSeries"]
-    models = [project / "Sources/ContainerDeskCore/Models" / (name + ".swift") for name in model_names]
-    for name in model_names:
-        relative = Path("Sources/ContainerDeskCore/Models") / (name + ".swift")
-        if (baseline / relative).read_bytes() != (project / relative).read_bytes():
+    models = core_models(project)
+    for current, before in zip(models, core_models(baseline)):
+        if before.read_bytes() != current.read_bytes():
             raise ValueError("Paired chart comparison requires identical Core models; use --separate-processes for Core changes")
     generated = []
     for version, root in [("before", baseline), ("after", project)]:
-        chart = root / "Sources/ContainerDeskApp/Features/ContainerMetricChart.swift"
-        helpers = [chart.with_name(name + ".swift") for name in ["ContainerMetricPlot", "ContainerMetricPlotGeometry"] if chart.with_name(name + ".swift").exists()]
-        paths = [chart, *helpers]
+        paths = chart_sources(root)
         source = instrument_chart("\n".join(path.read_text() for path in paths))
         if version == "before":
             # Namespace only types declared by the chart source; shared Core
@@ -85,8 +92,7 @@ def compile_pair(project, baseline, folder):
         path = folder / (version + ".swift")
         path.write_text(source)
         generated.append(path)
-        hashes[version] = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
-                           for path in [*paths, *[root / "Sources/ContainerDeskCore/Models" / (name + ".swift") for name in model_names]]}
+        hashes[version] = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in [*paths, *core_models(root)]}
     binary = folder / "paired"
     cache = (project / ".build/chart-benchmark-module-cache").resolve()
     cache.mkdir(parents=True, exist_ok=True)

@@ -37,17 +37,17 @@ struct ContainerMetricChart: View {
         let projection = presentation.series
         let series = projection.value(samples: samples, events: events, metric: chartMetric, maximumPoints: max(64, plotWidth * 2))
         let points = series.points
-        let _ = presentation.formatting.prepare(points: points, locale: .current)
+        let formatting = presentation.formatting.prepared(points: points, locale: .current)
         let peak = series.peak
         let average = series.average
         let unitSuffix = metric.unit == "%" ? "%" : " \(metric.unit)"
-        let upper = max(1, peak * 1.12)
+        let domain = ContainerMetricPlotDomain(start: start, end: end, upper: max(1, peak * 1.12))
         VStack(alignment: .leading, spacing: 14) {
-            ContainerMetricReadout(metric: metric, samples: samples, latest: points.last, selectedDate: $selectedDate, formatting: presentation.formatting)
-            ContainerMetricPlot(metric: metric, points: points, events: events, start: start, end: end, upper: upper, sampleCount: series.sampleCount, cache: presentation.paths)
+            ContainerMetricReadout(metric: metric, samples: samples, latest: points.last, selectedDate: $selectedDate, formatting: formatting)
+            ContainerMetricPlot(metric: metric, points: points, events: events, domain: domain, sampleCount: series.sampleCount, cache: presentation.paths)
                 .equatable()
                 .overlay {
-                    ContainerMetricCursor(metric: metric, samples: samples, latest: points.last, start: start, end: end, upper: upper, selectedDate: $selectedDate)
+                    ContainerMetricCursor(metric: metric, samples: samples, latest: points.last, domain: domain, selectedDate: $selectedDate)
                 }
                 .frame(height: 112)
                 .onGeometryChange(for: Int.self) { max(1, Int($0.size.width.rounded())) } action: { plotWidth = $0 }
@@ -66,7 +66,6 @@ struct ContainerMetricChart: View {
         }
         .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(contrast == .increased ? Color.primary.opacity(0.5) : metric.tint.opacity(0.16)) }
     }
-
 }
 
 /// A shared interpretation for the readout and marker, including collection gaps.
@@ -139,15 +138,13 @@ private struct ContainerMetricCursor: View {
     let metric: ContainerMetricChart.Metric
     let samples: [ContainerHistorySample]
     let latest: ContainerChartPoint?
-    let start: Date
-    let end: Date
-    let upper: Double
+    let domain: ContainerMetricPlotDomain
     @Binding var selectedDate: Date?
 
     var body: some View {
         let selection = ContainerMetricSelection(metric: metric, samples: samples, latest: latest, selectedDate: selectedDate)
         GeometryReader { geometry in
-            let coordinates = ContainerMetricPlotCoordinates(start: start, end: end, upper: upper, size: geometry.size)
+            let coordinates = ContainerMetricPlotCoordinates(domain: domain, size: geometry.size)
             let frame = coordinates.frame
             if frame.width > 0 && frame.height > 0 {
                 ZStack(alignment: .topLeading) {
@@ -205,16 +202,19 @@ extension ContainerHistoryEvent.Kind {
     private var preparedPoints: [ContainerChartPoint] = []
     private var preparedLocale: Locale?
 
-    func prepare(points: [ContainerChartPoint], locale: Locale) {
-        guard preparedPoints != points || preparedLocale != locale else { return }
+    /// Returns the receiver with the plotted values' text ready, so a body can
+    /// hand the warmed formatter to its readout without a bare side effect.
+    @discardableResult
+    func prepared(points: [ContainerChartPoint], locale: Locale) -> ContainerMetricReadoutFormatting {
+        guard preparedPoints != points || preparedLocale != locale else { return self }
         preparedPoints = points; preparedLocale = locale
         var recent: [UInt64: String] = [:]
         for point in points.suffix(128) {
             recent[point.value.bitPattern] = string(point.value, locale: locale)
         }
         cached = recent
+        return self
     }
-
 
     func string(_ value: Double?, locale: Locale) -> String {
         guard let value, value.isFinite else { return "—" }

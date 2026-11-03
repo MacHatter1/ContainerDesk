@@ -3,7 +3,7 @@ import Testing
 @testable import ContainerDeskApp
 @testable import ContainerDeskCore
 
-@MainActor @Suite(.serialized)
+@MainActor @Suite
 struct ContainerMetricReadoutFormattingTests {
     @Test(arguments: ["en_US", "en_GB", "de_DE", "fr_FR", "hi_IN", "ar_EG"])
     func readoutsPreserveLocalizedDigitsGroupingAndRounding(_ identifier: String) {
@@ -32,7 +32,7 @@ struct ContainerMetricReadoutFormattingTests {
         }
         for identifier in ["en_US", "de_DE", "en_US"] {
             let locale = Locale(identifier: identifier)
-            formatting.prepare(points: points, locale: locale)
+            #expect(formatting.prepared(points: points, locale: locale) === formatting)
             // Include prepared values, older full-resolution misses and cache
             // eviction. The sign of zero must also survive numeric cache keys.
             for value in points.map(\.value) + [-0.0, 0.0, 999.95] {

@@ -1,34 +1,55 @@
 import ContainerDeskCore
 import SwiftUI
 
-/// One coordinate system for drawing and inspection, including the axis gutters.
-struct ContainerMetricPlotCoordinates {
+/// The time span and value ceiling that drawing, inspection and accessibility share.
+struct ContainerMetricPlotDomain: Equatable {
     let start: Date
     let end: Date
     let upper: Double
+
+    var span: TimeInterval { end.timeIntervalSince(start) }
+    var minutes: Int { Int(span / 60) }
+    var isDrawable: Bool { span > 0 && span.isFinite && upper > 0 && upper.isFinite }
+}
+
+/// One coordinate system for drawing and inspection, including the axis gutters.
+struct ContainerMetricPlotCoordinates {
+    /// Room for value labels on the leading edge, the peak marker above the
+    /// plot and time labels below it.
+    static let valueLabelGutter: CGFloat = 42
+    static let topInset: CGFloat = 4
+    static let timeLabelGutter: CGFloat = 20
+
+    let domain: ContainerMetricPlotDomain
     let size: CGSize
 
-    var frame: CGRect { CGRect(x: 42, y: 4, width: max(0, size.width - 42), height: max(0, size.height - 24)) }
-
-    func x(for date: Date) -> CGFloat? {
-        let span = end.timeIntervalSince(start)
-        guard span > 0, span.isFinite, date >= start, date <= end else { return nil }
-        return frame.minX + CGFloat(date.timeIntervalSince(start) / span) * frame.width
+    var frame: CGRect {
+        CGRect(x: Self.valueLabelGutter, y: Self.topInset,
+               width: max(0, size.width - Self.valueLabelGutter),
+               height: max(0, size.height - Self.topInset - Self.timeLabelGutter))
     }
 
+    func x(for date: Date) -> CGFloat? {
+        guard domain.span > 0, domain.span.isFinite, date >= domain.start, date <= domain.end else { return nil }
+        return frame.minX + CGFloat(date.timeIntervalSince(domain.start) / domain.span) * frame.width
+    }
+
+    /// Values are clamped to the domain so a marker never leaves the plot frame.
     func y(for value: Double) -> CGFloat? {
-        guard upper > 0, upper.isFinite, value.isFinite else { return nil }
-        return frame.maxY - CGFloat(value / upper) * frame.height
+        guard domain.upper > 0, domain.upper.isFinite, value.isFinite else { return nil }
+        return frame.maxY - CGFloat(min(1, max(0, value / domain.upper))) * frame.height
     }
 
     func date(at location: CGPoint) -> Date? {
-        let span = end.timeIntervalSince(start)
-        guard frame.width > 0, frame.height > 0, frame.contains(location), span > 0, span.isFinite else { return nil }
-        return start.addingTimeInterval(Double((location.x - frame.minX) / frame.width) * span)
+        guard frame.width > 0, frame.height > 0, frame.contains(location), domain.span > 0, domain.span.isFinite else { return nil }
+        return domain.start.addingTimeInterval(Double((location.x - frame.minX) / frame.width) * domain.span)
     }
 }
 
 struct ContainerMetricPlotPaths {
+    /// Event rules and accessibility series use this order, matching the legend.
+    static let eventKinds: [ContainerHistoryEvent.Kind] = [.restart, .exit, .limits]
+
     let line: Path
     let area: Path
     let eventRules: [(kind: ContainerHistoryEvent.Kind, path: Path)]
@@ -43,15 +64,15 @@ struct ContainerMetricPlotPaths {
         return result
     }
 
-    init(points: [ContainerChartPoint], events: [ContainerHistoryEvent], start: Date, end: Date, upper: Double) {
-        let span = end.timeIntervalSince(start)
-        guard span > 0, span.isFinite, upper > 0, upper.isFinite else {
+    init(points: [ContainerChartPoint], events: [ContainerHistoryEvent], domain: ContainerMetricPlotDomain) {
+        guard domain.isDrawable else {
             line = Path(); area = Path(); eventRules = []; return
         }
+        let span = domain.span
         var line = Path()
         var area = Path()
         for segment in Self.segments(points) {
-            let values = segment.map { CGPoint(x: $0.date.timeIntervalSince(start) / span, y: 1 - $0.value / upper) }
+            let values = segment.map { CGPoint(x: $0.date.timeIntervalSince(domain.start) / span, y: 1 - $0.value / domain.upper) }
             guard let first = values.first, let last = values.last else { continue }
             let curve = Self.monotoneCurve(values)
             line.addPath(curve)
@@ -62,10 +83,10 @@ struct ContainerMetricPlotPaths {
             area.addPath(fill)
         }
         self.line = line; self.area = area
-        eventRules = [ContainerHistoryEvent.Kind.restart, .exit, .limits].map { kind in
+        eventRules = Self.eventKinds.map { kind in
             var path = Path()
             for event in events where event.kind == kind {
-                let x = event.date.timeIntervalSince(start) / span
+                let x = event.date.timeIntervalSince(domain.start) / span
                 path.move(to: CGPoint(x: x, y: 0)); path.addLine(to: CGPoint(x: x, y: 1))
             }
             return (kind, path)
@@ -108,21 +129,23 @@ struct ContainerMetricPlotPaths {
 }
 
 /// Unit-space paths survive resizing and hover; only changed plot inputs rebuild them.
+/// Unchanged inputs arrive in the same array storage, so comparing them is cheap.
 @MainActor final class ContainerMetricPlotPathCache {
-    private var points: [ContainerChartPoint] = []
-    private var events: [ContainerHistoryEvent] = []
-    private var start: Date?
-    private var end: Date?
-    private var upper = 0.0
-    private var paths: ContainerMetricPlotPaths?
+    private struct Inputs: Equatable {
+        let points: [ContainerChartPoint]
+        let events: [ContainerHistoryEvent]
+        let domain: ContainerMetricPlotDomain
+    }
+
+    private var built: (inputs: Inputs, paths: ContainerMetricPlotPaths)?
     private(set) var buildCount = 0
 
-    func value(points: [ContainerChartPoint], events: [ContainerHistoryEvent], start: Date, end: Date, upper: Double) -> ContainerMetricPlotPaths {
-        if paths == nil || self.points != points || self.events != events || self.start != start || self.end != end || self.upper != upper {
-            self.points = points; self.events = events; self.start = start; self.end = end; self.upper = upper
-            paths = ContainerMetricPlotPaths(points: points, events: events, start: start, end: end, upper: upper)
-            buildCount += 1
-        }
-        return paths!
+    func value(points: [ContainerChartPoint], events: [ContainerHistoryEvent], domain: ContainerMetricPlotDomain) -> ContainerMetricPlotPaths {
+        let inputs = Inputs(points: points, events: events, domain: domain)
+        if let built, built.inputs == inputs { return built.paths }
+        let paths = ContainerMetricPlotPaths(points: points, events: events, domain: domain)
+        built = (inputs, paths)
+        buildCount += 1
+        return paths
     }
 }

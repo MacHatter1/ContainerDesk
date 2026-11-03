@@ -10,15 +10,23 @@ import subprocess
 import tempfile
 
 
+CORE_MODEL_NAMES = ["ResourceSummary", "ContainerCPUUsage", "ContainerMetricsHistory", "ContainerMetricSeries"]
+
+
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def compile_benchmark(project, root, folder, version, *, harness=None, manual_refresh=False):
-    models = root / "Sources/ContainerDeskCore/Models"
-    inputs = [models / (name + ".swift") for name in ["ResourceSummary", "ContainerCPUUsage", "ContainerMetricsHistory", "ContainerMetricSeries"]]
+def chart_sources(root):
+    """The chart view plus whichever split-out helpers this source tree has."""
     chart = root / "Sources/ContainerDeskApp/Features/ContainerMetricChart.swift"
-    helpers = [chart.with_name(name + ".swift") for name in ["ContainerMetricPlot", "ContainerMetricPlotGeometry"] if chart.with_name(name + ".swift").exists()]
+    helpers = [chart.with_name(name + ".swift") for name in ["ContainerMetricPlot", "ContainerMetricPlotGeometry"]]
+    return [chart, *[path for path in helpers if path.exists()]]
+
+
+def compile_benchmark(project, root, folder, version, *, harness=None, manual_refresh=False):
+    inputs = [root / "Sources/ContainerDeskCore/Models" / (name + ".swift") for name in CORE_MODEL_NAMES]
+    chart, *helpers = chart_sources(root)
     history = root / "Sources/ContainerDeskApp/Features/ContainerMetricsHistoryView.swift"
     generated_chart = folder / (version + "-chart.swift")
     chart_source = "\n".join(path.read_text() for path in [chart, *helpers]).replace("import ContainerDeskCore\n", "")
@@ -26,7 +34,9 @@ def compile_benchmark(project, root, folder, version, *, harness=None, manual_re
     if chart_source.count(marker) != 1:
         raise ValueError("Cannot locate the real chart projection")
     end = chart_source.index("\n", chart_source.index(marker))
-    window = (", window: Int(end.timeIntervalSince(start) / 60)" if manual_refresh else "") + ", metric: metric.title"
+    # Charts with a shared plot domain expose the window there; older trees keep start/end.
+    minutes = "domain.minutes" if "let domain: ContainerMetricPlotDomain" in chart_source else "Int(end.timeIntervalSince(start) / 60)"
+    window = (", window: " + minutes if manual_refresh else "") + ", metric: metric.title"
     if helpers:
         canvas = "        Canvas { context, size in"
         draw_end = "        }\n        .accessibilityElement(children: .ignore)"
@@ -49,6 +59,7 @@ def compile_benchmark(project, root, folder, version, *, harness=None, manual_re
     source = source.replace("context.date", "StatsBenchmarkClock.end")
     timeline = "TimelineView(.periodic(from: .now, by: 5)) { context in"
     publications = [
+        "snapshot = monitoring.history.snapshot(for: containerID, at: .now)",
         "snapshot = ContainerHistorySnapshot(history: monitoring.history, containerID: containerID, minutes: minutes, at: .now)",
         "snapshot = ContainerHistorySnapshot(history: monitoring.history, containerID: containerID, at: .now)",
     ]
@@ -59,10 +70,11 @@ def compile_benchmark(project, root, folder, version, *, harness=None, manual_re
             source = source.replace("    let monitoring: ContainerMonitoringStore", "    let monitoring: ContainerMonitoringStore\n    var isActive = true")
             source = source.replace("            let end =", "            let _ = StatsBenchmarkClock.publication()\n            let end =", 1)
     elif publication is not None:
-        source = source.replace(publication, publication.replace("at: .now", "at: StatsBenchmarkClock.end"))
+        published = publication.replace("at: .now", "at: StatsBenchmarkClock.end")
+        source = source.replace(publication, published)
         source = source.replace("Date.now", "StatsBenchmarkClock.end")
         if manual_refresh:
-            source = source.replace("                snapshot = ContainerHistorySnapshot", "                StatsBenchmarkClock.publication()\n                snapshot = ContainerHistorySnapshot")
+            source = source.replace("                " + published, "                StatsBenchmarkClock.publication()\n                " + published)
             sleep = "try await Task.sleep(for: refreshInterval)"
             if source.count(sleep) != 1:
                 raise ValueError("Cannot adapt the presentation refresh clock")

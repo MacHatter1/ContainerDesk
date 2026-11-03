@@ -61,12 +61,10 @@ struct StatsHistoryViewTests {
         defer { window.contentView = nil; window.close() }
         try await wait(host) { strings(host).contains { $0.contains("Memory latest, 4.0 MiB") } }
         host.rootView = StatsActivationTestRoot(monitoring: monitoring, activation: activation, phase: .background)
-        host.layoutSubtreeIfNeeded()
-        try await Task.sleep(for: .milliseconds(30))
+        try await allowRefreshCycles(host)
         monitoring.append(["web": .init(memoryUsageBytes: 8_388_608)], containers: [container])
-        try await Task.sleep(for: .milliseconds(30))
-        host.layoutSubtreeIfNeeded()
-        #expect(strings(host).contains { $0.contains("Memory latest, 4.0 MiB") })
+        try await allowRefreshCycles(host)
+        #expect(strings(host).contains { $0.contains("Memory latest, 4.0 MiB") }, "Background Stats must not publish while collection continues")
         host.rootView = StatsActivationTestRoot(monitoring: monitoring, activation: activation, phase: .inactive)
         try await wait(host) { strings(host).contains { $0.contains("Memory latest, 8.0 MiB") } }
     }
@@ -117,11 +115,9 @@ struct StatsHistoryViewTests {
         try await wait(host) { strings(host).contains { $0.contains("Memory latest, 4.0 MiB") } }
         for value in 5...9 {
             activation.update(isActive: false)
-            host.layoutSubtreeIfNeeded()
-            try await Task.sleep(for: .milliseconds(30))
+            try await allowRefreshCycles(host)
             monitoring.append(["web": .init(memoryUsageBytes: Int64(value) * 1_048_576)], containers: [container])
-            try await Task.sleep(for: .milliseconds(30))
-            host.layoutSubtreeIfNeeded()
+            try await allowRefreshCycles(host)
             #expect(monitoring.history.latestSample(for: "web")?.metric.memoryUsageBytes == Int64(value) * 1_048_576)
             #expect(strings(host).contains { $0.contains("Memory latest, \(value - 1).0 MiB") }, "Inactive Stats must not publish while collection continues")
             activation.update(isActive: true)
@@ -142,8 +138,10 @@ struct StatsHistoryViewTests {
         for tick in 0..<3_600 {
             monitoring.append(["web": .init(cpuPercent: Double(tick % 80), memoryUsageBytes: Int64(1_024 * (tick % 50 + 1)))], containers: [container], at: now.addingTimeInterval(Double(tick - 3_600)))
         }
+        // A long cadence means any change to the displayed hour can only come
+        // from collection leaking into presentation, not from a refresh.
         let host = NSHostingView(rootView: ScrollView {
-            ContainerMetricsHistoryView(containerID: "web", monitoring: monitoring).padding(16)
+            ContainerMetricsHistoryView(containerID: "web", monitoring: monitoring, refreshInterval: .seconds(3_600)).padding(16)
         }.frame(width: 1_200, height: 700).environment(\.scenePhase, .active))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1_200, height: 700), styleMask: .borderless, backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -152,7 +150,12 @@ struct StatsHistoryViewTests {
         try await wait(host) { strings(host).contains { $0.contains("CPU latest") } }
         let picker = try #require(descendants(host, as: NSSegmentedControl.self).first)
         choose(1, in: picker)
-        try await wait(host) { strings(host).contains { $0.contains("over the last 60 minutes") } }
+        try await wait(host) {
+            let labels = strings(host)
+            return ["CPU", "Memory"].allSatisfy { metric in labels.contains { $0.hasPrefix("\(metric) over the last 60 minutes") } }
+        }
+        let published = strings(host).filter { $0.contains("over the last 60 minutes") }
+        #expect(published.count == 2)
         var times: [Double] = []
         for tick in 0..<24 {
             let started = ContinuousClock.now
@@ -167,6 +170,7 @@ struct StatsHistoryViewTests {
         }
         let median = times.sorted()[times.count / 2]
         print("Stats live publication layout median: \(median) ms (24 updates, full-hour history)")
+        #expect(strings(host).filter { $0.contains("over the last 60 minutes") } == published, "Collection must not change the displayed hour between presentation refreshes")
         #expect(median < 50, "Collection must leave the main loop responsive between presentation refreshes")
     }
 
@@ -215,6 +219,14 @@ struct StatsHistoryViewTests {
         try await wait(host) { hasEventCount(101, in: host) }
         scroll.go(.event(try #require(monitoring.history.events.last?.id)))
         try await wait(host) { strings(host).contains { $0.contains("CPU limit: 104 ·") } }
+    }
+
+    /// Gives the 10 ms presentation loop several cycles to react to an
+    /// activation change, so a "must not publish" check cannot pass vacuously.
+    @MainActor private func allowRefreshCycles(_ host: NSView) async throws {
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(60))
+        host.layoutSubtreeIfNeeded()
     }
 
     @MainActor private func wait(_ host: NSView, line: UInt = #line, until predicate: () -> Bool) async throws {
