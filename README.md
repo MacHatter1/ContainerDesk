@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="docs/images/icon.png" width="128" height="128" alt="ContainerDesk app icon">
-
 # ContainerDesk
 
 **A native macOS workspace for Apple’s `container` runtime.**
