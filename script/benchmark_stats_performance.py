@@ -10,29 +10,89 @@ import subprocess
 import tempfile
 
 
+CORE_MODEL_NAMES = ["ResourceSummary", "ContainerCPUUsage", "ContainerMetricsHistory", "ContainerMetricSeries"]
+
+
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def compile_benchmark(project, root, folder, version):
-    models = root / "Sources/ContainerDeskCore/Models"
-    inputs = [models / (name + ".swift") for name in ["ResourceSummary", "ContainerCPUUsage", "ContainerMetricsHistory", "ContainerMetricSeries"]]
+def chart_sources(root):
+    """The chart view plus whichever split-out helpers this source tree has."""
     chart = root / "Sources/ContainerDeskApp/Features/ContainerMetricChart.swift"
+    helpers = [chart.with_name(name + ".swift") for name in ["ContainerMetricPlot", "ContainerMetricPlotGeometry"]]
+    return [chart, *[path for path in helpers if path.exists()]]
+
+
+def compile_benchmark(project, root, folder, version, *, harness=None, manual_refresh=False):
+    inputs = [root / "Sources/ContainerDeskCore/Models" / (name + ".swift") for name in CORE_MODEL_NAMES]
+    chart, *helpers = chart_sources(root)
     history = root / "Sources/ContainerDeskApp/Features/ContainerMetricsHistoryView.swift"
     generated_chart = folder / (version + "-chart.swift")
-    generated_chart.write_text(chart.read_text().replace("import ContainerDeskCore\n", ""))
+    chart_source = "\n".join(path.read_text() for path in [chart, *helpers]).replace("import ContainerDeskCore\n", "")
+    marker = "        let series = projection.value("
+    if chart_source.count(marker) != 1:
+        raise ValueError("Cannot locate the real chart projection")
+    end = chart_source.index("\n", chart_source.index(marker))
+    # Charts with a shared plot domain expose the window there; older trees keep start/end.
+    minutes = "domain.minutes" if "let domain: ContainerMetricPlotDomain" in chart_source else "Int(end.timeIntervalSince(start) / 60)"
+    window = (", window: " + minutes if manual_refresh else "") + ", metric: metric.title"
+    if helpers:
+        canvas = "        Canvas { context, size in"
+        draw_end = "        }\n        .accessibilityElement(children: .ignore)"
+        if chart_source.count(canvas) != 1 or chart_source[chart_source.index(canvas):].count(draw_end) != 1:
+            raise ValueError("Cannot locate the completed chart drawing")
+        draw_position = chart_source.index(draw_end, chart_source.index(canvas))
+        chart_source = chart_source[:draw_position] + "            StatsBenchmarkClock.rendered(points.last?.date, count: sampleCount" + window + ")\n" + chart_source[draw_position:]
+    else:
+        chart_source = chart_source[:end] + "\n        let _ = StatsBenchmarkClock.rendered(samples.last?.date, count: samples.count" + window + ")" + chart_source[end:]
+    generated_chart.write_text(chart_source)
     source = history.read_text().replace("import ContainerDeskCore\n", "")
     substitutions = {
         "@State private var minutes = 15": "@State private var minutes = StatsBenchmarkClock.minutes",
         "@State private var hoveredDate: Date?": "@Binding var hoveredDate: Date?",
-        "TimelineView(.periodic(from: .now, by: 5)) { context in": "TimelineView(.explicit([StatsBenchmarkClock.end])) { _ in",
-        "                    ForEach(events.reversed()) { event in": "                    ForEach(events.reversed()) { event in\n                        let _ = StatsBenchmarkClock.eventRow()",
     }
     for old, new in substitutions.items():
         if source.count(old) != 1:
             raise ValueError("Cannot adapt current native history source: " + old)
         source = source.replace(old, new)
     source = source.replace("context.date", "StatsBenchmarkClock.end")
+    timeline = "TimelineView(.periodic(from: .now, by: 5)) { context in"
+    publications = [
+        "snapshot = monitoring.history.snapshot(for: containerID, at: .now)",
+        "snapshot = ContainerHistorySnapshot(history: monitoring.history, containerID: containerID, minutes: minutes, at: .now)",
+        "snapshot = ContainerHistorySnapshot(history: monitoring.history, containerID: containerID, at: .now)",
+    ]
+    publication = next((value for value in publications if source.count(value) == 1), None)
+    if source.count(timeline) == 1:
+        source = source.replace(timeline, "TimelineView(.explicit([StatsBenchmarkClock.end])) { _ in")
+        if manual_refresh:
+            source = source.replace("    let monitoring: ContainerMonitoringStore", "    let monitoring: ContainerMonitoringStore\n    var isActive = true")
+            source = source.replace("            let end =", "            let _ = StatsBenchmarkClock.publication()\n            let end =", 1)
+    elif publication is not None:
+        published = publication.replace("at: .now", "at: StatsBenchmarkClock.end")
+        source = source.replace(publication, published)
+        source = source.replace("Date.now", "StatsBenchmarkClock.end")
+        if manual_refresh:
+            source = source.replace("                " + published, "                StatsBenchmarkClock.publication()\n                " + published)
+            sleep = "try await Task.sleep(for: refreshInterval)"
+            if source.count(sleep) != 1:
+                raise ValueError("Cannot adapt the presentation refresh clock")
+            source = source.replace(sleep, "try await StatsBenchmarkClock.sleep()")
+    else:
+        raise ValueError("Cannot locate the production Stats publication path")
+    if manual_refresh:
+        # Keep the disposable memberwise initializer consistent for both versions.
+        source = source.replace("    var isActive = true\n", "")
+        source = source.replace("    let monitoring: ContainerMonitoringStore", "    let monitoring: ContainerMonitoringStore\n    var isActive = true")
+        label = 'Label("History & Events", systemImage: "chart.xyaxis.line").font(.headline)'
+        if source.count(label) != 1:
+            raise ValueError("Cannot locate the production picker header")
+        source = source.replace(label, "let _ = StatsBenchmarkClock.pickerBody()\n            " + label)
+    event = "ForEach(events.reversed()) { event in"
+    if source.count(event) != 1:
+        raise ValueError("Cannot locate event rows")
+    source = source.replace(event, event + "\n                        let _ = StatsBenchmarkClock.eventRow()")
     generated_history = folder / (version + "-history.swift")
     generated_history.write_text(source)
     binary = folder / version
@@ -40,8 +100,8 @@ def compile_benchmark(project, root, folder, version):
     cache.mkdir(parents=True, exist_ok=True)
     subprocess.run(["swiftc", "-O", "-swift-version", "6", "-module-cache-path", str(cache),
                     *map(str, inputs), str(generated_chart), str(generated_history),
-                    str(project / "script/benchmarks/StatsPerformanceBench.swift"), "-o", str(binary)], check=True)
-    return binary, {str(path.relative_to(root)): sha256(path) for path in [*inputs, chart, history]}
+                    str(harness or project / "script/benchmarks/StatsPerformanceBench.swift"), "-o", str(binary)], check=True)
+    return binary, {str(path.relative_to(root)): sha256(path) for path in [*inputs, chart, *helpers, history]}
 
 
 def main():

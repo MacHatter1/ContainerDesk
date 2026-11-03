@@ -2,14 +2,20 @@ import AppKit
 import Observation
 import QuartzCore
 import SwiftUI
+import Synchronization
 
 // The runner inserts these counters into disposable copies of the real chart
 // source. No instrumentation is added to the shipping app.
 @MainActor enum ChartBenchmarkRecorder {
     static var plotBodies = 0
+    static var readoutBodies = 0
+    nonisolated private static let draws = Mutex<Int>(0)
+    static var plotDrawCount: Int { draws.withLock { $0 } }
     static var selectionChanges = 0
     static var projectionBuilds: [Int] = []
     static func plot() { plotBodies += 1 }
+    static func readout() { readoutBodies += 1 }
+    nonisolated static func plotDraw() { draws.withLock { $0 += 1 } }
     static func projection(_ count: Int) { projectionBuilds.append(count) }
 }
 
@@ -52,6 +58,8 @@ struct ChartBenchmarkView: View {
     static func main() throws {
         let count = Int(CommandLine.arguments[1])!
         let eventCount = Int(CommandLine.arguments[2])!
+        let hoverUpdates = CommandLine.arguments.count > 3 ? Int(CommandLine.arguments[3])! : 5
+        precondition(hoverUpdates > 0)
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
         app.finishLaunching()
@@ -73,6 +81,7 @@ struct ChartBenchmarkView: View {
         // Settle width-driven downsampling and initial native chart layout.
         for _ in 0..<5 { _ = pump(host) { true } }
         let initialProjectionBuilds = ChartBenchmarkRecorder.projectionBuilds
+        let initialPlotDraws = ChartBenchmarkRecorder.plotDrawCount
         var idle: [Double] = []
         for _ in 0..<5 {
             let begin = ContinuousClock.now
@@ -81,29 +90,36 @@ struct ChartBenchmarkView: View {
         }
         var timings: [Double] = []
         var plotBodies: [Int] = []
+        var readoutBodies: [Int] = []
+        var plotDraws: [Int] = []
         var projectionBuilds: [[Int]] = []
-        for tick in 0..<7 {
+        for tick in 0..<(hoverUpdates + 2) {
             let previous = ChartBenchmarkRecorder.plotBodies
+            let readoutsBefore = ChartBenchmarkRecorder.readoutBodies
+            let drawsBefore = ChartBenchmarkRecorder.plotDrawCount
             let buildIndex = ChartBenchmarkRecorder.projectionBuilds.count
             let revision = ChartBenchmarkRecorder.selectionChanges
             let begin = ContinuousClock.now
-            state.selectedDate = start.addingTimeInterval(Double(100 + tick))
+            state.selectedDate = start.addingTimeInterval(Double(100 + tick % max(1, count - 200)))
             success = pump(host) { ChartBenchmarkRecorder.selectionChanges > revision } && success
             let elapsed = milliseconds(since: begin)
             if tick >= 2 {
                 timings.append(elapsed)
                 plotBodies.append(ChartBenchmarkRecorder.plotBodies - previous)
+                readoutBodies.append(ChartBenchmarkRecorder.readoutBodies - readoutsBefore)
+                plotDraws.append(ChartBenchmarkRecorder.plotDrawCount - drawsBefore)
                 projectionBuilds.append(Array(ChartBenchmarkRecorder.projectionBuilds[buildIndex...]))
             }
         }
         let result: [String: Any] = ["samples_each": count, "events": eventCount, "charts": 2,
             "hover_update_ms": timings, "idle_layout_ms": idle, "static_plot_body_calls": plotBodies,
+            "readout_body_calls": readoutBodies, "static_plot_draw_calls": plotDraws, "plot_draw_instrumented": initialPlotDraws >= 2,
             "initial_projection_builds": initialProjectionBuilds, "hover_projection_builds": projectionBuilds, "processed_updates": success]
-        if CommandLine.arguments.count > 3,
+        if CommandLine.arguments.count > 4,
            let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
             host.cacheDisplay(in: host.bounds, to: bitmap)
             if let png = bitmap.representation(using: .png, properties: [:]) {
-                try png.write(to: URL(fileURLWithPath: CommandLine.arguments[3]))
+                try png.write(to: URL(fileURLWithPath: CommandLine.arguments[4]))
             }
         }
         print(String(decoding: try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]), as: UTF8.self))
