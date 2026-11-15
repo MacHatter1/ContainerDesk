@@ -568,7 +568,7 @@ struct StackWorkspaceFeatureView: View {
         logOperationIDs = []
         for container in workspace.containers {
             let stream = store.streamWithID(
-                CommandRequest(arguments: ["logs", container.id, "--follow"], captureLimit: 500_000),
+                LogRequestBuilder.make(source: .container(container.id), mode: .follow),
                 title: "Follow Stack Logs · \(container.title)"
             )
             logOperationIDs.append(stream.operationID)

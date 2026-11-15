@@ -234,10 +234,6 @@ struct ResourceDetailPane: View {
             .background(Color.accentColor.opacity(0.12), in: Capsule()).foregroundStyle(.tint)
     }
 
-    private var logsCommand: [String] {
-        section == .machines ? ["machine", "logs", resource.id] : ["logs", resource.id]
-    }
-
     private var availableTabs: [ResourceDetailTab] {
         ResourceDetailTab.available(for: section)
     }
@@ -431,9 +427,11 @@ struct ResourceDetailPane: View {
         detailState.error = nil
         transientText = ""
         if requestedTab == .inspect { detailState.inspectBackend = nil; detailState.inspectFallbackReason = nil }
-        let args: [String]
+        let request: CommandRequest
         switch requestedTab {
-        case .logs: args = logsCommand
+        case .logs:
+            let source: LogRequestBuilder.Source = section == .machines ? .machine(resource.id) : .container(resource.id)
+            request = LogRequestBuilder.make(source: source, mode: detailState.followLogs ? .follow : .snapshot)
         case .stats: detailState.isLoading = false; return
         case .inspect:
             guard let inspection = ResourceActionRouting.inspectionArguments(section: section, target: resource.id) else {
@@ -441,14 +439,14 @@ struct ResourceDetailPane: View {
                 detailState.error = "This resource does not support inspection."
                 return
             }
-            args = inspection
-        case .files: args = ["exec", resource.id, "ls", "-la", "/"]
+            request = CommandRequest(arguments: inspection, captureLimit: 500_000, suppressOutputEvents: true)
+        case .files: request = CommandRequest(arguments: ["exec", resource.id, "ls", "-la", "/"], captureLimit: 500_000, suppressOutputEvents: true)
         default: detailState.isLoading = false; return
         }
         do {
             if requestedTab == .logs && detailState.followLogs {
                 transientText = ""
-                let ownedStream = store.streamWithID(CommandRequest(arguments: args + ["--follow"], captureLimit: 500_000), title: "Follow Container Logs")
+                let ownedStream = store.streamWithID(request, title: "Follow Container Logs")
                 loadOperationID = ownedStream.operationID
                 detailState.operationID = loadOperationID
                 for try await event in ownedStream.events {
@@ -469,7 +467,7 @@ struct ResourceDetailPane: View {
                     detailState.inspectFallbackReason = result.fallbackReason
                     transientText = result.value.json
                 } else {
-                    let result = try await store.client.run(CommandRequest(arguments: args, captureLimit: 500_000, suppressOutputEvents: true))
+                    let result = try await store.client.run(request)
                     try Task.checkCancellation()
                     guard isCurrentLoad() else { return }
                     guard result.succeeded else { throw FeatureCommandError(result: result) }

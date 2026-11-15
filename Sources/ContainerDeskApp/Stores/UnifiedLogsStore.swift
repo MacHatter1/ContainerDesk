@@ -60,10 +60,10 @@ final class UnifiedLogsStore {
         errors[id] = nil
         streamingIDs.insert(id)
         // Resume an already opened source at its current end, without replaying the tail.
-        let tail = openedIDs.contains(id) ? "0" : "200"
+        let mode: LogRequestBuilder.Mode = openedIDs.contains(id) ? .resume : .follow
         tasks[id] = Task { [weak self] in
             do {
-                let request = CommandRequest(arguments: ["logs", "--follow", "-n", tail, "--", id], captureLimit: 0)
+                let request = LogRequestBuilder.make(source: .container(id), mode: mode)
                 for try await event in client.stream(request) {
                     guard !Task.isCancelled, let self, self.generations[id] == generation else { break }
                     switch event {
