@@ -99,8 +99,8 @@ struct AdvancedCommandSheet: View {
                                 TextField(descriptor.label, text: valueBinding(descriptor.name), prompt: Text(descriptor.placeholder ?? (descriptor.repeats ? "One value per line" : "Optional")), axis: descriptor.multiline || descriptor.repeats ? .vertical : .horizontal)
                                     .font(descriptor.multiline ? .system(.body, design: .monospaced) : .body)
                                     .if(descriptor.multiline || descriptor.repeats) { $0.lineLimit(2...5) }
-                                if descriptor.name == "memory", ["run", "create"].contains(commandID), !values["memory", default: ""].isEmpty, let amount = Self.memoryMiB(values["memory", default: ""]), amount < 200 {
-                                    Label("Container memory must be at least 200 MiB.", systemImage: "exclamationmark.triangle.fill")
+                                if descriptor.name == "memory", let issue = spec.memoryLimitError(values["memory"]) {
+                                    Label(issue.localizedDescription, systemImage: "exclamationmark.triangle.fill")
                                         .font(.caption).foregroundStyle(.orange)
                                 }
                             }
@@ -143,8 +143,7 @@ struct AdvancedCommandSheet: View {
         guard let spec else { return false }
         let positionalsValid = spec.positionals.enumerated().allSatisfy { index, item in !item.required || (positionals.indices.contains(index) && !positionals[index].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
         let requiredFlagsValid = spec.flags.filter { $0.required }.allSatisfy { !values[$0.name, default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        let memory = values["memory", default: ""]
-        let memoryValid = !["run", "create"].contains(spec.id) || memory.isEmpty || (Self.memoryMiB(memory).map { $0 >= 200 } ?? false)
+        let memoryValid = spec.memoryLimitError(values["memory"]) == nil
         let scopeValid = AdvancedCommandScopeValidation.isValid(section: section, commandID: spec.id, positionals: positionals, flags: flags)
         return positionalsValid && requiredFlagsValid && memoryValid && scopeValid
     }
@@ -203,22 +202,6 @@ struct AdvancedCommandSheet: View {
         operationID = nil
         running = false
     }
-    private static func memoryMiB(_ value: String) -> Double? {
-        let input = value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        guard !input.isEmpty else { return nil }
-        let suffix = input.last
-        let number = (suffix.map { "KMGTP".contains($0) } ?? false) ? String(input.dropLast()) : input
-        guard let amount = Double(number), amount >= 0 else { return nil }
-        switch suffix {
-        case "K": return amount / 1_024
-        case "M": return amount
-        case "G": return amount * 1_024
-        case "T": return amount * 1_048_576
-        case "P": return amount * 1_073_741_824
-        default: return amount / 1_048_576
-        }
-    }
-
     private func positionalValues(for spec: AdvancedCommandSpec) throws -> [String] {
         try AdvancedCommandRequestBuilder.positionals(for: spec, input: positionals)
     }
@@ -254,6 +237,11 @@ enum AdvancedCommandScopeValidation {
 }
 
 struct AdvancedCommandSpec: Identifiable {
+    func memoryLimitError(_ input: String?) -> ContainerLaunchValidationError? {
+        guard let input, ["run", "create"].contains(id) else { return nil }
+        return ContainerLaunchRequestBuilder.memoryLimitError(input)
+    }
+
     struct Positional { let name: String; let placeholder: String; let required: Bool; var repeats = false; var multiline = false; var tokenized = false }
     struct Flag: Identifiable {
         enum Kind { case boolean, value }

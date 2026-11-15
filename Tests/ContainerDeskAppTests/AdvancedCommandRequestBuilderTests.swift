@@ -4,6 +4,23 @@ import Testing
 @testable import ContainerDeskApp
 
 struct AdvancedCommandRequestBuilderTests {
+    @Test func advancedLaunchAcceptsCLIMemoryUnitsAndRejectsOutOfRangeSizes() throws {
+        for command in ["run", "create"] {
+            let spec = try #require(AdvancedCommandCatalog.specs(for: .containers).first { $0.id == command })
+            func request(_ memory: String) throws -> CommandRequest {
+                try AdvancedCommandRequestBuilder.make(section: .containers, spec: spec, flags: [],
+                    values: ["memory": memory], positionalArguments: ["alpine"])
+            }
+            for memory in ["200MiB", "512MiB", "512M", "1GiB", "209715200"] {
+                #expect(try request(memory).arguments == [command, "--memory", memory, "alpine"])
+            }
+            #expect(try request("").arguments == [command, "alpine"])
+            for memory in ["199MiB", "unknown", "999999999999999999P"] {
+                #expect(throws: ContainerLaunchValidationError.self) { try request(memory) }
+            }
+        }
+    }
+
     @Test func everyAdvancedEnvironmentRouteSnapshotsAndRedactsFileInheritedAndInlineValues() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("AdvancedEnv.\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

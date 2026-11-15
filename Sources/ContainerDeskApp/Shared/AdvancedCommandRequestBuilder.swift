@@ -16,6 +16,7 @@ enum AdvancedCommandRequestBuilder {
     }
 
     static func make(section: ContainerSection, spec: AdvancedCommandSpec, flags: Set<String>, values: [String: String], positionalArguments: [String], inherited: [String: String] = ProcessInfo.processInfo.environment) throws -> CommandRequest {
+        if let error = spec.memoryLimitError(values["memory"]) { throw error }
         var sensitiveValues: [String] = []
         let flagArguments = spec.flags.flatMap { descriptor -> [String] in
             if ["env", "env-file"].contains(descriptor.name) { return [] }
