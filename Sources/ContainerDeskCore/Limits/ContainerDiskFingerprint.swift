@@ -6,7 +6,7 @@ import Foundation
 /// Hole layout is intentionally significant: a layout mismatch fails closed rather than scanning zeros.
 enum ContainerDiskFingerprint {
     static func digest(of url: URL) throws -> String {
-        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard descriptor >= 0 else { throw ContainerLimitsIssue.backupFailed }
         defer { Darwin.close(descriptor) }
         var initial = stat()

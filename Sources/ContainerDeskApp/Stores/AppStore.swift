@@ -256,6 +256,47 @@ public final class AppStore {
         return try await recoveryService().remove(sessions)
     }
 
+    struct ReviewedLimitsRestore {
+        let backup: LimitsRestoreReview
+        fileprivate let epoch: Int
+    }
+
+    func reviewLimitsRestore(_ session: LimitsRecoverySession) async throws -> ReviewedLimitsRestore {
+        guard !isShuttingDown else { throw RuntimeOperationError.shuttingDown }
+        guard cliPath == nil else { throw ContainerLimitsIssue.unsupportedCLI }
+        guard limitsOperationContainerID == nil, !isRecoveryCleanupInProgress else { throw LimitsRecoveryError.busy }
+        let epoch = clientEpoch
+        let backup = try await recoveryService().reviewRestore(session)
+        try Task.checkCancellation()
+        guard clientEpoch == epoch else { throw RuntimeOperationError.runtimeChanged }
+        return ReviewedLimitsRestore(backup: backup, epoch: epoch)
+    }
+
+    func restoreLimitsBackup(_ review: ReviewedLimitsRestore) async throws {
+        guard !isShuttingDown else { throw RuntimeOperationError.shuttingDown }
+        guard cliPath == nil, clientEpoch == review.epoch else { throw RuntimeOperationError.runtimeChanged }
+        let id = review.backup.containerID
+        guard let token = runtimeOperations.beginLimitsChange(id) else { throw LimitsRecoveryError.busy }
+        defer { runtimeOperations.endLimitsChange(token) }
+        var record = OperationRecord(title: "Restore Container: \(id)", commandPreview: "Restore \(id) from limits recovery", canRetry: false, canCancel: false)
+        operations.insert(record, at: 0)
+        trimHistory()
+        do {
+            try await recoveryService().restore(review.backup)
+            record.state = .succeeded
+        } catch {
+            record.state = .failed
+            record.error = "Container restoration did not complete. Review the recovery session."
+            record.finishedAt = .now
+            updateOperation(record)
+            await refresh(.containers, force: true)
+            throw error
+        }
+        record.finishedAt = .now
+        updateOperation(record)
+        await refresh(.containers, force: true)
+    }
+
     private func recoveryService() -> ContainerLimitsRecoveryService {
         if let limitsRecoveryService { return limitsRecoveryService }
         let service = ContainerLimitsRecoveryService(client: client)
