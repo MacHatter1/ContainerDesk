@@ -12,14 +12,16 @@ final class KubernetesOperationStore {
     @ObservationIgnored private var task: Task<Bool, Never>?
     @ObservationIgnored private weak var appStore: AppStore?
 
-    func run(_ request: CommandRequest, title: String, store: AppStore, owner: UUID) async -> Bool {
+    func run(_ request: CommandRequest, title: String, store: AppStore, owner: UUID, reviewedRuntime: AppStore.ReviewedRuntime? = nil) async -> Bool {
         guard !isRunning, !Task.isCancelled, !store.isShuttingDown else { return false }
+        let operation: TrackedCommandStream
+        do { operation = try store.streamWithID(request, title: title, reviewedRuntime: reviewedRuntime ?? store.captureReviewedRuntime()) }
+        catch { self.error = error.localizedDescription; return false }
         isRunning = true
         output = ""
         error = nil
         self.owner = owner
         appStore = store
-        let operation = store.streamWithID(request, title: title)
         operationID = operation.operationID
         let worker = Task { @MainActor in
             var success = false

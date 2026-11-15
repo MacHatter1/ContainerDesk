@@ -14,6 +14,7 @@ struct AdvancedCommandSheet: View {
     @State private var values: [String: String] = [:]
     @State private var flags: Set<String> = []
     @State private var showingConfirmation = false
+    @State private var pendingReview: AdvancedCommandReview?
     @State private var running = false
     @State private var output = ""
     @State private var error: String?
@@ -22,37 +23,6 @@ struct AdvancedCommandSheet: View {
 
     private var specs: [AdvancedCommandSpec] { AdvancedCommandCatalog.specs(for: section) }
     private var spec: AdvancedCommandSpec? { specs.first { $0.id == commandID } ?? specs.first }
-    private var destructive: Bool { spec?.destructive ?? false }
-    private var confirmationTitle: String {
-        guard let spec else { return "Run this command?" }
-        if flags.contains("all") {
-            switch spec.id {
-            case "stop": return "Stop all running containers?"
-            case "delete" where section == .images: return "Delete all local images?"
-            case "delete" where section == .containers: return "Delete all containers?"
-            case "delete" where section == .volumes: return "Delete all unused volumes?"
-            case "delete" where section == .networks: return "Delete all user-defined networks?"
-            case "kill": return "Signal every running container?"
-            default: break
-            }
-        }
-        let targets = confirmationTargets
-        return targets.isEmpty ? "\(spec.title)?" : "\(spec.title): \(targets)?"
-    }
-    private var confirmationMessage: String {
-        if let message = spec?.confirmationMessage { return message }
-        let targets = confirmationTargets
-        if !targets.isEmpty { return "This command targets: \(targets)" }
-        return flags.contains("all") ? "The command will apply to the full scope named above." : "Review the selected action and scope before continuing."
-    }
-    private var confirmationTargets: String {
-        positionals
-            .flatMap { $0.split(whereSeparator: \.isNewline).map(String.init) }
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .map(AdvancedCommandScopeValidation.confirmationLabel)
-            .joined(separator: ", ")
-    }
 
     var body: some View {
         NavigationStack {
@@ -124,14 +94,18 @@ struct AdvancedCommandSheet: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     AdvancedCommandControls(running: running, valid: valid && spec.map { store.runtimeOperations.canStart(CommandRequest(arguments: $0.arguments)) } == true, run: {
-                        if destructive { showingConfirmation = true } else { launch() }
+                        prepareCommand()
                     }, cancel: cancelOperation)
                 }
             }
-            .confirmationDialog(confirmationTitle, isPresented: $showingConfirmation, titleVisibility: .visible) {
-                Button("Run \(spec?.title ?? "Command")", role: .destructive) { launch() }
-                Button("Cancel", role: .cancel) { }
-            } message: { Text(confirmationMessage) }
+            .confirmationDialog(pendingReview?.confirmationTitle ?? "Run this command?", isPresented: $showingConfirmation, titleVisibility: .visible) {
+                Button("Run \(pendingReview?.title ?? "Command")", role: .destructive) {
+                    guard let review = pendingReview else { return }
+                    pendingReview = nil
+                    launch(review)
+                }
+                Button("Cancel", role: .cancel) { pendingReview = nil }
+            } message: { Text(pendingReview?.confirmationMessage ?? "") }
             .onChange(of: commandID) { _, newValue in reset(for: newValue) }
         }
         .frame(minWidth: 500, minHeight: 460)
@@ -161,10 +135,20 @@ struct AdvancedCommandSheet: View {
     }
     private func reset(for id: String) { positionals = []; values = [:]; flags = []; output = ""; error = nil }
 
-    private func launch() {
+    private func prepareCommand() {
+        guard !running, valid, let spec else { return }
+        do {
+            let review = try AdvancedCommandReview(section: section, spec: spec, flags: flags, values: values, positionals: positionals, runtime: store.captureReviewedRuntime())
+            if spec.destructive {
+                pendingReview = review
+                showingConfirmation = true
+            } else { launch(review) }
+        } catch { self.error = error.localizedDescription }
+    }
+    private func launch(_ review: AdvancedCommandReview) {
         guard !running else { return }
         running = true
-        runningTask = Task { await run() }
+        runningTask = Task { await run(review) }
     }
     private func cancelOperation() {
         if let operationID { store.cancelOperation(operationID) }
@@ -172,14 +156,12 @@ struct AdvancedCommandSheet: View {
         runningTask = nil
     }
 
-    private func run() async {
-        guard let spec else { return }
+    private func run(_ review: AdvancedCommandReview) async {
         running = true
         error = nil
         do {
-            let request = try AdvancedCommandRequestBuilder.make(section: section, spec: spec, flags: flags, values: values, positionalArguments: positionalValues(for: spec))
-            var commandOutput = AdvancedCommandOutput(section: section, commandID: spec.id, arguments: request.arguments)
-            let stream = store.streamWithID(request, title: spec.title)
+            var commandOutput = AdvancedCommandOutput(section: review.section, commandID: review.commandID, arguments: review.request.arguments)
+            let stream = try store.streamWithID(review.request, title: review.title, reviewedRuntime: review.runtime)
             operationID = stream.operationID
             for try await event in stream.events {
                 try Task.checkCancellation()
@@ -196,14 +178,11 @@ struct AdvancedCommandSheet: View {
                     }
                 }
             }
-            if spec.refreshSection { await store.refresh(section, force: true) }
+            if review.refreshSection { await store.refresh(review.section, force: true) }
         } catch is CancellationError { }
         catch { self.error = error.localizedDescription }
         operationID = nil
         running = false
-    }
-    private func positionalValues(for spec: AdvancedCommandSpec) throws -> [String] {
-        try AdvancedCommandRequestBuilder.positionals(for: spec, input: positionals)
     }
 }
 

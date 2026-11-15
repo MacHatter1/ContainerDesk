@@ -11,13 +11,20 @@ final class BuildOperationStore {
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private weak var appStore: AppStore?
 
-    func start(_ request: CommandRequest, title: String, store: AppStore, onCompletion: @escaping @MainActor (Bool) async -> Void = { _ in }) {
+    func start(_ request: CommandRequest, title: String, store: AppStore, reviewedRuntime: AppStore.ReviewedRuntime? = nil, onCompletion: @escaping @MainActor (Bool) async -> Void = { _ in }) {
         guard !isRunning, !store.isShuttingDown else { return }
-        isRunning = true
         output = ""
         error = nil
+        let operation: TrackedCommandStream
+        do {
+            if let reviewedRuntime { operation = try store.streamWithID(request, title: title, reviewedRuntime: reviewedRuntime) }
+            else { operation = store.streamWithID(request, title: title) }
+        } catch {
+            self.error = error.localizedDescription
+            return
+        }
+        isRunning = true
         appStore = store
-        let operation = store.streamWithID(request, title: title)
         operationID = operation.operationID
         task = Task { [weak self] in
             guard let self else { return }

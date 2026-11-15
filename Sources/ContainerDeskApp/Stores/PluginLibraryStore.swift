@@ -12,13 +12,20 @@ struct SavedComposeProject: Codable, Identifiable, Hashable {
 struct ComposeDownReview {
     let project: SavedComposeProject
     let keepNetworks: Bool
+    let runtime: AppStore.ReviewedRuntime
     var displayName: String { project.name.isEmpty ? "default project for \(project.fileURL.lastPathComponent)" : project.name }
     var request: CommandRequest {
         var args = ["compose", "down", "--file", project.fileURL.path]
         if !project.name.isEmpty { args += ["--project-name", project.name] }
         if keepNetworks { args.append("--keep-networks") }
-        return CommandRequest(arguments: args, workingDirectory: project.fileURL.deletingLastPathComponent())
+        return CommandRequest(arguments: args, workingDirectory: project.fileURL.deletingLastPathComponent(), captureLimit: 1_000_000)
     }
+}
+
+struct KubernetesDeleteReview {
+    let name: String
+    let runtime: AppStore.ReviewedRuntime
+    var request: CommandRequest { .init(arguments: ["k8s", "delete", "--name", name], captureLimit: 500_000) }
 }
 
 enum PluginLibraryKind: String, Identifiable {

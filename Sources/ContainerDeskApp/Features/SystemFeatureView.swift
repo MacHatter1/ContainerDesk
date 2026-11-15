@@ -14,9 +14,11 @@ struct SystemFeatureView: View {
     private var error: String? { actions.error }
     private var busy: Bool { actions.isRunning }
     @State private var showStopConfirmation = false
+    @State private var stopReview: SystemStopReview?
     @State private var showDNSCreate = false
     @State private var showDNSDelete = false
     @State private var showDNSDeleteConfirmation = false
+    @State private var dnsDeleteReview: SystemDNSRemovalReview?
     @State private var showKernelSheet = false
     @State private var domain = ""
     @State private var localhost = ""
@@ -60,8 +62,12 @@ struct SystemFeatureView: View {
         .sheet(isPresented: $showKernelSheet) { kernelSheet }
         .sheet(isPresented: $showAdvanced) { AdvancedCommandSheet(section: .system, store: store) { _ in } }
         .confirmationDialog("Stop Apple container services?", isPresented: $showStopConfirmation, titleVisibility: .visible) {
-            Button("Stop Services", role: .destructive) { Task { await run(["system", "stop"], title: "Stop Container Services") } }
-            Button("Cancel", role: .cancel) { }
+            Button("Stop Services", role: .destructive) {
+                guard let review = stopReview else { return }
+                stopReview = nil
+                Task { await run(review.request, title: "Stop Container Services", reviewedRuntime: review.runtime) }
+            }
+            Button("Cancel", role: .cancel) { stopReview = nil }
         } message: { Text(SystemServiceActions.stopConfirmation) }
     }
 
@@ -83,7 +89,10 @@ struct SystemFeatureView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(busy || runtimeIsRunning)
-                    Button("Stop Services", systemImage: "stop.fill") { showStopConfirmation = true }
+                    Button("Stop Services", systemImage: "stop.fill") {
+                        stopReview = SystemStopReview(runtime: store.captureReviewedRuntime())
+                        showStopConfirmation = true
+                    }
                         .disabled(busy || !runtimeIsRunning || store.limitsOperationContainerID != nil)
                 }
                 .controlSize(.regular)
@@ -303,12 +312,21 @@ struct SystemFeatureView: View {
                 if let error { Section { InlineNotice(message: error, kind: .error) } }
             }.formStyle(.grouped).navigationTitle("Remove Local DNS Domain")
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showDNSDelete = false } }
-                ToolbarItem(placement: .confirmationAction) { Button("Remove…", role: .destructive) { showDNSDeleteConfirmation = true }.disabled(busy || domain.trimmedFormValue.isEmpty) }
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dnsDeleteReview = nil; showDNSDelete = false } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Remove…", role: .destructive) {
+                        dnsDeleteReview = actions.reviewDNSRemoval(domain: domain, store: store)
+                        showDNSDeleteConfirmation = dnsDeleteReview != nil
+                    }.disabled(busy || domain.trimmedFormValue.isEmpty)
+                }
             }
-            .confirmationDialog("Remove \(domain) from local DNS?", isPresented: $showDNSDeleteConfirmation, titleVisibility: .visible) {
-                Button("Remove Domain", role: .destructive) { Task { await deleteDNS() } }
-                Button("Cancel", role: .cancel) { }
+            .confirmationDialog("Remove \(dnsDeleteReview?.domainName ?? "") from local DNS?", isPresented: $showDNSDeleteConfirmation, titleVisibility: .visible) {
+                Button("Remove Domain", role: .destructive) {
+                    guard let review = dnsDeleteReview else { return }
+                    dnsDeleteReview = nil
+                    Task { await deleteDNS(review) }
+                }
+                Button("Cancel", role: .cancel) { dnsDeleteReview = nil }
             } message: {
                 Text("This removes the named local DNS domain and then requests administrator approval.")
             }
@@ -339,14 +357,17 @@ struct SystemFeatureView: View {
     }
 
     @discardableResult private func run(_ arguments: [String], title: String) async -> Bool {
+        await run(CommandRequest(arguments: arguments, captureLimit: 500_000, suppressOutputEvents: true), title: title, reviewedRuntime: store.captureReviewedRuntime())
+    }
+
+    @discardableResult private func run(_ request: CommandRequest, title: String, reviewedRuntime: AppStore.ReviewedRuntime) async -> Bool {
         let tab = selectedSystemTab
         return await actions.perform {
             panel.showActionOutput("")
-            let request = CommandRequest(arguments: arguments, captureLimit: 500_000, suppressOutputEvents: true)
-            let result = try await store.execute(request, title: title)
+            let result = try await store.execute(request, title: title, reviewedRuntime: reviewedRuntime)
             if selectedSystemTab == tab { panel.showActionOutput(request.sanitizeOutput(result.standardOutput + (result.standardError.isEmpty ? "" : "\n" + result.standardError))) }
             guard result.succeeded else { throw FeatureCommandError(result: result) }
-            if arguments.contains("start") || arguments.contains("stop") { await store.refreshSystemVersion() }
+            if request.arguments.contains("start") || request.arguments.contains("stop") { await store.refreshSystemVersion() }
         }
     }
     private func createDNS() async {
@@ -356,9 +377,9 @@ struct SystemFeatureView: View {
             await refreshCurrentScreen()
         }
     }
-    private func deleteDNS() async {
+    private func deleteDNS(_ review: SystemDNSRemovalReview) async {
         await actions.perform {
-            let value = try await store.executePrivilegedDNS(.delete(domainName: domain.trimmedFormValue))
+            let value = try await store.executePrivilegedDNS(review.action)
             panel.output = value.isEmpty ? "DNS domain removed." : value; showDNSDelete = false
             await refreshCurrentScreen()
         }

@@ -71,9 +71,10 @@ struct ComposeFeatureView: View {
         .confirmationDialog("Stop and remove project \(downReview?.displayName ?? "")?", isPresented: $showDownConfirmation, titleVisibility: .visible) {
             Button("Compose Down", role: .destructive) {
                 guard let review = downReview else { return }
-                launch { await execute(review.request.arguments, title: "Compose Down", file: review.project.fileURL) }
+                downReview = nil
+                launch { await execute(review.request, title: "Compose Down", file: review.project.fileURL, runtime: review.runtime) }
             }
-            Button("Cancel", role: .cancel) { }
+            Button("Cancel", role: .cancel) { downReview = nil }
         } message: { Text("File: \(downReview?.project.fileURL.path ?? "")\nRemoves this saved project's containers\(downReview?.keepNetworks == true ? ". Networks will be kept." : " and networks.")") }
         .onAppear { if selectedID == nil { selectedID = projects.first?.id } }
         .onChange(of: selectedID) { _, newID in
@@ -192,23 +193,26 @@ struct ComposeFeatureView: View {
     }
     private func runDown(dryRun: Bool) async {
         guard let project = selectedProject else { return }
-        var args = ComposeDownReview(project: project, keepNetworks: keepNetworks).request.arguments
+        var args = ComposeDownReview(project: project, keepNetworks: keepNetworks, runtime: store.captureReviewedRuntime()).request.arguments
         if dryRun { args.append("--dry-run") }
         await execute(args, title: dryRun ? "Plan Compose Down" : "Compose Down", file: project.fileURL)
     }
     private func reviewDown() {
         guard let project = selectedProject else { return }
-        downReview = ComposeDownReview(project: project, keepNetworks: keepNetworks)
+        downReview = ComposeDownReview(project: project, keepNetworks: keepNetworks, runtime: store.captureReviewedRuntime())
         showDownConfirmation = true
     }
     private func execute(_ args: [String], title: String, file: URL) async {
+        await execute(CommandRequest(arguments: args, workingDirectory: file.deletingLastPathComponent(), captureLimit: 1_000_000), title: title, file: file, runtime: store.captureReviewedRuntime())
+    }
+    private func execute(_ request: CommandRequest, title: String, file: URL, runtime: AppStore.ReviewedRuntime) async {
         busy = true; error = nil; output = ""
         let hasScope = file.startAccessingSecurityScopedResource()
         defer { if hasScope { file.stopAccessingSecurityScopedResource() } }
         do {
-            let stream = store.stream(CommandRequest(arguments: args, workingDirectory: file.deletingLastPathComponent(), captureLimit: 1_000_000), title: title)
-            operationID = store.operations.first?.id
-            for try await event in stream {
+            let stream = try store.streamWithID(request, title: title, reviewedRuntime: runtime)
+            operationID = stream.operationID
+            for try await event in stream.events {
                 try Task.checkCancellation()
                 switch event {
                 case .standardOutput(let chunk): append(chunk)

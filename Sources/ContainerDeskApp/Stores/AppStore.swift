@@ -367,11 +367,19 @@ public final class AppStore {
     }
 
     public func streamWithID(_ request: CommandRequest, title: String) -> TrackedCommandStream {
+        streamWithID(request, title: title, using: client)
+    }
+
+    func streamWithID(_ request: CommandRequest, title: String, reviewedRuntime: ReviewedRuntime) throws -> TrackedCommandStream {
+        guard reviewedRuntime.epoch == clientEpoch else { throw RuntimeOperationError.runtimeChanged }
+        return streamWithID(request, title: title, using: reviewedRuntime.client)
+    }
+
+    private func streamWithID(_ request: CommandRequest, title: String, using requestClient: any ContainerClient) -> TrackedCommandStream {
         let lease: UUID?
         let rejection: (any Error)?
         do { lease = try runtimeOperations.beginCommand(request); rejection = nil }
         catch { lease = nil; rejection = error }
-        let requestClient = client
         let commandEpoch = clientEpoch
         let affected = rejection == nil ? monitoring.beginCommand(request, containers: snapshots[.containers]?.items ?? []) : []
         var record = OperationRecord(title: title, commandPreview: request.preview, canRetry: request.isSafeToRetry)
@@ -763,15 +771,37 @@ public final class AppStore {
 
     /// The only elevation path exposed by the app: fixed container DNS create/delete commands.
     public func executePrivilegedDNS(_ action: DNSAdminAction) async throws -> String {
+        try await executePrivilegedDNS(reviewPrivilegedDNS(action))
+    }
+
+    struct ReviewedDNSAction {
+        let action: DNSAdminAction
+        fileprivate let runtime: ReviewedRuntime
+        fileprivate let executable: URL
+    }
+
+    func reviewPrivilegedDNS(_ action: DNSAdminAction) throws -> ReviewedDNSAction {
         guard !isShuttingDown else { throw RuntimeOperationError.shuttingDown }
         try action.validate()
         guard let executable = ExecutableResolver(overridePath: cliPath).resolve() else { throw ContainerClientError.executableNotFound }
-        let adminRequest = try action.administratorRequest(executableURL: executable)
+        return ReviewedDNSAction(action: action, runtime: captureReviewedRuntime(), executable: executable)
+    }
+
+    func executePrivilegedDNS(
+        _ review: ReviewedDNSAction,
+        runAdministrator: (CommandRequest) async throws -> CommandResult = {
+            try await ProcessExecutableClient(executableURL: URL(fileURLWithPath: "/usr/bin/osascript")).run($0)
+        }
+    ) async throws -> String {
+        guard !isShuttingDown else { throw RuntimeOperationError.shuttingDown }
+        guard review.runtime.epoch == clientEpoch else { throw RuntimeOperationError.runtimeChanged }
+        let action = review.action
+        let adminRequest = try action.administratorRequest(executableURL: review.executable)
         var record = OperationRecord(title: action.activityTitle, commandPreview: "container \(action.arguments.joined(separator: " ")) (administrator)", canRetry: false, canCancel: false)
         operations.insert(record, at: 0)
         trimHistory()
         do {
-            let result = try await ProcessExecutableClient(executableURL: URL(fileURLWithPath: "/usr/bin/osascript")).run(adminRequest)
+            let result = try await runAdministrator(adminRequest)
             guard result.succeeded else { throw DNSAdminError.command(result.failureDescription ?? "The administrator command failed or was cancelled.") }
             let output = result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
             record.finishedAt = .now

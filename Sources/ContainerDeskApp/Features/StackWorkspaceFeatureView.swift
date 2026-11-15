@@ -33,10 +33,46 @@ struct StackWorkspaceFeatureView: View {
         var id: String { rawValue }
     }
 
-    private struct PendingStackAction {
+    struct PendingStackAction {
         let action: StackWorkspaceAction
         let workspaceID: String
+        let workspaceTitle: String
         let containerIDs: Set<String>
+        let runningCount: Int
+        let commands: [StackWorkspaceCommand]
+        let runtimeScope: String
+        let runtime: AppStore.ReviewedRuntime
+
+        init(action: StackWorkspaceAction, workspace: StackWorkspace, runtimeScope: String, runtime: AppStore.ReviewedRuntime) {
+            self.action = action
+            workspaceID = workspace.id
+            workspaceTitle = workspace.title
+            containerIDs = Set(workspace.containers.map(\.id))
+            runningCount = workspace.runningCount
+            commands = StackWorkspaceCatalog.plan(action, for: workspace)
+            self.runtimeScope = runtimeScope
+            self.runtime = runtime
+        }
+
+        var confirmationTitle: String {
+            switch action {
+            case .stop: "Stop \(workspaceTitle)?"
+            case .restart: "Restart \(workspaceTitle)?"
+            case .start: "Start \(workspaceTitle)?"
+            }
+        }
+
+        var confirmationMessage: String {
+            switch action {
+            case .stop: runningCount == 1 ? "The running container in this stack will stop gracefully." : "All \(runningCount) running containers in this stack will stop gracefully."
+            case .restart: runningCount == 1 ? "The running container in this stack will stop, then start again." : "All \(runningCount) running containers in this stack will stop, then those containers will start again."
+            case .start: "Stopped containers in this stack will start."
+            }
+        }
+
+        func matchesPlan(in workspace: StackWorkspace) -> Bool {
+            StackWorkspaceCatalog.plan(action, for: workspace) == commands
+        }
     }
 
     private var workspaces: [StackWorkspace] {
@@ -167,7 +203,7 @@ struct StackWorkspaceFeatureView: View {
                 Button(confirmationButtonTitle(pendingAction.action), role: .destructive) {
                     let action = pendingAction
                     self.pendingAction = nil
-                    Task { await perform(action.action, workspaceID: action.workspaceID, expectedContainerIDs: action.containerIDs) }
+                    Task { await perform(action) }
                 }
             }
             Button("Cancel", role: .cancel) { pendingAction = nil }
@@ -482,28 +518,18 @@ struct StackWorkspaceFeatureView: View {
     }
 
     private var confirmationTitle: String {
-        guard let workspace = pendingWorkspace, let pendingAction else { return "Confirm Stack Action" }
-        switch pendingAction.action {
-        case .stop: return "Stop \(workspace.title)?"
-        case .restart: return "Restart \(workspace.title)?"
-        case .start: return "Start \(workspace.title)?"
-        }
+        pendingAction?.confirmationTitle ?? "Confirm Stack Action"
     }
 
     private var confirmationMessage: String {
-        guard let workspace = pendingWorkspace, let pendingAction else { return "" }
-        switch pendingAction.action {
-        case .stop: return "All \(workspace.runningCount) running containers in this stack will stop gracefully."
-        case .restart: return "All \(workspace.runningCount) running containers in this stack will stop, then those containers will start again."
-        case .start: return "Stopped containers in this stack will start."
-        }
+        pendingAction?.confirmationMessage ?? ""
     }
 
     private func request(_ action: StackWorkspaceAction, _ workspace: StackWorkspace) {
         guard canOperate(workspace) else { return }
-        let members = Set(workspace.containers.map(\.id))
-        if action == .start { Task { await perform(action, workspaceID: workspace.id, expectedContainerIDs: members) } }
-        else { pendingAction = PendingStackAction(action: action, workspaceID: workspace.id, containerIDs: members) }
+        let review = PendingStackAction(action: action, workspace: workspace, runtimeScope: store.managedStacks.runtimeScope, runtime: store.captureReviewedRuntime())
+        if action == .start { Task { await perform(review) } }
+        else { pendingAction = review }
     }
 
     private func confirmationButtonTitle(_ action: StackWorkspaceAction) -> String {
@@ -514,35 +540,37 @@ struct StackWorkspaceFeatureView: View {
         }
     }
 
-    private var pendingWorkspace: StackWorkspace? {
-        guard let pendingAction else { return nil }
-        return workspaces.first { $0.id == pendingAction.workspaceID }
-    }
-
-    @MainActor private func perform(_ action: StackWorkspaceAction, workspaceID: String, expectedContainerIDs: Set<String>) async {
+    @MainActor private func perform(_ review: PendingStackAction) async {
+        let workspaceID = review.workspaceID
+        let expectedContainerIDs = review.containerIDs
+        guard store.managedStacks.runtimeScope == review.runtimeScope else {
+            actionError = ManagedStackError.runtimeChanged.localizedDescription
+            return
+        }
         guard let workspace = workspaces.first(where: { $0.id == workspaceID }), canOperate(workspace) else { return }
         guard Set(workspace.containers.map(\.id)) == expectedContainerIDs else {
             actionError = "Stack membership changed. Review the containers and try again."
             return
         }
-        let runtime = store.managedStacks.runtimeScope
-        let client = store.client
+        guard review.matchesPlan(in: workspace) else {
+            actionError = "Stack container states changed. Review the containers and try again."
+            return
+        }
         isRunningAction = true
         actionError = nil
         defer { isRunningAction = false }
         do {
-            let plan = StackWorkspaceCatalog.plan(action, for: workspace)
-            for command in plan {
-                guard store.managedStacks.runtimeScope == runtime else { throw ManagedStackError.runtimeChanged }
+            for command in review.commands {
+                guard store.managedStacks.runtimeScope == review.runtimeScope else { throw ManagedStackError.runtimeChanged }
                 guard let current = workspaces.first(where: { $0.id == workspaceID }),
                       Set(current.containers.map(\.id)) == expectedContainerIDs else { throw ManagedStackError.staleStack }
                 let phaseName = command.phase == .stop ? "Stop" : "Start"
                 _ = try await store.execute(
                     CommandRequest(arguments: command.arguments),
-                    title: "\(phaseName) Stack · \(workspace.title)", using: client
+                    title: "\(phaseName) Stack · \(review.workspaceTitle)", reviewedRuntime: review.runtime
                 )
             }
-            guard store.managedStacks.runtimeScope == runtime else { throw ManagedStackError.runtimeChanged }
+            guard store.managedStacks.runtimeScope == review.runtimeScope else { throw ManagedStackError.runtimeChanged }
             await store.refresh(.containers, force: true)
             await store.refresh(.images, force: true)
             await store.refresh(.volumes, force: true)
