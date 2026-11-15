@@ -14,6 +14,7 @@ struct AdvancedCommandSheet: View {
     @State private var values: [String: String] = [:]
     @State private var flags: Set<String> = []
     @State private var showingConfirmation = false
+    @State private var pendingReview: AdvancedCommandReview?
     @State private var running = false
     @State private var output = ""
     @State private var error: String?
@@ -22,37 +23,6 @@ struct AdvancedCommandSheet: View {
 
     private var specs: [AdvancedCommandSpec] { AdvancedCommandCatalog.specs(for: section) }
     private var spec: AdvancedCommandSpec? { specs.first { $0.id == commandID } ?? specs.first }
-    private var destructive: Bool { spec?.destructive ?? false }
-    private var confirmationTitle: String {
-        guard let spec else { return "Run this command?" }
-        if flags.contains("all") {
-            switch spec.id {
-            case "stop": return "Stop all running containers?"
-            case "delete" where section == .images: return "Delete all local images?"
-            case "delete" where section == .containers: return "Delete all containers?"
-            case "delete" where section == .volumes: return "Delete all unused volumes?"
-            case "delete" where section == .networks: return "Delete all user-defined networks?"
-            case "kill": return "Signal every running container?"
-            default: break
-            }
-        }
-        let targets = confirmationTargets
-        return targets.isEmpty ? "\(spec.title)?" : "\(spec.title): \(targets)?"
-    }
-    private var confirmationMessage: String {
-        if let message = spec?.confirmationMessage { return message }
-        let targets = confirmationTargets
-        if !targets.isEmpty { return "This command targets: \(targets)" }
-        return flags.contains("all") ? "The command will apply to the full scope named above." : "Review the selected action and scope before continuing."
-    }
-    private var confirmationTargets: String {
-        positionals
-            .flatMap { $0.split(whereSeparator: \.isNewline).map(String.init) }
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .map(AdvancedCommandScopeValidation.confirmationLabel)
-            .joined(separator: ", ")
-    }
 
     var body: some View {
         NavigationStack {
@@ -99,8 +69,8 @@ struct AdvancedCommandSheet: View {
                                 TextField(descriptor.label, text: valueBinding(descriptor.name), prompt: Text(descriptor.placeholder ?? (descriptor.repeats ? "One value per line" : "Optional")), axis: descriptor.multiline || descriptor.repeats ? .vertical : .horizontal)
                                     .font(descriptor.multiline ? .system(.body, design: .monospaced) : .body)
                                     .if(descriptor.multiline || descriptor.repeats) { $0.lineLimit(2...5) }
-                                if descriptor.name == "memory", ["run", "create"].contains(commandID), !values["memory", default: ""].isEmpty, let amount = Self.memoryMiB(values["memory", default: ""]), amount < 200 {
-                                    Label("Container memory must be at least 200 MiB.", systemImage: "exclamationmark.triangle.fill")
+                                if descriptor.name == "memory", let issue = spec.memoryLimitError(values["memory"]) {
+                                    Label(issue.localizedDescription, systemImage: "exclamationmark.triangle.fill")
                                         .font(.caption).foregroundStyle(.orange)
                                 }
                             }
@@ -124,14 +94,18 @@ struct AdvancedCommandSheet: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     AdvancedCommandControls(running: running, valid: valid && spec.map { store.runtimeOperations.canStart(CommandRequest(arguments: $0.arguments)) } == true, run: {
-                        if destructive { showingConfirmation = true } else { launch() }
+                        prepareCommand()
                     }, cancel: cancelOperation)
                 }
             }
-            .confirmationDialog(confirmationTitle, isPresented: $showingConfirmation, titleVisibility: .visible) {
-                Button("Run \(spec?.title ?? "Command")", role: .destructive) { launch() }
-                Button("Cancel", role: .cancel) { }
-            } message: { Text(confirmationMessage) }
+            .confirmationDialog(pendingReview?.confirmationTitle ?? "Run this command?", isPresented: $showingConfirmation, titleVisibility: .visible) {
+                Button("Run \(pendingReview?.title ?? "Command")", role: .destructive) {
+                    guard let review = pendingReview else { return }
+                    pendingReview = nil
+                    launch(review)
+                }
+                Button("Cancel", role: .cancel) { pendingReview = nil }
+            } message: { Text(pendingReview?.confirmationMessage ?? "") }
             .onChange(of: commandID) { _, newValue in reset(for: newValue) }
         }
         .frame(minWidth: 500, minHeight: 460)
@@ -143,8 +117,7 @@ struct AdvancedCommandSheet: View {
         guard let spec else { return false }
         let positionalsValid = spec.positionals.enumerated().allSatisfy { index, item in !item.required || (positionals.indices.contains(index) && !positionals[index].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
         let requiredFlagsValid = spec.flags.filter { $0.required }.allSatisfy { !values[$0.name, default: ""].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        let memory = values["memory", default: ""]
-        let memoryValid = !["run", "create"].contains(spec.id) || memory.isEmpty || (Self.memoryMiB(memory).map { $0 >= 200 } ?? false)
+        let memoryValid = spec.memoryLimitError(values["memory"]) == nil
         let scopeValid = AdvancedCommandScopeValidation.isValid(section: section, commandID: spec.id, positionals: positionals, flags: flags)
         return positionalsValid && requiredFlagsValid && memoryValid && scopeValid
     }
@@ -162,10 +135,20 @@ struct AdvancedCommandSheet: View {
     }
     private func reset(for id: String) { positionals = []; values = [:]; flags = []; output = ""; error = nil }
 
-    private func launch() {
+    private func prepareCommand() {
+        guard !running, valid, let spec else { return }
+        do {
+            let review = try AdvancedCommandReview(section: section, spec: spec, flags: flags, values: values, positionals: positionals, runtime: store.captureReviewedRuntime())
+            if spec.destructive {
+                pendingReview = review
+                showingConfirmation = true
+            } else { launch(review) }
+        } catch { self.error = error.localizedDescription }
+    }
+    private func launch(_ review: AdvancedCommandReview) {
         guard !running else { return }
         running = true
-        runningTask = Task { await run() }
+        runningTask = Task { await run(review) }
     }
     private func cancelOperation() {
         if let operationID { store.cancelOperation(operationID) }
@@ -173,14 +156,12 @@ struct AdvancedCommandSheet: View {
         runningTask = nil
     }
 
-    private func run() async {
-        guard let spec else { return }
+    private func run(_ review: AdvancedCommandReview) async {
         running = true
         error = nil
         do {
-            let request = try AdvancedCommandRequestBuilder.make(section: section, spec: spec, flags: flags, values: values, positionalArguments: positionalValues(for: spec))
-            var commandOutput = AdvancedCommandOutput(section: section, commandID: spec.id, arguments: request.arguments)
-            let stream = store.streamWithID(request, title: spec.title)
+            var commandOutput = AdvancedCommandOutput(section: review.section, commandID: review.commandID, arguments: review.request.arguments)
+            let stream = try store.streamWithID(review.request, title: review.title, reviewedRuntime: review.runtime)
             operationID = stream.operationID
             for try await event in stream.events {
                 try Task.checkCancellation()
@@ -197,30 +178,11 @@ struct AdvancedCommandSheet: View {
                     }
                 }
             }
-            if spec.refreshSection { await store.refresh(section, force: true) }
+            if review.refreshSection { await store.refresh(review.section, force: true) }
         } catch is CancellationError { }
         catch { self.error = error.localizedDescription }
         operationID = nil
         running = false
-    }
-    private static func memoryMiB(_ value: String) -> Double? {
-        let input = value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        guard !input.isEmpty else { return nil }
-        let suffix = input.last
-        let number = (suffix.map { "KMGTP".contains($0) } ?? false) ? String(input.dropLast()) : input
-        guard let amount = Double(number), amount >= 0 else { return nil }
-        switch suffix {
-        case "K": return amount / 1_024
-        case "M": return amount
-        case "G": return amount * 1_024
-        case "T": return amount * 1_048_576
-        case "P": return amount * 1_073_741_824
-        default: return amount / 1_048_576
-        }
-    }
-
-    private func positionalValues(for spec: AdvancedCommandSpec) throws -> [String] {
-        try AdvancedCommandRequestBuilder.positionals(for: spec, input: positionals)
     }
 }
 
@@ -254,6 +216,11 @@ enum AdvancedCommandScopeValidation {
 }
 
 struct AdvancedCommandSpec: Identifiable {
+    func memoryLimitError(_ input: String?) -> ContainerLaunchValidationError? {
+        guard let input, ["run", "create"].contains(id) else { return nil }
+        return ContainerLaunchRequestBuilder.memoryLimitError(input)
+    }
+
     struct Positional { let name: String; let placeholder: String; let required: Bool; var repeats = false; var multiline = false; var tokenized = false }
     struct Flag: Identifiable {
         enum Kind { case boolean, value }

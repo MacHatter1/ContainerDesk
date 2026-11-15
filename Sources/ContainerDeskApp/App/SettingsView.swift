@@ -16,7 +16,7 @@ struct SettingsView: View {
             Section {
                 Button("Review Limits Recovery Files…") { showRecoveryFiles = true }
                     .disabled(store.cliPath != nil || store.limitsOperationContainerID != nil || store.isRecoveryCleanupInProgress)
-                Text("Review completed rollback copies and their allocated size before removing them. Files needed by a container or an unfinished recovery are kept.")
+                Text("Restore a missing container after an interrupted limits change, or review completed rollback copies for removal.")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Label("Limits Recovery", systemImage: "externaldrive.badge.timemachine") }
             Section {

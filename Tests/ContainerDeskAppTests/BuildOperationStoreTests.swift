@@ -4,6 +4,48 @@ import Testing
 @testable import ContainerDeskApp
 
 struct BuildOperationStoreTests {
+    @MainActor @Test(arguments: [false, true])
+    func staleBuilderDeleteReviewDoesNotStartOrAcquireOwnership(_ restoreOriginalPath: Bool) async throws {
+        let suite = "BuildDeleteReview.\(UUID())"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let client = BlockingBuildClient()
+        let appStore = AppStore(client: client, defaults: defaults)
+        let build = BuildOperationStore()
+        let runtime = appStore.captureReviewedRuntime()
+        appStore.cliPath = "/missing/unreviewed-builder-\(UUID())"
+        if restoreOriginalPath { appStore.cliPath = nil }
+        var completed = false
+
+        build.start(CommandRequest(arguments: ["builder", "delete"]), title: "Delete builder", store: appStore, reviewedRuntime: runtime) { _ in completed = true }
+
+        #expect(!build.isRunning && build.operationID == nil)
+        #expect(build.error != nil)
+        #expect(!completed)
+        #expect(appStore.operations.isEmpty)
+        #expect(await !client.started)
+        let lease = try #require(appStore.runtimeOperations.beginLimitsChange("available"))
+        appStore.runtimeOperations.endLimitsChange(lease)
+    }
+
+    @MainActor @Test func reviewedBuilderDeleteUsesCapturedClientAndRetainsCancellationOwnership() async throws {
+        let suite = "BuildDeleteReview.\(UUID())"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let client = BlockingBuildClient()
+        let appStore = AppStore(client: client, defaults: defaults)
+        let build = BuildOperationStore()
+        build.start(CommandRequest(arguments: ["builder", "delete"]), title: "Delete builder", store: appStore, reviewedRuntime: appStore.captureReviewedRuntime())
+        let id = try #require(build.operationID)
+        appStore.cliPath = "/missing/unreviewed-builder-\(UUID())"
+        try await waitUntil { await client.started }
+        build.cancel()
+        try await waitUntil { await client.cancelled }
+        try await waitUntil { !build.isRunning }
+        #expect(build.operationID == nil && build.error == nil)
+        #expect(appStore.operations.first(where: { $0.id == id })?.state == .cancelled)
+    }
+
     @MainActor @Test func cancellationFromActivityDoesNotBecomeAViewError() async throws {
         let client = BlockingBuildClient()
         let appStore = AppStore(client: client)

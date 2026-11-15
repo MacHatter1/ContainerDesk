@@ -51,6 +51,21 @@ The optional profile launch check requires an already-running runtime and a loca
 CONTAINERDESK_PROFILES_LIVE_CHECK=1 CONTAINERDESK_PROFILES_IMAGE=docker.io/library/alpine:3.20 swift test --filter EnvironmentProfilesLiveTests
 ```
 
+Choose the image from `container image list`. A cached `docker.io/library/ubuntu:24.04` also works.
+
+The external MLX discovery check expects both Jev v3 models on loopback. If they are absent, run each of these commands in its own terminal. The first run downloads the 8-bit weights.
+
+```sh
+uvx --python 3.12 --from 'jev-style[mlx]==0.6.3' jev-style serve --release 0.8b-v3 --backend mlx --precision 8bit --host 127.0.0.1 --port 8765
+uvx --python 3.12 --from 'jev-style[mlx]==0.6.3' jev-style serve --release 2b-v3 --backend mlx --precision 8bit --host 127.0.0.1 --port 8766
+```
+
+Choose other free ports if needed. Once both servers are ready, run the check below. Stop any servers you started with Ctrl-C in their terminals.
+
+```sh
+CONTAINERDESK_EXTERNAL_MLX_LIVE_CHECK=1 swift test --filter MLXExternalServerLiveTests
+```
+
 The optional `./script/smoke_test.sh` uses uniquely named temporary resources and the already-running builder to exercise container, file, volume, network, export, image build, and OCI archive workflows. It removes only the resources it created. Use `--keep-for-ui` to retain them for manual review; remove only the printed resource names afterward. `./script/plugin_smoke_test.sh` covers the Compose and Kubernetes plugins in the same disposable way.
 
 For an optimized local app bundle, set the build configuration to `release`:

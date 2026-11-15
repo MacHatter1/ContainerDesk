@@ -114,15 +114,17 @@ struct MLXExternalServerDiscoveryTests {
         #expect(records.first?.id == "9146:8765")
     }
 
-    @Test func decodesJevOpenAIModelsAndHealthMetadataWithoutAssumingPaths() throws {
-        let modelPayload = #"{"data":[{"id":"jev-style-2b-decision-v3","context_tokens":25600,"head_max_tokens":25600,"backend":"mlx-metal"}],"models":[{"name":"jev-style-2b-decision-v3","release_date":"2026-09-27","description":"Jev-Style 2B Decision v3, MLX bf16, native macOS Metal GPU"}]}"#
-        let healthPayload = #"{"status":"ok","model":"jev-style-2b-decision-v3","backend":"mlx-metal","auth":false,"untrained":false,"release_kind":"release","extensions":["agent_approval"],"ext_errors":[]}"#
+    @Test(arguments: ["mlx", "mlx-metal"])
+    func decodesJevOpenAIModelsAndHealthMetadataWithoutAssumingPaths(backend: String) throws {
+        let modelPayload = #"{"data":[{"id":"jev-style-2b-decision-v3","context_tokens":25600,"head_max_tokens":25600,"backend":"\#(backend)"}],"models":[{"name":"jev-style-2b-decision-v3","release_date":"2026-09-27","description":"Jev-Style 2B Decision v3, MLX bf16, native macOS Metal GPU"}]}"#
+        let healthPayload = #"{"status":"ok","model":"jev-style-2b-decision-v3","backend":"\#(backend)","auth":false,"untrained":false,"release_kind":"release","extensions":["agent_approval"],"ext_errors":[]}"#
         let modelsObject = try #require(JSONSerialization.jsonObject(with: Data(modelPayload.utf8)) as? [String: Any])
         let healthObject = try #require(JSONSerialization.jsonObject(with: Data(healthPayload.utf8)) as? [String: Any])
 
         let result = try #require(LoopbackMLXServerProber.decode(modelsObject: modelsObject, healthObject: healthObject))
         #expect(result.status == .reachable)
-        #expect(result.backend == "mlx-metal")
+        #expect(result.backend == backend)
+        #expect(result.models.first?.backend == backend)
         #expect(result.models.count == 1)
         #expect(result.models[0].id == "jev-style-2b-decision-v3")
         #expect(result.models[0].description?.contains("native macOS Metal GPU") == true)
@@ -187,11 +189,13 @@ struct MLXExternalServerLiveTests {
     func discoversExistingJevModelsOnCurrentUsersLoopbackListeners() async {
         let result = await MLXExternalServerDiscoverer().scan()
         #expect(result.failure == nil)
-        let models = Set(result.servers.flatMap(\.models).map(\.name))
-        #expect(models.contains("jev-style-2b-decision-v3"))
-        #expect(models.contains("jev-style-0.8b-decision-v3"))
         #expect(result.servers.allSatisfy { $0.endpoint.host == "127.0.0.1" })
-        #expect(result.servers.filter { $0.models.contains(where: { $0.name.hasPrefix("jev-style-") }) }.allSatisfy { $0.backend == "mlx-metal" })
+        for model in ["jev-style-2b-decision-v3", "jev-style-0.8b-decision-v3"] {
+            let matches = result.servers.filter { $0.models.contains { $0.name == model } }
+            #expect(matches.contains { server in
+                server.status == .reachable && (server.backend == "mlx" || server.backend == "mlx-metal")
+            }, "Expected a reachable Jev MLX server for \(model). Discovered backends: \(matches.compactMap(\.backend)).")
+        }
     }
 }
 

@@ -6,7 +6,7 @@ import Testing
 struct ReviewFixAppRegressionTests {
     @MainActor @Test func composeDownUsesSavedIdentityAndConfirmationSnapshot() {
         var project = SavedComposeProject(fileURL: URL(fileURLWithPath: "/tmp/staging/compose.yaml"), name: "staging")
-        let review = ComposeDownReview(project: project, keepNetworks: true)
+        let review = ComposeDownReview(project: project, keepNetworks: true, runtime: AppStore().captureReviewedRuntime())
         project.name = "prod"
         #expect(review.request.arguments == ["compose", "down", "--file", "/tmp/staging/compose.yaml", "--project-name", "staging", "--keep-networks"])
         #expect(review.displayName == "staging")

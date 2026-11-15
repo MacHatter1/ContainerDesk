@@ -24,7 +24,7 @@ struct BuildFeatureView: View {
     private var running: Bool { operation.isRunning }
     private var progress: String { operation.output }
     private var error: String? { formError ?? operation.error }
-    @State private var showBuilderDelete = false
+    @State private var builderDeleteRuntime: AppStore.ReviewedRuntime?
     @State private var showAdvanced = false
     @State private var showBuildArgs = false
     @State private var showSecrets = false
@@ -50,9 +50,15 @@ struct BuildFeatureView: View {
         .fileImporter(isPresented: $contextImporter, allowedContentTypes: [.folder], allowsMultipleSelection: false) { result in switch result { case .success(let urls): if let url = urls.first { contextURL = url }; case .failure(let error): formError = error.localizedDescription } }
         .fileImporter(isPresented: $dockerfileImporter, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in switch result { case .success(let urls): dockerfileURL = urls.first; case .failure(let error): formError = error.localizedDescription } }
         .sheet(isPresented: $showAdvanced) { AdvancedCommandSheet(section: .builds, store: store) { _ in } }
-        .confirmationDialog("Delete the image builder?", isPresented: $showBuilderDelete, titleVisibility: .visible) {
-            Button("Delete Builder", role: .destructive) { Task { await builderAction(["builder", "delete"], title: "Delete Image Builder") } }
-            Button("Cancel", role: .cancel) { }
+        .onChange(of: store.managedStacks.runtimeScope) { _, _ in builderDeleteRuntime = nil }
+        .confirmationDialog("Delete the image builder?", isPresented: Binding(get: { builderDeleteRuntime != nil }, set: { if !$0 { builderDeleteRuntime = nil } }), titleVisibility: .visible) {
+            if let runtime = builderDeleteRuntime {
+                Button("Delete Builder", role: .destructive) {
+                    builderDeleteRuntime = nil
+                    Task { await builderAction(["builder", "delete"], title: "Delete Image Builder", reviewedRuntime: runtime) }
+                }
+            }
+            Button("Cancel", role: .cancel) { builderDeleteRuntime = nil }
         } message: { Text("The next build will recreate the builder container.") }
     }
 
@@ -128,7 +134,7 @@ struct BuildFeatureView: View {
             Divider()
             Button("Start Builder", systemImage: "play.fill") { Task { await builderAction(["builder", "start"], title: "Start Builder") } }.disabled(running || !builderStatusLoaded || builderStatusError != nil || builderIsRunning)
             Button("Stop Builder", systemImage: "stop.fill") { Task { await builderAction(["builder", "stop"], title: "Stop Builder") } }.disabled(running || !builderIsRunning)
-            Button("Delete Builder…", systemImage: "trash", role: .destructive) { showBuilderDelete = true }.disabled(running)
+            Button("Delete Builder…", systemImage: "trash", role: .destructive) { builderDeleteRuntime = store.captureReviewedRuntime() }.disabled(running)
             Spacer()
             Text("Builds use the selected folder as their working directory. The CLI finds Dockerfile first, then Containerfile.")
                 .font(.caption).foregroundStyle(.secondary)
@@ -182,9 +188,9 @@ struct BuildFeatureView: View {
         }
     }
 
-    private func builderAction(_ args: [String], title: String) async {
+    private func builderAction(_ args: [String], title: String, reviewedRuntime: AppStore.ReviewedRuntime? = nil) async {
         formError = nil
-        operation.start(CommandRequest(arguments: args), title: title, store: store) { _ in
+        operation.start(CommandRequest(arguments: args), title: title, store: store, reviewedRuntime: reviewedRuntime) { _ in
             await refreshBuilderStatus()
         }
     }

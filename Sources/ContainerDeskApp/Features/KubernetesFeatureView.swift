@@ -21,6 +21,7 @@ struct KubernetesFeatureView: View {
     @State private var actionID: UUID?
     @State private var showCreate = false
     @State private var showDelete = false
+    @State private var deleteReview: KubernetesDeleteReview?
     @State private var showLoadImage = false
     @State private var showWriteConfig = false
     @State private var confirmWriteConfig = false
@@ -64,7 +65,7 @@ struct KubernetesFeatureView: View {
                         Button("Load Local Image…", systemImage: "square.and.arrow.down") { showLoadImage = true }
                         Button("Write Kubeconfig…", systemImage: "doc.badge.gearshape") { showWriteConfig = true }
                         Divider()
-                        Button("Delete Cluster…", systemImage: "trash", role: .destructive) { showDelete = true }
+                        Button("Delete Cluster…", systemImage: "trash", role: .destructive) { reviewDelete() }
                     }
                 }.disabled(busy)
                 Text(output.isEmpty ? "Refresh to list clusters. The 1.5.0 list command returns human-readable text and has no JSON formatter." : output)
@@ -97,7 +98,7 @@ struct KubernetesFeatureView: View {
                         Button("Load Image…") { showLoadImage = true }.disabled(busy || rememberedNames.isEmpty)
                         Button("Write Kubeconfig…") { showWriteConfig = true }.disabled(busy || rememberedNames.isEmpty)
                         Spacer()
-                        Button("Delete…", role: .destructive) { showDelete = true }.disabled(busy || rememberedNames.isEmpty)
+                        Button("Delete…", role: .destructive) { reviewDelete() }.disabled(busy || rememberedNames.isEmpty)
                     }
                   }
                 }
@@ -118,8 +119,12 @@ struct KubernetesFeatureView: View {
             Button("Cancel", role: .cancel) { }
         } message: { Text("The plugin merges credentials into ~/.kube/config when it creates a cluster. This action creates one control-plane node and changes local Kubernetes configuration.") }
         .confirmationDialog("Delete Kubernetes cluster?", isPresented: $showDelete, titleVisibility: .visible) {
-            Button("Delete \(clusterName)", role: .destructive) { launch { await deleteCluster() } }
-            Button("Cancel", role: .cancel) { }
+            Button("Delete \(deleteReview?.name ?? "cluster")", role: .destructive) {
+                guard let review = deleteReview else { return }
+                deleteReview = nil
+                launch { await deleteCluster(review) }
+            }
+            Button("Cancel", role: .cancel) { deleteReview = nil }
         } message: { Text("This stops and removes the cluster container and removes its context from ~/.kube/config.") }
         .task { await refreshList() }
         .onChange(of: selectedName) { _, name in if let name { clusterName = name } }
@@ -207,11 +212,16 @@ struct KubernetesFeatureView: View {
         guard await execute(args, title: "Create Kubernetes Cluster") else { return }
         store.pluginLibrary.rememberCluster(name); showCreate = false; await refreshList()
     }
-    private func deleteCluster() async {
+    private func reviewDelete() {
         let name = clusterName.trimmedFormValue
         guard !name.isEmpty else { return }
-        guard await execute(["k8s", "delete", "--name", name], title: "Delete Kubernetes Cluster") else { return }
-        store.pluginLibrary.forgetCluster(name); if selectedName == name { selectedName = nil }; await refreshList()
+        deleteReview = KubernetesDeleteReview(name: name, runtime: store.captureReviewedRuntime())
+        showDelete = true
+    }
+    private func deleteCluster(_ review: KubernetesDeleteReview) async {
+        inputError = nil
+        guard await operation.run(review.request, title: "Delete Kubernetes Cluster", store: store, owner: owner, reviewedRuntime: review.runtime) else { return }
+        store.pluginLibrary.forgetCluster(review.name); if selectedName == review.name { selectedName = nil }; await refreshList()
     }
     private func loadImage() async {
         var args = ["k8s", "load-image", "--name", clusterName.trimmedFormValue, image.trimmedFormValue]

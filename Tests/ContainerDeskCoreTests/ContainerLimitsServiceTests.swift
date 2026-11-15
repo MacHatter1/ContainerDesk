@@ -8,6 +8,145 @@ import Testing
 
 @Suite("Container limits recreation")
 struct ContainerLimitsServiceTests {
+    @Test(arguments: [OriginalLimitsStatus.running, .stopped, .neverStarted])
+    func freshServiceRestoresOriginalAfterDeletion(status: OriginalLimitsStatus) async throws {
+        let fixture = try LimitsFixture.make(status: status == .running ? .running : .stopped,
+                                            neverStarted: status == .neverStarted, terminalEnabled: true, createFailures: 2)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let directory = try await fixture.interruptAfterDeletion()
+        if status == .running {
+            var marker = try #require(LimitsRecoveryState.read(at: directory))
+            marker.outcome = .inProgress
+            try marker.write(to: directory)
+        }
+        let service = fixture.relaunchedRecovery()
+        let offered = try #require(try await service.scan().first)
+        #expect(!offered.canRemove && offered.canReviewRestore)
+        let review = try await service.reviewRestore(offered)
+        #expect(review.session.directory == directory && review.containerID == fixture.id)
+        #expect(review.wasRunning == (status == .running))
+        #expect(review.neverStarted == (status == .neverStarted))
+        #expect(review.limits == ContainerResourceLimits(cpus: 2, memoryBytes: 512 * mebibyte))
+        try await service.restore(review)
+
+        let restored = try #require(await fixture.runtime.inspect(id: fixture.id))
+        #expect(restored.snapshot.status == (status == .running ? .running : .stopped))
+        var expected = fixture.originalState.snapshot.configuration
+        expected.creationDate = restored.snapshot.configuration.creationDate
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        #expect(try encoder.encode(expected) == encoder.encode(restored.snapshot.configuration))
+        #expect(try Data(contentsOf: URL(fileURLWithPath: restored.initialFilesystem.source)) == fixture.initfsBytes)
+        #expect(try Data(contentsOf: restored.kernel.path) == fixture.kernelBytes)
+        let restoredRoot = fixture.bundle.appendingPathComponent("rootfs.ext4")
+        if status == .neverStarted {
+            #expect(!FileManager.default.fileExists(atPath: restoredRoot.path))
+            #expect(try Data(contentsOf: URL(fileURLWithPath: restored.rootFilesystem.source)) == Data("fixture image filesystem".utf8))
+        } else {
+            #expect(try Data(contentsOf: restoredRoot) == Data("fixture writable filesystem".utf8))
+        }
+        #expect(LimitsRecoveryState.read(at: directory)?.outcome == .rolledBack)
+        let activity = await fixture.runtime.activity()
+        await #expect(throws: (any Error).self) { try await service.restore(review) }
+        #expect(await fixture.runtime.activity() == activity)
+    }
+
+    @Test(arguments: ["rootfs.ext4", "kernel.bin", "initfs.ext4", "recovery.json", "owned ID", "partial bundle",
+                      "changed runtime", "unsupported CLI", "legacy", "referenced", "incomplete inventory"])
+    func restoreRefusesChangedBackupOrRuntime(problem: String) async throws {
+        let fixture = try LimitsFixture.make(status: .stopped, createFailures: 2)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let directory = try await fixture.interruptAfterDeletion()
+        let inventory = RestoreInventory()
+        let service = ContainerLimitsRecoveryService(directory: fixture.recoveryRoot, reader: inventory, runtime: fixture.runtime)
+        let session = try #require(try await service.scan().first)
+        let review = try await service.reviewRestore(session)
+        switch problem {
+        case "owned ID": await fixture.runtime.insertOtherIdentity()
+        case "partial bundle": try FileManager.default.createDirectory(at: fixture.bundle, withIntermediateDirectories: true)
+        case "changed runtime": await fixture.runtime.changeAppRoot(fixture.root)
+        case "unsupported CLI": await fixture.runtime.changeAppRoot(nil)
+        case "legacy":
+            var marker = try #require(LimitsRecoveryState.read(at: directory))
+            marker.manifestDigest = nil
+            try marker.write(to: directory)
+        case "referenced": await inventory.change(.init(referencedFiles: [directory], complete: true))
+        case "incomplete inventory": await inventory.change(.init(referencedFiles: [], complete: false))
+        default: try Data("unexpected".utf8).write(to: directory.appendingPathComponent(problem))
+        }
+        let actions = await fixture.runtime.activity().filter { ["delete", "start", "stop", "create"].contains($0) }
+        await #expect(throws: (any Error).self) { try await service.restore(review) }
+        #expect(await fixture.runtime.activity().filter { ["delete", "start", "stop", "create"].contains($0) } == actions)
+        #expect(FileManager.default.fileExists(atPath: directory.path))
+        #expect(LimitsRecoveryState.read(at: directory)?.outcome == .recoveryNeeded)
+    }
+
+    @Test func restoresOnlyTheReviewedBackupWhenTwoSessionsShareAContainerName() async throws {
+        let first = try LimitsFixture.make(status: .stopped, createFailures: 2)
+        defer { try? FileManager.default.removeItem(at: first.root) }
+        let firstBackup = try await first.interruptAfterDeletion()
+        let second = try LimitsFixture.make(root: first.root, status: .running, terminalEnabled: true, createFailures: 2)
+        let secondBytes = Data("second container disk".utf8)
+        try secondBytes.write(to: second.bundle.appendingPathComponent("rootfs.ext4"))
+        let secondBackup = try await second.interruptAfterDeletion()
+        let service = second.relaunchedRecovery()
+        let sessions = try await service.scan()
+        #expect(sessions.count == 2 && sessions.allSatisfy(\.canReviewRestore))
+        let selected = try #require(sessions.first { $0.directory == secondBackup })
+        let review = try await service.reviewRestore(selected)
+        try await service.restore(review)
+
+        let restored = try #require(await second.runtime.inspect(id: second.id))
+        #expect(restored.snapshot.status == .running && restored.snapshot.configuration.initProcess.terminal)
+        #expect(try Data(contentsOf: second.bundle.appendingPathComponent("rootfs.ext4")) == secondBytes)
+        #expect(LimitsRecoveryState.read(at: secondBackup)?.outcome == .rolledBack)
+        #expect(LimitsRecoveryState.read(at: firstBackup)?.outcome == .recoveryNeeded)
+        #expect(try Data(contentsOf: firstBackup.appendingPathComponent("rootfs.ext4")) == Data("fixture writable filesystem".utf8))
+    }
+
+    @Test func aFailedCreateCanBeRetriedAfterReviewingTheAbsentContainerAgain() async throws {
+        let fixture = try LimitsFixture.make(status: .stopped, createFailures: 3)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let directory = try await fixture.interruptAfterDeletion()
+        let service = fixture.relaunchedRecovery()
+        let review = try await service.reviewRestore(#require(try await service.scan().first))
+        await #expect(throws: LimitsRecoveryError.restoreFailed) { try await service.restore(review) }
+        #expect(try await fixture.runtime.inspect(id: fixture.id) == nil)
+        #expect(LimitsRecoveryState.read(at: directory)?.outcome == .recoveryNeeded)
+        let retry = try await service.reviewRestore(#require(try await service.scan().first))
+        try await service.restore(retry)
+        #expect(try await fixture.runtime.inspect(id: fixture.id)?.snapshot.status == .stopped)
+        #expect(LimitsRecoveryState.read(at: directory)?.outcome == .rolledBack)
+    }
+
+    @Test func failedPostCreateVerificationKeepsPartialContainerForManualRecovery() async throws {
+        let fixture = try LimitsFixture.make(createFailures: 2, corruptCreatedConfiguration: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let directory = try await fixture.interruptAfterDeletion()
+        let service = fixture.relaunchedRecovery()
+        let review = try await service.reviewRestore(#require(try await service.scan().first))
+        await #expect(throws: LimitsRecoveryError.restoreFailed) { try await service.restore(review) }
+        let partial = try #require(await fixture.runtime.inspect(id: fixture.id))
+        #expect(partial.snapshot.status == .stopped)
+        #expect(partial.snapshot.configuration.resources.cpus == review.limits.cpus + 1)
+        #expect((await fixture.runtime.activity()).filter { $0 == "delete" }.count == 1)
+        let session = try #require(try await service.scan().first)
+        await #expect(throws: (any Error).self) { _ = try await service.reviewRestore(session) }
+        #expect(LimitsRecoveryState.read(at: directory)?.outcome == .recoveryNeeded)
+        #expect(try Data(contentsOf: directory.appendingPathComponent("rootfs.ext4")) == Data("fixture writable filesystem".utf8))
+    }
+
+    @Test func changedImageFilesystemPreventsNeverStartedRestore() async throws {
+        let fixture = try LimitsFixture.make(status: .stopped, neverStarted: true, createFailures: 2)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try await fixture.interruptAfterDeletion()
+        let service = fixture.relaunchedRecovery()
+        let session = try #require(try await service.scan().first)
+        try Data("changed image".utf8).write(to: fixture.imageRootfs)
+        await #expect(throws: (any Error).self) { _ = try await service.reviewRestore(session) }
+        #expect(try await fixture.runtime.inspect(id: fixture.id) == nil)
+    }
+
     @Test func runningReplacementKeepsConfigurationMountsAndVerifiedRecoveryCopies() async throws {
         let fixture = try LimitsFixture.make()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -485,7 +624,20 @@ private struct LimitsFixture {
     let runtime: ScriptedLimitsRuntime
     let service: ContainerLimitsService
 
+    func interruptAfterDeletion() async throws -> URL {
+        let plan = try await service.prepare(id: id)
+        let result = await service.apply(plan, limits: .init(cpus: validCPUCount(plan), memoryBytes: 200 * mebibyte))
+        guard case .recoveryNeeded(let directory, _) = result else { throw TestRuntimeFailure.injected }
+        #expect(try await runtime.inspect(id: id) == nil)
+        return directory
+    }
+
+    func relaunchedRecovery() -> ContainerLimitsRecoveryService {
+        .init(directory: recoveryRoot, reader: RestoreInventory(), runtime: runtime)
+    }
+
     static func make(
+        root existingRoot: URL? = nil,
         status: RuntimeStatus = .running,
         neverStarted: Bool = false,
         everStarted: Bool = false,
@@ -496,7 +648,7 @@ private struct LimitsFixture {
         corruptCreatedConfiguration: Bool = false,
         deleteRemovesThenThrows: Bool = false
     ) throws -> LimitsFixture {
-        let root = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+        let root = existingRoot ?? URL(fileURLWithPath: "/private/tmp", isDirectory: true)
             .appendingPathComponent("ContainerLimitsServiceTests-\(UUID().uuidString)", isDirectory: true)
         let appRoot = root.appendingPathComponent("container-app", isDirectory: true)
         let id = "limits-fixture"
@@ -597,6 +749,7 @@ private struct LimitsFixture {
 private actor ScriptedLimitsRuntime: ContainerLimitsRuntime {
     private var current: ContainerLimitsRuntimeState?
     private let template: ContainerLimitsRuntimeState
+    private var appRoot: URL?
     private var createFailures: Int
     private var startFailures: Int
     private let corruptCreatedConfiguration: Bool
@@ -611,12 +764,25 @@ private actor ScriptedLimitsRuntime: ContainerLimitsRuntime {
         deleteRemovesThenThrows: Bool
     ) {
         self.current = initialState
+        self.appRoot = initialState.appRoot
         self.template = initialState
         self.createFailures = createFailures
         self.startFailures = startFailures
         self.corruptCreatedConfiguration = corruptCreatedConfiguration
         self.deleteRemovesThenThrows = deleteRemovesThenThrows
     }
+
+    func verifiedAppRoot() throws -> URL {
+        guard let appRoot else { throw ContainerLimitsIssue.unsupportedCLI }
+        return appRoot
+    }
+
+    func insertOtherIdentity() {
+        current = template
+        changeLabel()
+    }
+
+    func changeAppRoot(_ url: URL?) { appRoot = url }
 
     func inspect(id: String) async throws -> ContainerLimitsRuntimeState? {
         guard current?.snapshot.id == id else { return nil }
@@ -789,4 +955,11 @@ private func validCPUCount(_ plan: ContainerLimitsPlan) -> Int {
 private struct LimitsFixtureRecoveryReader: LimitsRecoveryInventoryReading {
     let paths: [URL]
     func inventory() async throws -> LimitsRecoveryInventory { .init(referencedFiles: paths, complete: true) }
+}
+
+
+private actor RestoreInventory: LimitsRecoveryInventoryReading {
+    var current = LimitsRecoveryInventory(referencedFiles: [], complete: true)
+    func inventory() -> LimitsRecoveryInventory { current }
+    func change(_ value: LimitsRecoveryInventory) { current = value }
 }

@@ -205,7 +205,7 @@ public actor ContainerLimitsService {
         let recovery = RecoveryFiles(directory: sessionURL)
         var oldContainerDeleted = false
         var replacementCreated = false
-        var backup: RecoveryInputs?
+        var backup: RecoveryManifest?
         var newConfiguration: ContainerConfiguration?
 
         do {
@@ -229,7 +229,7 @@ public actor ContainerLimitsService {
             }
             try Self.validateConfiguration(stoppedState, recoveryRoot: recoveryRoot)
             do {
-                backup = try Self.writeVerifiedBackup(stoppedState: stoppedState, files: recovery)
+                backup = try Self.writeVerifiedBackup(stoppedState: stoppedState, files: recovery, originalStatus: plan.wasRunning ? .running : .stopped, initImage: initImageReference)
             } catch {
                 throw ContainerLimitsIssue.backupFailed
             }
@@ -241,8 +241,7 @@ public actor ContainerLimitsService {
                 throw ContainerLimitsIssue.staleReview
             }
             try Self.validateConfiguration(beforeDelete, recoveryRoot: recoveryRoot)
-            guard let rootfsFingerprint = backup.rootfsFingerprint,
-                  try Self.fileDigest(URL(fileURLWithPath: beforeDelete.rootFilesystem.source)) == rootfsFingerprint,
+            guard try Self.fileDigest(URL(fileURLWithPath: beforeDelete.rootFilesystem.source)) == backup.rootfsFingerprint,
                   try Self.fileDigest(URL(fileURLWithPath: beforeDelete.initialFilesystem.source)) == backup.initfsFingerprint,
                   try Self.fileDigest(beforeDelete.kernel.path) == backup.kernelFingerprint else {
                 throw ContainerLimitsIssue.staleReview
@@ -355,13 +354,10 @@ public actor ContainerLimitsService {
             guard let backup else { return .recoveryNeeded(recoveryURL: sessionURL, reason: .rollbackFailed) }
             let rollbackSucceeded = await rollback(
                 change: change,
-                limits: plan.currentLimits,
                 recovery: recovery,
                 backup: backup,
-                replacementLimits: limits,
                 replacementConfiguration: newConfiguration,
-                replacementCreated: replacementCreated,
-                initImageReference: initImageReference
+                replacementCreated: replacementCreated
             )
             return rollbackSucceeded
                 ? .rolledBack(recoveryURL: sessionURL, reason: issue)
@@ -388,7 +384,7 @@ public actor ContainerLimitsService {
         let files = RecoveryFiles(directory: sessionURL)
         var oldContainerDeleted = false
         var replacementConfiguration: ContainerConfiguration?
-        var backup: RecoveryInputs?
+        var backup: RecoveryManifest?
 
         do {
             await onProgress(.backingUp)
@@ -396,12 +392,13 @@ public actor ContainerLimitsService {
                   original.snapshot.status == .stopped, Self.matches(change, fresh: original),
                   Self.isNeverStarted(original) else { throw ContainerLimitsIssue.staleReview }
             try Self.validateConfiguration(original, recoveryRoot: recoveryRoot)
-            backup = try Self.writeVerifiedBackup(stoppedState: original, files: files, includeRootFilesystem: false)
+            backup = try Self.writeVerifiedBackup(stoppedState: original, files: files, originalStatus: .neverStarted, initImage: initImageReference)
             guard let backup else { throw ContainerLimitsIssue.backupFailed }
 
             guard let beforeDelete = try await runtime.inspect(id: plan.containerID),
                   beforeDelete.snapshot.status == .stopped, Self.matches(change, fresh: beforeDelete),
                   Self.isNeverStarted(beforeDelete),
+                  try Self.fileDigest(URL(fileURLWithPath: beforeDelete.rootFilesystem.source)) == backup.rootfsFingerprint,
                   try Self.fileDigest(URL(fileURLWithPath: beforeDelete.initialFilesystem.source)) == backup.initfsFingerprint,
                   try Self.fileDigest(beforeDelete.kernel.path) == backup.kernelFingerprint else {
                 throw ContainerLimitsIssue.staleReview
@@ -465,11 +462,9 @@ public actor ContainerLimitsService {
                 return .unchanged(reason: issue)
             }
             await onProgress(.rollingBack)
-            let restored = await rollbackNeverStarted(
-                change: change,
-                backup: backup,
-                replacementConfiguration: replacementConfiguration,
-                initImageReference: initImageReference
+            let restored = await rollback(
+                change: change, recovery: files, backup: backup,
+                replacementConfiguration: replacementConfiguration, replacementCreated: false
             )
             return restored
                 ? .rolledBack(recoveryURL: sessionURL, reason: issue)
@@ -477,66 +472,12 @@ public actor ContainerLimitsService {
         }
     }
 
-    private func rollbackNeverStarted(
-        change: PreparedLimitsChange,
-        backup: RecoveryInputs,
-        replacementConfiguration: ContainerConfiguration?,
-        initImageReference: String
-    ) async -> Bool {
-        let id = change.plan.containerID
-        do {
-            if let current = try await runtime.inspect(id: id) {
-                guard let replacementConfiguration,
-                      Self.digest(current.snapshot.configuration) == Self.digest(replacementConfiguration),
-                      current.snapshot.status == .stopped, Self.isNeverStarted(current) else { return false }
-                try await runtime.delete(id: id)
-                guard try await runtime.inspect(id: id) == nil,
-                      !FileManager.default.fileExists(atPath: change.state.bundlePath.path) else { return false }
-            }
-            let original = change.state
-            guard Self.isNeverStarted(original) else { return false }
-            var restoredConfiguration = Self.configuration(
-                original.snapshot.configuration,
-                limits: change.plan.currentLimits,
-                creationDate: Self.nextCreationDate(after: original.snapshot.configuration.creationDate)
-            )
-            // Preserve all original settings; only creationDate changes as required by the CLI identity.
-            restoredConfiguration.labels = original.snapshot.configuration.labels
-            let options = original.options ?? ContainerCreateOptions(autoRemove: false)
-            try await runtime.create(configuration: restoredConfiguration, options: options, kernel: backup.kernel, initImage: initImageReference)
-            guard let created = try await runtime.inspect(id: id),
-                  created.snapshot.status == .stopped,
-                  Self.digest(created.snapshot.configuration) == Self.digest(restoredConfiguration),
-                  Self.isNeverStarted(created) else { return false }
-            let coldConfiguration = RuntimeConfiguration(
-                path: original.bundlePath,
-                initialFilesystem: backup.initialFilesystem,
-                kernel: backup.kernel,
-                containerConfiguration: restoredConfiguration,
-                containerRootFilesystem: original.runtimeConfiguration.containerRootFilesystem,
-                options: original.options,
-                runtimeData: original.runtimeConfiguration.runtimeData
-            )
-            try await runtime.replaceColdRuntimeConfiguration(coldConfiguration)
-            guard let final = try await runtime.inspect(id: id),
-                  final.snapshot.status == .stopped,
-                  Self.digest(final.snapshot.configuration) == Self.digest(restoredConfiguration),
-                  Self.isNeverStarted(final) else { return false }
-            return true
-        } catch {
-            return false
-        }
-    }
-
     private func rollback(
         change: PreparedLimitsChange,
-        limits: ContainerResourceLimits,
         recovery: RecoveryFiles,
-        backup: RecoveryInputs,
-        replacementLimits: ContainerResourceLimits,
+        backup: RecoveryManifest,
         replacementConfiguration: ContainerConfiguration?,
-        replacementCreated: Bool,
-        initImageReference: String?
+        replacementCreated: Bool
     ) async -> Bool {
         let id = change.plan.containerID
         do {
@@ -544,6 +485,7 @@ public actor ContainerLimitsService {
                 guard let replacementConfiguration,
                       (replacementCreated || current.snapshot.configuration.creationDate != change.state.snapshot.configuration.creationDate),
                       Self.digest(current.snapshot.configuration) == Self.digest(replacementConfiguration),
+                      backup.originalStatus != .neverStarted || Self.isNeverStarted(current),
                       current.snapshot.status == .stopped || current.snapshot.status == .running else { return false }
                 if current.snapshot.status == .running {
                     try await runtime.stop(id: id)
@@ -554,42 +496,92 @@ public actor ContainerLimitsService {
                 guard try await runtime.inspect(id: id) == nil,
                       !FileManager.default.fileExists(atPath: change.state.bundlePath.path) else { return false }
             }
-            guard !FileManager.default.fileExists(atPath: change.state.bundlePath.path) else { return false }
-            let originalConfiguration = Self.configuration(
-                change.state.snapshot.configuration,
-                limits: limits,
-                creationDate: Self.nextCreationDate(after: change.state.snapshot.configuration.creationDate)
-            )
-            var rootfsOverride = change.state.rootFilesystem
-            rootfsOverride.source = change.state.bundlePath.appendingPathComponent("rootfs.ext4").path
-            let options = ContainerCreateOptions(autoRemove: false, rootFsOverride: rootfsOverride)
-            guard let initImageReference else { return false }
-            try await runtime.create(configuration: originalConfiguration, options: options, kernel: backup.kernel, initImage: initImageReference)
-            guard let created = try await runtime.inspect(id: id),
-                  created.snapshot.status == .stopped,
-                  Self.digest(created.snapshot.configuration) == Self.digest(originalConfiguration),
-                  created.bundlePath.standardizedFileURL == change.state.bundlePath.standardizedFileURL else { return false }
-            try Self.copyVerified(recovery.rootfs, to: change.state.bundlePath.appendingPathComponent("rootfs.ext4"))
-            let runtimeConfiguration = RuntimeConfiguration(
-                path: change.state.bundlePath,
-                initialFilesystem: backup.initialFilesystem,
-                kernel: backup.kernel,
-                containerConfiguration: originalConfiguration,
-                containerRootFilesystem: nil,
-                options: options,
-                runtimeData: change.state.runtimeConfiguration.runtimeData
-            )
-            try await runtime.replaceColdRuntimeConfiguration(runtimeConfiguration)
-            if change.plan.wasRunning {
-                try await runtime.start(id: id)
-            }
-            guard let restored = try await runtime.inspect(id: id),
-                  restored.snapshot.status == (change.plan.wasRunning ? .running : .stopped),
-                  Self.digest(restored.snapshot.configuration) == Self.digest(originalConfiguration) else { return false }
+            try await Self.recreateOriginal(backup, files: recovery, runtime: runtime)
             return true
         } catch {
             return false
         }
+    }
+
+    static func verifyRestore(_ backup: RecoveryManifest, files: RecoveryFiles, runtime: any ContainerLimitsRuntime) async throws {
+        let id = backup.containerID
+        guard !id.isEmpty, id != ".", id != "..", !id.contains("/"), !id.contains("\\"), !id.contains("\0"),
+              backup.version == 2, backup.sessionID == files.directory.lastPathComponent,
+              backup.configuration.id == id, backup.configuration.creationDate == backup.createdAt,
+              backup.configuration.runtimeHandler == "container-runtime-linux", !backup.configuration.readOnly,
+              backup.options?.autoRemove != true, backup.kernel.platform.os == .linux,
+              backup.kernel.path.path == files.kernel.path, backup.initialFilesystem.source == files.initfs.path,
+              backup.appRoot.isFileURL, !hasSymbolicLinkComponent(backup.appRoot),
+              try await runtime.verifiedAppRoot().path == backup.appRoot.path else {
+            throw LimitsRecoveryError.unavailableRestore
+        }
+        try validateFilesystem(backup.initialFilesystem, root: files.directory, mustBeWritable: false)
+        let rootfs = backup.rootFilesystem
+        guard case .block(let format, _, _) = rootfs.type, format == "ext4", rootfs.destination == "/" else {
+            throw LimitsRecoveryError.unavailableRestore
+        }
+        let rootSource: URL
+        if backup.originalStatus == .neverStarted {
+            rootSource = URL(fileURLWithPath: rootfs.source)
+            guard backup.options?.rootFsOverride == nil, !isWithin(rootSource, root: backup.bundle) else {
+                throw LimitsRecoveryError.unavailableRestore
+            }
+            try validateFilesystem(rootfs, root: backup.appRoot, mustBeWritable: false)
+        } else {
+            guard rootfs.source == backup.bundle.appendingPathComponent("rootfs.ext4").path,
+                  !rootfs.options.contains("ro") else { throw LimitsRecoveryError.unavailableRestore }
+            rootSource = files.rootfs
+        }
+        try validateMounts(backup.configuration.mounts, appRoot: backup.appRoot)
+        guard try fileDigest(files.kernel) == backup.kernelFingerprint,
+              try fileDigest(files.initfs) == backup.initfsFingerprint,
+              try fileDigest(rootSource) == backup.rootfsFingerprint,
+              try await runtime.preflightCreate(platform: backup.configuration.platform) == backup.initImage else {
+            throw LimitsRecoveryError.unavailableRestore
+        }
+        try await requireAbsent(backup, runtime: runtime)
+    }
+
+    private static func requireAbsent(_ backup: RecoveryManifest, runtime: any ContainerLimitsRuntime) async throws {
+        var info = stat()
+        guard try await runtime.inspect(id: backup.containerID) == nil,
+              try await runtime.verifiedAppRoot().path == backup.appRoot.path,
+              !hasSymbolicLinkComponent(backup.bundle.deletingLastPathComponent()),
+              lstat(backup.bundle.path, &info) != 0, errno == ENOENT else {
+            throw LimitsRecoveryError.unavailableRestore
+        }
+    }
+
+    static func recreateOriginal(_ backup: RecoveryManifest, files: RecoveryFiles, runtime: any ContainerLimitsRuntime) async throws {
+        try await requireAbsent(backup, runtime: runtime)
+        let cold = backup.originalStatus == .neverStarted
+        let options = cold ? backup.options : ContainerCreateOptions(autoRemove: false, rootFsOverride: backup.rootFilesystem)
+        var original = backup.configuration
+        original.creationDate = nextCreationDate(after: original.creationDate)
+        try await runtime.create(configuration: original, options: options ?? .default, kernel: backup.kernel, initImage: backup.initImage)
+        guard let created = try await runtime.inspect(id: backup.containerID),
+              created.snapshot.status == .stopped, digest(created.snapshot.configuration) == digest(original),
+              created.bundlePath.path == backup.bundle.path, !hasSymbolicLinkComponent(created.bundlePath),
+              !cold || (isNeverStarted(created) && digest(created.rootFilesystem) == digest(backup.rootFilesystem)) else {
+            throw LimitsRecoveryError.restoreFailed
+        }
+        let root = URL(fileURLWithPath: backup.rootFilesystem.source)
+        if !cold { try copyVerified(files.rootfs, to: root) }
+        let configuration = RuntimeConfiguration(
+            path: backup.bundle, initialFilesystem: backup.initialFilesystem, kernel: backup.kernel,
+            containerConfiguration: original, containerRootFilesystem: cold ? backup.rootFilesystem : nil, options: options
+        )
+        try await runtime.replaceColdRuntimeConfiguration(configuration)
+        guard let patched = try await runtime.inspect(id: backup.containerID), patched.snapshot.status == .stopped,
+              patched.bundlePath.path == backup.bundle.path, digest(patched.snapshot.configuration) == digest(original),
+              digest(patched.runtimeConfiguration) == digest(configuration), !cold || isNeverStarted(patched),
+              try fileDigest(root) == backup.rootfsFingerprint, try fileDigest(files.initfs) == backup.initfsFingerprint,
+              try fileDigest(files.kernel) == backup.kernelFingerprint else { throw LimitsRecoveryError.restoreFailed }
+        if backup.originalStatus == .running { try await runtime.start(id: backup.containerID) }
+        guard let final = try await runtime.inspect(id: backup.containerID),
+              final.bundlePath.path == backup.bundle.path,
+              final.snapshot.status == (backup.originalStatus == .running ? .running : .stopped),
+              digest(final.snapshot.configuration) == digest(original) else { throw LimitsRecoveryError.restoreFailed }
     }
 
     private static func configuration(_ original: ContainerConfiguration, limits: ContainerResourceLimits, creationDate: Date?) -> ContainerConfiguration {
@@ -669,18 +661,22 @@ public actor ContainerLimitsService {
                 throw ContainerLimitsIssue.unsupportedContainer
             }
         }
-        for mount in config.mounts {
+        try validateMounts(config.mounts, appRoot: state.appRoot)
+    }
+
+    private static func validateMounts(_ mounts: [Filesystem], appRoot: URL) throws {
+        for mount in mounts {
             switch mount.type {
             case .tmpfs:
                 throw ContainerLimitsIssue.unsupportedContainer
             case .virtiofs:
-                try validateFile(URL(fileURLWithPath: mount.source), root: state.appRoot, allowExternal: true)
+                try validateFile(URL(fileURLWithPath: mount.source), root: appRoot, allowExternal: true)
             case .block(let format, _, _):
                 guard format == "ext4" else { throw ContainerLimitsIssue.unsupportedContainer }
-                try validateFile(URL(fileURLWithPath: mount.source), root: state.appRoot, allowExternal: true)
+                try validateFile(URL(fileURLWithPath: mount.source), root: appRoot, allowExternal: true)
             case .volume(_, let format, _, _):
                 guard format == "ext4" else { throw ContainerLimitsIssue.unsupportedContainer }
-                try validateFile(URL(fileURLWithPath: mount.source), root: state.appRoot, allowExternal: true)
+                try validateFile(URL(fileURLWithPath: mount.source), root: appRoot, allowExternal: true)
             @unknown default:
                 throw ContainerLimitsIssue.unsupportedContainer
             }
@@ -789,12 +785,13 @@ public actor ContainerLimitsService {
     private static func writeVerifiedBackup(
         stoppedState: ContainerLimitsRuntimeState,
         files: RecoveryFiles,
-        includeRootFilesystem: Bool = true
-    ) throws -> RecoveryInputs {
+        originalStatus: OriginalLimitsStatus,
+        initImage: String
+    ) throws -> RecoveryManifest {
         let rootfsSource = URL(fileURLWithPath: stoppedState.rootFilesystem.source)
         let initSource = URL(fileURLWithPath: stoppedState.initialFilesystem.source)
         let kernelSource = stoppedState.kernel.path
-        if includeRootFilesystem { try copyVerified(rootfsSource, to: files.rootfs) }
+        if originalStatus != .neverStarted { try copyVerified(rootfsSource, to: files.rootfs) }
         try copyVerified(initSource, to: files.initfs)
         try copyVerified(kernelSource, to: files.kernel)
         var backupKernel = stoppedState.kernel
@@ -802,13 +799,15 @@ public actor ContainerLimitsService {
         var backupInitialFilesystem = stoppedState.initialFilesystem
         backupInitialFilesystem.source = files.initfs.path
         let manifest = RecoveryManifest(
+            version: 2, sessionID: files.directory.lastPathComponent, appRoot: stoppedState.appRoot,
+            originalStatus: originalStatus, rootFilesystem: stoppedState.rootFilesystem, initImage: initImage,
             containerID: stoppedState.snapshot.id,
             createdAt: stoppedState.snapshot.configuration.creationDate,
             configuration: stoppedState.snapshot.configuration,
             kernel: backupKernel,
             initialFilesystem: backupInitialFilesystem,
             options: stoppedState.options,
-            rootfsFingerprint: includeRootFilesystem ? try fileDigest(files.rootfs) : nil,
+            rootfsFingerprint: try fileDigest(originalStatus == .neverStarted ? rootfsSource : files.rootfs),
             initfsFingerprint: try fileDigest(files.initfs),
             kernelFingerprint: try fileDigest(files.kernel)
         )
@@ -825,13 +824,12 @@ public actor ContainerLimitsService {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: files.metadata.path)
         try syncFile(files.metadata)
         try syncDirectory(files.directory)
-        return RecoveryInputs(
-            kernel: backupKernel,
-            initialFilesystem: backupInitialFilesystem,
-            rootfsFingerprint: manifest.rootfsFingerprint,
-            initfsFingerprint: manifest.initfsFingerprint,
-            kernelFingerprint: manifest.kernelFingerprint
-        )
+        guard var marker = LimitsRecoveryState.read(at: files.directory), marker.containerID == manifest.containerID else {
+            throw ContainerLimitsIssue.backupFailed
+        }
+        marker.manifestDigest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        try marker.write(to: files.directory)
+        return manifest
     }
 
     private static func copyVerified(_ source: URL, to destination: URL) throws {
@@ -880,7 +878,7 @@ private struct PreparedLimitsChange: Sendable {
     let configDigest: String
 }
 
-private struct RecoveryFiles: Sendable {
+struct RecoveryFiles: Sendable {
     let directory: URL
     var rootfs: URL { directory.appendingPathComponent("rootfs.ext4") }
     var initfs: URL { directory.appendingPathComponent("initfs.ext4") }
@@ -888,14 +886,25 @@ private struct RecoveryFiles: Sendable {
     var metadata: URL { directory.appendingPathComponent("recovery.json") }
 }
 
-private struct RecoveryManifest: Codable, Sendable {
+enum OriginalLimitsStatus: String, Codable, Sendable {
+    case running, stopped, neverStarted
+}
+
+struct RecoveryManifest: Codable, Sendable {
+    let version: Int
+    let sessionID: String
+    let appRoot: URL
+    let originalStatus: OriginalLimitsStatus
+    let rootFilesystem: Filesystem
+    let initImage: String
+    var bundle: URL { appRoot.appendingPathComponent("containers", isDirectory: true).appendingPathComponent(containerID, isDirectory: true) }
     let containerID: String
     let createdAt: Date
     let configuration: ContainerConfiguration
     let kernel: Kernel
     let initialFilesystem: Filesystem
     let options: ContainerCreateOptions?
-    let rootfsFingerprint: String?
+    let rootfsFingerprint: String
     let initfsFingerprint: String
     let kernelFingerprint: String
 }
@@ -911,15 +920,8 @@ struct ContainerLimitsRuntimeState: Sendable {
     let options: ContainerCreateOptions?
 }
 
-private struct RecoveryInputs: Sendable {
-    let kernel: Kernel
-    let initialFilesystem: Filesystem
-    let rootfsFingerprint: String?
-    let initfsFingerprint: String
-    let kernelFingerprint: String
-}
-
 protocol ContainerLimitsRuntime: Sendable {
+    func verifiedAppRoot() async throws -> URL
     func inspect(id: String) async throws -> ContainerLimitsRuntimeState?
     func stop(id: String) async throws
     func delete(id: String) async throws
@@ -929,32 +931,27 @@ protocol ContainerLimitsRuntime: Sendable {
     func start(id: String) async throws
 }
 
-private struct AppleContainerLimitsRuntime: ContainerLimitsRuntime {
+struct AppleContainerLimitsRuntime: ContainerLimitsRuntime {
     private let cli: any ContainerClient
     private let api = ContainerAPIClient.ContainerClient()
 
     init(cli: any ContainerClient) { self.cli = cli }
 
-    func verifyRuntimeForRecovery() async throws {
+    func verifiedAppRoot() async throws -> URL {
         let health = try await ClientHealthCheck.ping(timeout: .seconds(10))
         guard health.apiServerVersion == "1.5.0", let client = cli as? ProcessContainerClient,
               client.resolver.overridePath == nil, try await cliVersion() == "1.5.0" else { throw ContainerLimitsIssue.unsupportedCLI }
+        return health.appRoot.standardizedFileURL
     }
 
     func inspect(id: String) async throws -> ContainerLimitsRuntimeState? {
         guard !id.isEmpty, id != ".", id != "..", !id.contains("/"), !id.contains("\\") else {
             throw ContainerLimitsIssue.unsupportedContainer
         }
-        let health = try await ClientHealthCheck.ping(timeout: .seconds(10))
-        guard health.apiServerVersion == "1.5.0",
-              let processClient = cli as? ProcessContainerClient,
-              processClient.resolver.overridePath == nil,
-              try await cliVersion() == "1.5.0" else {
-            throw ContainerLimitsIssue.unsupportedCLI
-        }
+        let root = try await verifiedAppRoot()
         let snapshots = try await api.list(filters: ContainerListFilters(ids: [id]))
         guard let snapshot = snapshots.first else { return nil }
-        let root = health.appRoot.standardizedFileURL
+        guard snapshots.count == 1, snapshot.id == id else { throw ContainerLimitsIssue.staleReview }
         let bundlePath = root.appendingPathComponent("containers", isDirectory: true).appendingPathComponent(id, isDirectory: true).standardizedFileURL
         guard Self.isWithin(bundlePath, root: root.appendingPathComponent("containers", isDirectory: true)),
               !Self.hasSymbolicLinkComponent(root), !Self.hasSymbolicLinkComponent(bundlePath) else {
@@ -1149,7 +1146,7 @@ struct AppleLimitsRecoveryInventory: LimitsRecoveryInventoryReading {
 
     private func completeInventory() async throws -> LimitsRecoveryInventory {
         let runtime = AppleContainerLimitsRuntime(cli: cli)
-        try await runtime.verifyRuntimeForRecovery()
+        _ = try await runtime.verifiedAppRoot()
         let api = ContainerAPIClient.ContainerClient()
         let before = try await api.list(filters: .all)
         guard Set(before.map(\.id)).count == before.count else { throw LimitsRecoveryError.incompleteInventory }
@@ -1170,6 +1167,6 @@ struct AppleLimitsRecoveryInventory: LimitsRecoveryInventoryReading {
         for snapshot in after {
             guard configurations[snapshot.id] == (try encoder.encode(snapshot.configuration)) else { throw LimitsRecoveryError.incompleteInventory }
         }
-        return LimitsRecoveryInventory(referencedFiles: paths, complete: true)
+        return LimitsRecoveryInventory(referencedFiles: paths, complete: true, containerIDs: Set(configurations.keys))
     }
 }

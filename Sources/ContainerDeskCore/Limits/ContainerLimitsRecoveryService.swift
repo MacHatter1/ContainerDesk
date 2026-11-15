@@ -13,12 +13,13 @@ struct LimitsRecoveryState: Codable {
     let containerID: String
     let createdAt: Date
     var outcome: LimitsRecoveryOutcome
+    var manifestDigest: String?
     static let filename = "session-state.json"
 
     static func read(at directory: URL) -> Self? { readRecord(at: directory)?.state }
 
     static func readRecord(at directory: URL) -> (state: Self, data: Data)? {
-        let fd = open(directory.appendingPathComponent(filename).path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let fd = open(directory.appendingPathComponent(filename).path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { return nil }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         var info = stat()
@@ -71,6 +72,7 @@ struct LimitsRecoveryState: Codable {
 struct LimitsRecoveryInventory: Sendable {
     let referencedFiles: [URL]
     let complete: Bool
+    var containerIDs: Set<String> = []
 }
 
 protocol LimitsRecoveryInventoryReading: Sendable {
@@ -85,9 +87,19 @@ public struct LimitsRecoverySession: Identifiable, Sendable, Equatable {
     public let allocatedBytes: Int64
     public let keepReason: String?
     public var canRemove: Bool { keepReason == nil }
+    public fileprivate(set) var canReviewRestore: Bool
     fileprivate let directoryStamp: RecoveryFileStamp
     fileprivate let fileStamps: [RecoveryFileStamp]
     fileprivate let markerDigest: String?
+}
+
+public struct LimitsRestoreReview: Sendable, Equatable {
+    public let session: LimitsRecoverySession
+    public let containerID: String
+    public let imageReference: String
+    public let limits: ContainerResourceLimits
+    public let wasRunning: Bool
+    public let neverStarted: Bool
 }
 
 public struct LimitsRecoveryRemoval: Sendable {
@@ -97,28 +109,33 @@ public struct LimitsRecoveryRemoval: Sendable {
 }
 
 public enum LimitsRecoveryError: LocalizedError {
-    case incompleteInventory, unsafeSession, busy
+    case incompleteInventory, unsafeSession, busy, unavailableRestore, restoreFailed
     public var errorDescription: String? {
         switch self {
-        case .incompleteInventory: "A complete inventory of all containers and their runtime files is required. No recovery sessions were removed."
-        case .unsafeSession: "A recovery directory or file changed or could not be verified. Scan again before removing it."
-        case .busy: "Wait for the limits change or recovery cleanup to finish."
+        case .incompleteInventory: "A complete inventory of containers and their runtime files is required for recovery."
+        case .unsafeSession: "A recovery directory or file changed or could not be verified. Scan again before continuing."
+        case .busy: "Wait for the current limits operation to finish."
+        case .unavailableRestore: "The backup or original container location could not be verified for restoration. Scan again."
+        case .restoreFailed: "Restoration could not be verified. The recovery files were retained. Inspect the container before trying again."
         }
     }
 }
 
-/// Explicit, reviewed cleanup only. In-progress, unknown and recovery-needed sessions are always retained.
+/// Recovery actions require a fresh inventory and the same session the user reviewed.
 public actor ContainerLimitsRecoveryService {
     public nonisolated let directory: URL
     private let reader: any LimitsRecoveryInventoryReading
-    private var removing = false
+    private let runtime: any ContainerLimitsRuntime
+    private var modifying = false
 
     public init(client: any ContainerClient = ProcessContainerClient(), directory: URL? = nil) {
         self.directory = (directory ?? ContainerLimitsService.defaultRecoveryDirectory()).standardizedFileURL
         self.reader = AppleLimitsRecoveryInventory(cli: client)
+        self.runtime = AppleContainerLimitsRuntime(cli: client)
     }
 
-    init(directory: URL, reader: any LimitsRecoveryInventoryReading) {
+    init(directory: URL, reader: any LimitsRecoveryInventoryReading, runtime: any ContainerLimitsRuntime = AppleContainerLimitsRuntime(cli: ProcessContainerClient())) {
+        self.runtime = runtime
         self.directory = directory.standardizedFileURL
         self.reader = reader
     }
@@ -127,13 +144,83 @@ public actor ContainerLimitsRecoveryService {
         let inventory = try await reader.inventory()
         guard inventory.complete else { throw LimitsRecoveryError.incompleteInventory }
         try Task.checkCancellation()
-        return try sessions(references: inventory.referencedFiles)
+        var scanned = try sessions(references: inventory.referencedFiles)
+        let currentIDs = Set(inventory.containerIDs.map { $0.lowercased() })
+        for index in scanned.indices where scanned[index].canReviewRestore {
+            let id = scanned[index].containerID?.lowercased()
+            scanned[index].canReviewRestore = id.map { !currentIDs.contains($0) } == true
+        }
+        return scanned
+    }
+
+    public func reviewRestore(_ session: LimitsRecoverySession) async throws -> LimitsRestoreReview {
+        guard !modifying else { throw LimitsRecoveryError.busy }
+        let backup = try await verifiedBackup(for: session)
+        let resources = backup.configuration.resources
+        return LimitsRestoreReview(
+            session: session, containerID: backup.containerID, imageReference: backup.configuration.image.reference,
+            limits: .init(cpus: resources.cpus, memoryBytes: resources.memoryInBytes),
+            wasRunning: backup.originalStatus == .running, neverStarted: backup.originalStatus == .neverStarted
+        )
+    }
+
+    public func restore(_ review: LimitsRestoreReview) async throws {
+        guard !modifying else { throw LimitsRecoveryError.busy }
+        modifying = true
+        defer { modifying = false }
+        let session = review.session
+        let backup = try await verifiedBackup(for: session)
+        try Task.checkCancellation()
+        do {
+            try await ContainerLimitsService.recreateOriginal(backup, files: RecoveryFiles(directory: session.directory), runtime: runtime)
+            guard let record = LimitsRecoveryState.readRecord(at: session.directory),
+                  Self.digest(record.data) == session.markerDigest else {
+                throw LimitsRecoveryError.restoreFailed
+            }
+            var marker = record.state
+            marker.outcome = .rolledBack
+            try marker.write(to: session.directory)
+        } catch {
+            throw LimitsRecoveryError.restoreFailed
+        }
+    }
+
+    private func verifiedBackup(for review: LimitsRecoverySession) async throws -> RecoveryManifest {
+        guard review.canReviewRestore, let fresh = try await scan().first(where: { $0.id == review.id }),
+              fresh.canReviewRestore, sameReview(fresh, review),
+              let marker = LimitsRecoveryState.read(at: fresh.directory), let manifestDigest = marker.manifestDigest else {
+            throw LimitsRecoveryError.unavailableRestore
+        }
+        let files = RecoveryFiles(directory: fresh.directory)
+        let fd = open(files.metadata.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw LimitsRecoveryError.unavailableRestore }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        var info = stat()
+        let limit = 16 * 1024 * 1024
+        guard fstat(fd, &info) == 0, info.st_size > 0, info.st_size <= limit,
+              fresh.fileStamps.first(where: { $0.name == "recovery.json" })?.matches(info) == true,
+              let data = try? handle.read(upToCount: limit + 1), data.count == info.st_size, Self.digest(data) == manifestDigest,
+              let backup = try? JSONDecoder().decode(RecoveryManifest.self, from: data),
+              backup.containerID == marker.containerID,
+              (backup.originalStatus != .neverStarted) == fresh.fileStamps.contains(where: { $0.name == "rootfs.ext4" }) else {
+            throw LimitsRecoveryError.unavailableRestore
+        }
+        do { try await ContainerLimitsService.verifyRestore(backup, files: files, runtime: runtime) }
+        catch is CancellationError { throw CancellationError() }
+        catch { throw LimitsRecoveryError.unavailableRestore }
+        guard let checked = try await scan().first(where: { $0.id == fresh.id }), checked.canReviewRestore,
+              sameReview(checked, fresh) else { throw LimitsRecoveryError.unavailableRestore }
+        return backup
+    }
+
+    private static func digest(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     public func remove(_ reviewed: [LimitsRecoverySession]) async throws -> [LimitsRecoveryRemoval] {
-        guard !removing else { throw LimitsRecoveryError.busy }
-        removing = true
-        defer { removing = false }
+        guard !modifying else { throw LimitsRecoveryError.busy }
+        modifying = true
+        defer { modifying = false }
         // Inventory failure/incompleteness aborts the entire batch before any unlink.
         let inventory = try await reader.inventory()
         guard inventory.complete else { throw LimitsRecoveryError.incompleteInventory }
@@ -202,10 +289,15 @@ public actor ContainerLimitsRecoveryService {
         else if directoryStamp.owner != geteuid() || !stamps.allSatisfy({ $0.isRegular && $0.owner == geteuid() && knownFiles.contains($0.name) }) {
             reason = "Unrecognised or unsafe session files; retained."
         } else { reason = nil }
-        let marker = record?.data
+        let names = Set(stamps.map(\.name))
+        let restorable = (state?.outcome == .recoveryNeeded || state?.outcome == .inProgress)
+            && state?.manifestDigest != nil && !referenced
+            && directoryStamp.owner == geteuid() && directoryStamp.mode & 0o777 == 0o700
+            && stamps.allSatisfy { $0.isRegular && $0.owner == geteuid() && $0.mode & 0o777 == 0o600 && $0.linkCount == 1 }
+            && (names == knownFiles || names == knownFiles.subtracting(["rootfs.ext4"]))
         return .init(directory: url, containerID: state?.containerID, outcome: state?.outcome, allocatedBytes: bytes,
-                     keepReason: reason, directoryStamp: directoryStamp, fileStamps: stamps,
-                     markerDigest: marker.map { SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined() })
+                     keepReason: reason, canReviewRestore: restorable, directoryStamp: directoryStamp, fileStamps: stamps,
+                     markerDigest: record.map { Self.digest($0.data) })
     }
 
     private func sameReview(_ fresh: LimitsRecoverySession, _ reviewed: LimitsRecoverySession) -> Bool {
@@ -246,6 +338,7 @@ fileprivate struct RecoveryFileStamp: Equatable, Sendable {
     let inode: ino_t
     let device: dev_t
     let owner: uid_t
+    let linkCount: nlink_t
     let mode: mode_t
     let size: off_t
     let modifiedSeconds: Int
@@ -261,13 +354,13 @@ fileprivate struct RecoveryFileStamp: Equatable, Sendable {
     }
     init(name: String, info: stat) {
         self.name = name; inode = info.st_ino; device = info.st_dev; owner = info.st_uid; mode = info.st_mode
-        size = info.st_size; modifiedSeconds = info.st_mtimespec.tv_sec; modifiedNanoseconds = info.st_mtimespec.tv_nsec
+        linkCount = info.st_nlink; size = info.st_size; modifiedSeconds = info.st_mtimespec.tv_sec; modifiedNanoseconds = info.st_mtimespec.tv_nsec
         let (bytes, overflow) = Int64(max(0, info.st_blocks)).multipliedReportingOverflow(by: 512)
         allocatedBytes = overflow ? Int64.max : bytes
     }
     func sameIdentity(as other: Self) -> Bool {
         name == other.name && inode == other.inode && device == other.device && owner == other.owner && mode == other.mode
-            && size == other.size && modifiedSeconds == other.modifiedSeconds && modifiedNanoseconds == other.modifiedNanoseconds
+            && linkCount == other.linkCount && size == other.size && modifiedSeconds == other.modifiedSeconds && modifiedNanoseconds == other.modifiedNanoseconds
     }
     func matches(_ info: stat) -> Bool { sameIdentity(as: Self(name: name, info: info)) }
 }

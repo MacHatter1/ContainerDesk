@@ -41,17 +41,7 @@ public enum ContainerLaunchRequestBuilder {
                 throw ContainerLaunchValidationError.invalidField("CPU limit")
             }
         }
-        let memory = trimmed(configuration.memory)
-        if !memory.isEmpty {
-            // Validate the floating-point conversion before the CLI converts it to Int64.
-            guard let measurement = try? Measurement<UnitInformationStorage>.parse(parsing: memory) else {
-                throw ContainerLaunchValidationError.invalidField("memory limit")
-            }
-            let mib = measurement.converted(to: .mebibytes).value
-            guard mib.isFinite, mib >= 200, mib < Double(Int64.max / 1_048_576) else {
-                throw ContainerLaunchValidationError.invalidField("memory limit (at least 200 MiB)")
-            }
-        }
+        if let error = memoryLimitError(configuration.memory) { throw error }
         let platform = trimmed(configuration.platform)
         if !platform.isEmpty {
             guard isOptionValue(platform), (try? Parser.platform(from: platform)) != nil else {
@@ -74,6 +64,20 @@ public enum ContainerLaunchRequestBuilder {
             guard validEnvironmentKey(key) else { throw ContainerLaunchValidationError.invalidEnvironment }
         }
         _ = try ContainerCommandTokenizer.tokenize(configuration.command)
+    }
+
+    public static func memoryLimitError(_ input: String) -> ContainerLaunchValidationError? {
+        let memory = trimmed(input)
+        guard !memory.isEmpty else { return nil }
+        guard let measurement = try? Measurement<UnitInformationStorage>.parse(parsing: memory) else {
+            return .invalidField("memory limit")
+        }
+        let mib = measurement.converted(to: .mebibytes).value
+        // The CLI converts the parsed size to an Int64 byte count.
+        guard mib.isFinite, mib >= 200, mib < Double(Int64.max / 1_048_576) else {
+            return .invalidField("memory limit (at least 200 MiB)")
+        }
+        return nil
     }
 
     /// Values are transient: only their keys belong in a saved profile.

@@ -40,6 +40,11 @@ struct UnifiedLogsStoreTests {
         logs.retry(id: "web", client: client)
         try await waitUntil { client.requestCount == 2 }
         #expect(logs.errors["web"] == nil)
+        #expect(client.recordedRequests.map(\.arguments) == [
+            ["logs", "--follow", "-n", "200", "--", "web"],
+            ["logs", "--follow", "-n", "0", "--", "web"],
+        ])
+        #expect(client.recordedRequests.allSatisfy { $0.captureLimit == 0 && !$0.suppressOutputEvents })
         logs.stop()
     }
 
@@ -53,9 +58,10 @@ struct UnifiedLogsStoreTests {
 private final class LogStreamTestClient: ContainerClient, @unchecked Sendable {
     private let lock = NSLock()
     private var continuations: [String: AsyncThrowingStream<CommandEvent, Error>.Continuation] = [:]
-    private var requests = 0
+    private var requests: [CommandRequest] = []
     private var cancelled = Set<String>()
-    var requestCount: Int { lock.withLock { requests } }
+    var requestCount: Int { lock.withLock { requests.count } }
+    var recordedRequests: [CommandRequest] { lock.withLock { requests } }
     var cancelledIDs: Set<String> { lock.withLock { cancelled } }
     func run(_ request: CommandRequest) async throws -> CommandResult {
         CommandResult(standardOutput: "", standardError: "", exitCode: 0, terminationReason: .exit, duration: .zero)
@@ -64,7 +70,7 @@ private final class LogStreamTestClient: ContainerClient, @unchecked Sendable {
         let id = request.arguments.last!
         let (stream, continuation) = AsyncThrowingStream<CommandEvent, Error>.makeStream()
         continuation.onTermination = { [weak self] _ in _ = self?.lock.withLock { self?.cancelled.insert(id) } }
-        lock.withLock { continuations[id] = continuation; requests += 1 }
+        lock.withLock { continuations[id] = continuation; requests.append(request) }
         return stream
     }
     func emit(_ text: String, id: String) { _ = lock.withLock { continuations[id] }?.yield(.standardOutput(text)) }
